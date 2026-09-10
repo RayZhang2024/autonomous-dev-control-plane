@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Autonomous Development v2 Semantic Review Verdict",
+  "description": "Schema for raw semantic-review output. Schema validity does not establish provenance, applicability, authority, or Evidence Admission. This schema defines absolute format ceilings; active trusted policy or the exact reviewer profile may impose stricter invocation-specific limits but must not loosen these ceilings. Before reviewer output is accepted, active trusted policy or trusted parser configuration must establish finite maximum raw-response byte size and finite maximum JSON nesting depth. A reviewer profile may impose stricter limits. If applicable finite limits cannot be established, the response must not be parsed or admitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "review_invocation_id",
+    "requirement_results",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "review_invocation_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "subject_echo": {
+      "$ref": "#/$defs/subject_echo",
+      "description": "Optional correlation echoes only. These values do not establish canonical subject identity."
+    },
+    "requirement_results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/requirement_result"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "overall_verdict": {
+      "$ref": "#/$defs/verdict",
+      "description": "Optional reviewer-supplied summary echo. Trusted deterministic code recomputes the aggregate; if present, Evidence Admission must require equality."
+    },
+    "reviewer_summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "Optional free-form summary for human readability. It is not a control input."
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "changes_required",
+        "unable_to_determine"
+      ]
+    },
+    "unable_reason_code": {
+      "type": "string",
+      "enum": [
+        "missing_required_material",
+        "unsupported_material",
+        "insufficient_context",
+        "ambiguous_requirement",
+        "conflicting_context",
+        "context_limit",
+        "reviewer_capability_limit",
+        "permitted_tool_failure",
+        "other"
+      ],
+      "description": "Structured semantic reason claim for unable_to_determine. Enum validity does not establish that the reason is applicable to the exact reviewer profile or invocation, and it does not establish operational facts."
+    },
+    "subject_echo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "task_id",
+        "contract_id",
+        "candidate_id"
+      ],
+      "properties": {
+        "repository_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "task_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "contract_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "target_registration_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "active_policy_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "candidate_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "base_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "target_context_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "pr_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "requirement_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "verdict",
+        "rationale",
+        "finding_ids"
+      ],
+      "properties": {
+        "requirement_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "unable_reason_code": {
+          "$ref": "#/$defs/unable_reason_code"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "finding_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true,
+          "description": "References requirement_issue findings associated with this requirement result. Advisory observations must not appear here. Evidence Admission must resolve every reference and validate bidirectional consistency."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "const": "unable_to_determine"
+              }
+            },
+            "required": [
+              "verdict"
+            ]
+          },
+          "then": {
+            "required": [
+              "unable_reason_code"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "unable_reason_code"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_id",
+        "kind",
+        "requirement_ids",
+        "summary",
+        "rationale"
+      ],
+      "properties": {
+        "finding_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "requirement_issue",
+            "advisory_observation"
+          ],
+          "description": "Reporting metadata only. requirement_issue explains one or more changes_required results; advisory_observation never affects requirement satisfaction and must not be referenced by requirement_results[].finding_ids. requirement_results[].verdict remains the semantic conclusion."
+        },
+        "requirement_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "locations": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/location"
+          },
+          "description": "Advisory correlation metadata only; locations are not authoritative repository selectors or identities."
+        },
+        "suggested_remediation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "requirement_issue"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "requirement_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "Reviewer finding or advisory observation. Findings do not create authority, new acceptance requirements, or independent requirement verdicts."
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "content_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "line_start": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "line_end": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "line_end"
+            ]
+          },
+          "then": {
+            "required": [
+              "line_start"
+            ]
+          }
+        }
+      ],
+      "description": "Advisory correlation metadata only. It must not be used as an authoritative file selector, repository identity, or control instruction. Evidence Admission or downstream deterministic logic must resolve any consequential use against trusted candidate/material identities and, when both lines are present, validate line_end >= line_start."
+    }
+  },
+  "$comment": "PRE-SCHEMA RAW JSON CONTRACT: the trusted invocation/admission boundary must accept exactly one UTF-8 JSON document; reject malformed UTF-8, duplicate object member names at every nesting level, comments, trailing non-whitespace data, non-standard numeric values such as NaN or Infinity, and other parser extensions; and parse with one deterministic interpretation. A finite maximum raw-response byte size and finite maximum JSON nesting depth MUST be established by active trusted policy or trusted parser configuration before reviewer output is accepted. A reviewer profile MAY impose equal or stricter limits. If applicable finite limits cannot be established, the response MUST NOT be parsed or admitted. SCHEMA/PROFILE LIMIT RELATIONSHIP: maxLength/maxItems values in this schema are absolute accepted-format ceilings. Active trusted policy or the exact reviewer profile may impose equal or stricter limits; the effective limit is the strictest applicable limit. A profile cannot authorize values beyond this schema; doing so requires a new trusted schema version. EVIDENCE ADMISSION MUST ADDITIONALLY ENFORCE: (1) exact equality between the assigned semantic-requirement set and the requirement_results requirement_id set; exactly one result per assigned requirement_id; no unknown requirement IDs; (2) uniqueness of finding_id values; every requirement_result.finding_ids reference resolves; every finding.requirement_ids reference resolves to an assigned requirement; (3) every requirement_result.finding_ids reference resolves specifically to a requirement_issue finding, never to an advisory_observation; (4) for each requirement_issue finding, every referenced requirement has verdict changes_required, and every referenced requirement result references that finding_id; a requirement result may reference a requirement_issue only when that finding lists the requirement and the result verdict is changes_required; changes_required may have zero findings; (5) advisory_observation never appears in requirement_results[].finding_ids and never changes a requirement verdict, integration eligibility, or another control outcome; advisory requirement_ids are correlation only and must resolve to assigned requirements; (6) equality of any subject_echo fields to the trusted invocation record; (7) deterministic overall_verdict consistency when overall_verdict is present; (8) deterministic validation of line_end >= line_start when both are present; (9) unable_reason_code applicability to the exact reviewer profile and invocation, including that permitted_tool_failure is applicable only where a relevant permitted tool existed for that invocation; reviewer reason codes do not override machine-verifiable trusted operation facts; and (10) all required provenance, freshness, applicability, candidate/context, policy, authorization, disclosure, and operation-state checks. These checks are not delegated to schema validity."
+}
