@@ -1,0 +1,595 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Autonomous Development v2 Issue Contract",
+  "description": "Schema for a canonical structured ordinary-task contract. A valid contract describes and bounds requested work. It does not grant authorization, establish authoritative risk, admit evidence, select canonical lifecycle state, permit a consequential action, or authorize trusted-core/root modification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "task_id",
+    "context_anchor",
+    "objective",
+    "target",
+    "scope",
+    "requested_operations",
+    "risk_floor",
+    "acceptance_mode",
+    "acceptance_requirements",
+    "runtime_requirements",
+    "repair_policy",
+    "human_approval_requirements",
+    "delegation_limits"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "contract_id": {
+      "$ref": "#/$defs/identifier",
+      "description": "Logical identity for this exact contract representation. Trusted admission binds contract_id to the SHA-256 digest of the exact accepted raw UTF-8 JSON byte sequence. Reuse of one contract_id with different accepted raw bytes must be rejected."
+    },
+    "task_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "context_anchor": {
+      "$ref": "#/$defs/issue_anchor",
+      "description": "Exact GitHub issue identity used as the human context anchor. Issue prose, comments, labels, and later issue edits are not the execution contract."
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "Human-readable objective. Trusted control must not infer authority, scope, evaluator type, risk, operation requirements, acceptance composition, or lifecycle state from this prose."
+    },
+    "target": {
+      "$ref": "#/$defs/target_binding"
+    },
+    "scope": {
+      "$ref": "#/$defs/scope"
+    },
+    "requested_operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/requested_operation"
+      },
+      "description": "Unordered contract allowlist/ceiling of requested operations. Presence requests and permits consideration of an operation within the contract but does not authorize it or determine execution order. Root activation, target registration, and control-state-write authority are intentionally not requestable."
+    },
+    "risk_floor": {
+      "$ref": "#/$defs/risk_tier",
+      "description": "Minimum ordinary risk posture requested by the contract. Risk strength/order is defined only by the active trusted policy; trusted code must not infer ordering from enum position or names. The contract cannot downgrade a stricter applicable risk requirement."
+    },
+    "acceptance_mode": {
+      "const": "all",
+      "description": "Every acceptance requirement in acceptance_requirements is mandatory and conjunctive. Schema v1.0 does not encode OR, fallback, quorum, weighting, optional requirements, latest-wins, or prose-derived acceptance composition."
+    },
+    "acceptance_requirements": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/acceptance_requirement"
+      },
+      "description": "Explicit acceptance requirements. Contract acceptance requires every listed requirement to be satisfied; each requirement in turn selects one exact mandatory conjunctive evaluator set."
+    },
+    "runtime_requirements": {
+      "$ref": "#/$defs/runtime_requirements"
+    },
+    "repair_policy": {
+      "$ref": "#/$defs/repair_policy"
+    },
+    "human_approval_requirements": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/human_approval_requirement"
+      },
+      "description": "Contract-level human approvals required before specific requested operations. Every applicable listed requirement is independently mandatory and conjunctive. These are distinct from human_approval evaluators used to satisfy task acceptance requirements. Policy or Target Registration may impose additional approvals."
+    },
+    "delegation_limits": {
+      "$ref": "#/$defs/delegation_limits"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "requested_operations": {
+            "contains": {
+              "const": "merge"
+            }
+          }
+        },
+        "required": [
+          "requested_operations"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "required": [
+              "integration_ref"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "requested_operations": {
+            "contains": {
+              "const": "repair"
+            }
+          }
+        },
+        "required": [
+          "requested_operations"
+        ]
+      },
+      "then": {
+        "properties": {
+          "repair_policy": {
+            "properties": {
+              "max_attempts": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "repair_policy": {
+            "properties": {
+              "max_attempts": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "requested_operations": {
+            "contains": {
+              "const": "controlled_runtime"
+            }
+          }
+        },
+        "required": [
+          "requested_operations"
+        ]
+      },
+      "then": {
+        "properties": {
+          "runtime_requirements": {
+            "properties": {
+              "allowed_profile_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "runtime_requirements": {
+            "properties": {
+              "allowed_profile_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "immutable_config_id": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        }
+      ],
+      "description": "Immutable/versioned trusted configuration identity. Mutable aliases, labels, names, pointers, or selectors such as current/latest/default do not satisfy the contract-bound identity requirement even if they are syntactically valid strings; trusted admission must resolve and verify immutability."
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "git_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Canonical full Git ref such as refs/heads/main. Trusted admission validates exact ref syntax and applicable repository state."
+    },
+    "risk_tier": {
+      "type": "string",
+      "enum": [
+        "routine",
+        "supervised"
+      ],
+      "description": "Syntactically valid ordinary risk-tier identifier. This schema does not define ordering or strength. The active trusted policy defines the applicable risk relation."
+    },
+    "issue_anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "issue_number"
+      ],
+      "properties": {
+        "repository_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "issue_id": {
+          "$ref": "#/$defs/identifier",
+          "description": "Optional immutable platform issue identifier for correlation. If supplied, trusted admission must verify it against authoritative GitHub state."
+        }
+      }
+    },
+    "target_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_registration_id",
+        "base_ref",
+        "base_sha"
+      ],
+      "properties": {
+        "target_registration_id": {
+          "$ref": "#/$defs/immutable_config_id",
+          "description": "Immutable/versioned Target Registration identity. A mutable registration alias must not be used as the contract-bound target-registration identity."
+        },
+        "base_ref": {
+          "$ref": "#/$defs/git_ref"
+        },
+        "base_sha": {
+          "$ref": "#/$defs/git_sha"
+        },
+        "integration_ref": {
+          "$ref": "#/$defs/git_ref",
+          "description": "Exact requested final integration ref where integration is part of the task. If merge is requested, this field is required. Target Registration, authorization, active policy, and current authoritative state independently determine whether integration is permitted."
+        }
+      },
+      "description": "Exact Target Registration and base binding. Mutable base movement does not silently update this contract."
+    },
+    "change_type": {
+      "type": "string",
+      "enum": [
+        "add",
+        "modify",
+        "delete",
+        "mode_change"
+      ],
+      "description": "Atomic normalized change facet for supported regular-file Git objects."
+    },
+    "path_selector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ],
+          "properties": {
+            "kind": {
+              "const": "exact_path"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path_prefix"
+          ],
+          "properties": {
+            "kind": {
+              "const": "path_prefix"
+            },
+            "path_prefix": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "repository"
+            }
+          }
+        }
+      ],
+      "description": "Structured repository-relative selector. exact_path matches exactly one canonical Git path. path_prefix matches the canonical path itself or descendants separated by '/'; it is not a lexical string-prefix rule. repository matches every supported canonical repository path. Wildcard/glob semantics are intentionally absent."
+    },
+    "scope_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector",
+        "change_types"
+      ],
+      "properties": {
+        "selector": {
+          "$ref": "#/$defs/path_selector"
+        },
+        "change_types": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/change_type"
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object_model",
+        "allowed_changes",
+        "prohibited_changes"
+      ],
+      "properties": {
+        "object_model": {
+          "const": "regular_file_only",
+          "description": "Schema v1.0 ordinary mutation scope supports regular-file Git objects only. Symlinks, gitlinks/submodules, non-regular Git objects, and object-type transitions are outside contract mutation scope and fail closed."
+        },
+        "allowed_changes": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/scope_rule"
+          },
+          "description": "May be empty for a contract that permits no repository mutations."
+        },
+        "prohibited_changes": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/scope_rule"
+          }
+        }
+      },
+      "description": "Contract mutation-scope ceiling only. Every normalized supported candidate change facet must match at least one allowed rule and no prohibited rule. Prohibition wins on overlap. Active policy and admitted authorization may further restrict scope. Ordinary contract admission additionally rejects any scope that actually or potentially overlaps trusted-core or root-protected resources."
+    },
+    "requested_operation": {
+      "type": "string",
+      "enum": [
+        "implementation",
+        "candidate_materialization",
+        "target_publish",
+        "deterministic_validation",
+        "semantic_review",
+        "controlled_runtime",
+        "external_observation",
+        "repair",
+        "merge"
+      ]
+    },
+    "evaluator_mechanism": {
+      "type": "string",
+      "enum": [
+        "deterministic",
+        "semantic",
+        "controlled_runtime",
+        "external_observation",
+        "human_approval"
+      ]
+    },
+    "evaluator_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_id",
+        "mechanism",
+        "evaluator_ref",
+        "parameters"
+      ],
+      "properties": {
+        "evaluation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mechanism": {
+          "$ref": "#/$defs/evaluator_mechanism"
+        },
+        "evaluator_ref": {
+          "$ref": "#/$defs/immutable_config_id",
+          "description": "Immutable/versioned identity of the exact trusted evaluator configuration applicable to this mechanism."
+        },
+        "parameters": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Structured task-specific evaluator input. The exact trusted evaluator configuration referenced by evaluator_ref defines and validates the parameter schema. Trusted control must not recover missing parameters by parsing requirement prose."
+        }
+      },
+      "description": "Explicit evaluator declaration. The evaluator mechanism classifies the evidence mechanism. evaluator_ref selects an immutable trusted configuration defining profile capability, parameter schema, operational prerequisites, and other applicable trusted constraints."
+    },
+    "acceptance_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "statement",
+        "evaluation_mode",
+        "evaluators"
+      ],
+      "properties": {
+        "requirement_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Human/semantic statement of the requirement. Trusted code must not infer evaluator mechanism, operational prerequisites, authority, or missing machine parameters from this prose."
+        },
+        "evaluation_mode": {
+          "const": "all",
+          "description": "Every evaluator binding in evaluators is mandatory. Schema v1.0 does not encode OR, fallback, quorum, latest-wins, or implicit evaluator substitution."
+        },
+        "evaluators": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/evaluator_binding"
+          }
+        }
+      },
+      "description": "One exact selected conjunctive evaluator set. If trusted policy permits alternative evaluator sets, one permitted set must be explicitly selected before contract admission."
+    },
+    "runtime_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_profile_ids"
+      ],
+      "properties": {
+        "allowed_profile_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/immutable_config_id"
+          }
+        }
+      },
+      "description": "Contract-level allowlist/ceiling of immutable/versioned controlled-runtime profile identities. Empty means this contract permits no newly invoked controlled runtime. Non-empty is valid only when controlled_runtime is listed in requested_operations and does not itself authorize runtime."
+    },
+    "repair_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Contract-selected autonomous repair ceiling. Zero means no repair is requested by the contract. A positive value requires repair to be present in requested_operations. Active trusted policy defines repair eligibility and authoritative maximums; schema validity cannot create or enlarge repair authority."
+    },
+    "human_approval_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "before_operation",
+        "approval_ref"
+      ],
+      "properties": {
+        "approval_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "before_operation": {
+          "$ref": "#/$defs/requested_operation",
+          "description": "Must identify an operation explicitly listed in this contract's requested_operations."
+        },
+        "approval_ref": {
+          "$ref": "#/$defs/immutable_config_id",
+          "description": "Immutable/versioned identity of the exact trusted approval configuration defining eligible approver class, required identity binding, and evidence requirements."
+        }
+      },
+      "description": "Requires admitted human-approval evidence before the exact requested operation. Every applicable entry is independently mandatory; multiple entries for one operation are conjunctive. The contract cannot weaken approval requirements imposed by trusted policy or Target Registration."
+    },
+    "delegation_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_depth",
+        "delegable_operations"
+      ],
+      "properties": {
+        "max_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of additional delegation edges permitted below the authority associated with this contract. Zero permits no child delegation; one permits one child edge but no further delegation by that child."
+        },
+        "delegable_operations": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/requested_operation"
+          }
+        },
+        "risk_ceiling": {
+          "$ref": "#/$defs/risk_tier",
+          "description": "Maximum effective authoritative risk permitted for a child delegation. The child's effective authoritative risk, not merely its contract risk_floor, must satisfy this ceiling under the explicit risk relation defined by active trusted policy."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "max_depth": {
+                "const": 0
+              }
+            },
+            "required": [
+              "max_depth"
+            ]
+          },
+          "then": {
+            "properties": {
+              "delegable_operations": {
+                "maxItems": 0
+              }
+            },
+            "not": {
+              "required": [
+                "risk_ceiling"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "risk_ceiling"
+            ],
+            "properties": {
+              "delegable_operations": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "Additional contract ceiling on delegation. max_depth counts remaining additional delegation edges below this contract authority. On each authorized delegation edge, the child authorization's remaining delegation depth must be no greater than the parent's remaining depth minus one. The child's effective authoritative risk must also satisfy the applicable delegation risk ceiling. Authoritative remaining depth and effective risk are derived through trusted admission and authorization ancestry, not trusted from child contract assertions."
+    }
+  },
+  "$comment": "PRE-SCHEMA INPUT CONTRACT: trusted contract admission must accept exactly one UTF-8 JSON document with deterministic framing/parsing rules; reject malformed UTF-8, duplicate object member names at every nesting level, comments, trailing non-whitespace data, NaN/Infinity, unpaired surrogate escapes, and other non-standard or non-scalar parser results; and require finite trusted raw-byte and nesting-depth limits before parsing/admission. CONTRACT BYTE IDENTITY: the security-relevant content identity of a contract is SHA-256 over the exact accepted raw UTF-8 JSON byte sequence, without reserialization, whitespace normalization, key reordering, Unicode normalization, or other canonicalization. The digest is computed by trusted admission rather than supplied as self-attested contract data. The admitted contract record binds contract_id to this digest. Reuse of the same contract_id with a different digest is a conflict and must be rejected. Byte-distinct JSON representations, even when they parse to equivalent JSON values, therefore have distinct contract content identities. CONTRACT IDENTITY: schema validity does not authenticate contract_id or task_id. Trusted admission records the exact contract representation and its computed content identity in canonical control state. IMMUTABLE CONFIGURATION REFERENCES: target_registration_id, evaluator_ref, approval_ref, and runtime_requirements.allowed_profile_ids elements must resolve to immutable/versioned trusted configuration identities. Mutable aliases, labels, human-friendly names, moving pointers, or selectors such as current/latest/default are not contract-bound identities. If immutable/version identity cannot be established, admission fails closed. ORDINARY-CONTRACT/ROOT BOUNDARY: this schema is for ordinary task contracts only. Before admission, trusted control must evaluate the exact target and contract scope against trusted-core membership, root-protected resources, active trusted policy, and root-resource rules established by the previously active trusted boundary. If the proposed scope actually overlaps, can overlap, or cannot be proven disjoint from trusted-core code, Core Policy, trusted schemas, trusted enforcement configuration, trusted-core membership, Active Trusted Manifest/root activation material, or other root-protected resources identified by the previously active trusted system, the contract must not be admitted through the ordinary task path. It must instead follow the separate root-change procedure. Candidate declarations, renamed files, moved components, candidate policy, or a proposed future trusted-core manifest cannot redefine this admission test or remove an existing resource from root protection. Uncertain root impact fails closed. CONTEXT/TARGET: context_anchor is identity/context correlation only; issue prose, comments, labels, and issue edits cannot mutate the canonical contract. target_registration_id must resolve to an applicable Target Registration permitted by active trusted policy. base_ref/base_sha must be verified against authoritative target state where required. If merge is requested, integration_ref is required by schema but still grants no merge authority. REQUESTED OPERATIONS: requested_operations is an unordered task-contract allowlist/ceiling, not authorization and not lifecycle sequencing. Any operation absent from the contract is outside task-contract scope unless a replacement contract identity is deliberately admitted. Root activation, target registration, and control-state-write authority cannot be obtained through this schema. SCOPE OBJECT MODEL: schema v1.0 supports ordinary repository mutation only for regular-file Git blobs. For add, the resulting object must be a supported regular file; for delete, the removed object must be a supported regular file; for modify or mode_change, both applicable pre- and post-state objects must remain supported regular files. Symlinks, gitlinks/submodules, other non-regular Git objects, and transitions into or out of them fail closed regardless of path rules. A regular-file mode change may cover only target-registration-supported regular-file modes where deterministically represented; unsupported modes fail closed. SCOPE PATH NORMALIZATION: trusted admission and candidate validation must use one registered deterministic Git-path/change normalization model. Contract path strings consist only of Unicode scalar values and are deterministically encoded as UTF-8; no implicit Unicode normalization is performed. The canonical model uses '/' as the separator and must reject NUL, absolute paths, empty or traversal components, ambiguous separators/encodings, aliases, normalization collisions, unpaired surrogates, unsupported platform-sensitive representations, and other forms that cannot be mapped one-to-one to the target Git path. exact_path P matches only canonical P. path_prefix P matches canonical P itself or a descendant whose canonical path begins P + '/'; lexical prefix alone is insufficient. repository matches all supported canonical regular-file paths, subject always to the ordinary-contract/root boundary. Rename old->new is normalized as delete(old) plus add(new). Copy to a new destination is normalized as add(destination) while the source remains unchanged. A content change and regular-file mode change produce both applicable facets. Every normalized candidate change facet must match at least one allowed scope rule and no prohibited rule; prohibition wins. Empty allowed_changes means no repository mutation is permitted. RISK: risk_floor and delegation risk_ceiling use only risk identifiers recognized by this schema. Their ordering, equivalence, comparability, floor/ceiling semantics, and any policy expansion are defined by the active trusted policy, not by enum position, lexical order, prose meaning, or trusted-code guesswork. If the required policy risk relation is absent, ambiguous, or yields an incomparable value where comparison is required, the relevant admission/delegation fails closed. Authoritative task risk is canonical trusted control state and may be stricter than the contract floor. For delegation, risk_ceiling applies to the child's effective authoritative risk after all applicable contract-floor, active-policy, Target Registration, authorization, and trusted-context constraints are evaluated. Comparing risk_ceiling only with the child contract's risk_floor is insufficient. If the child's effective authoritative risk cannot be established or compared under active policy, delegation fails closed. ACCEPTANCE COMPOSITION: acceptance_mode is all, so every acceptance_requirement is mandatory. Each requirement's evaluation_mode is also all, so every evaluator listed for that requirement is mandatory. Contract acceptance therefore requires all requirements, and each requirement requires all of its selected evaluators. No OR, fallback, quorum, majority, weighting, optional requirement, latest-wins, or prose-derived composition exists in schema v1.0. If active policy permits alternative evaluator sets, trusted admission must establish that the contract selected exactly one permitted set and that the selected set satisfies all mandatory evaluator minimums. EVALUATOR REFERENCES: requirement_id values must be globally unique within the contract; evaluation_id values must be globally unique within the contract. Every evaluator_ref must resolve to exact immutable/versioned trusted evaluator configuration applicable to the declared mechanism and target. Admission must verify that the configuration is permitted by active policy and Target Registration where applicable; satisfies mandatory profile/capability/evaluator minimums; is a permitted selected alternative; matches the declared mechanism; and successfully validates parameters against the exact trusted parameter schema associated with evaluator_ref. Trusted code must not infer evaluator type, parameter values, composition, profile strength, or operational prerequisites from objective/statement prose. EVALUATOR/OPERATION RELATIONSHIP: the evaluator mechanism identifies the evidence class only. There is no hard-coded mechanism-to-requested-operation mapping in this schema. Exact trusted evaluator configuration defines any operational/capability prerequisites required to obtain its evidence. Trusted admission must deterministically verify that those prerequisites are permitted by active policy, Target Registration, admitted authorization as applicable, and this contract's requested_operations/runtime allowlist where task-level permission is required. An evaluator may consume already-existing admissible evidence without implying a new autonomous operation. RUNTIME: runtime_requirements.allowed_profile_ids is a contract allowlist only. Every listed profile must resolve to an immutable/versioned trusted controlled-runtime profile permitted by active policy and Target Registration. Schema v1.0 enforces a non-empty allowlist when controlled_runtime is requested and an empty allowlist when it is not requested. Any newly invoked controlled-runtime operation for this task must use an allowed profile. If policy or a selected evaluator requires a new controlled-runtime operation but the contract allowlist/requested-operation set cannot accommodate the required permitted profile and operation, the task cannot take that path without a replacement admitted contract. Existing admissible runtime evidence may be consumed according to policy without treating its existence as a new runtime request. REPAIR: max_attempts zero means repair is not requested; a positive value requires repair in requested_operations, and schema v1.0 also requires repair in requested_operations to have a positive max_attempts. max_attempts is only a contract ceiling and must satisfy active trusted-policy bounds and eligibility rules. No numeric value creates repair authority. HUMAN APPROVAL: approval_id values must be globally unique. Every before_operation must occur in this exact contract's requested_operations. Every approval_ref must resolve to exact immutable/versioned applicable trusted approval configuration. Every listed human_approval_requirement is independently mandatory. Before an operation, all contract approval requirements whose before_operation equals that operation must have applicable admitted approval evidence. Contract approval requirements may strengthen but never weaken active-policy or Target Registration requirements. human_approval evaluator bindings remain acceptance evidence and are distinct from these action-gating approval requirements. DELEGATION: max_depth is the maximum number of additional delegation edges below the authority associated with this contract. Zero permits no child delegation; one permits one child edge; two permits a child and one further descendant edge, subject at every step to authority ancestry. On each delegation edge, child remaining depth must be no greater than parent remaining depth minus one. The authoritative remaining depth is derived from and persisted with admitted authorization ancestry; a child contract cannot reset or increase it. max_depth zero requires an empty delegable_operations list with no risk_ceiling. Positive max_depth requires a non-empty delegable_operations list and risk_ceiling. delegable_operations must be a subset of requested_operations. risk_ceiling constrains the child's effective authoritative risk, not merely its declared risk_floor. Both depth and risk remain subject to stricter active-policy and authorization-ancestry limits. Delegation remains target-bound and cannot amplify scope, operations, capabilities, authorization validity, risk authority, or any ancestor authority. CROSS-FIELD AND AUTHORITY CHECKS: JSON Schema validity alone does not enforce global keyed uniqueness, arbitrary set inclusion, immutable configuration resolution, exact raw-byte identity binding, root-resource disjointness, exact Target Registration applicability, evaluator-set policy compatibility, operation prerequisites, approval conjunction satisfaction, authorization, authoritative risk computation, lifecycle state, current authoritative state, provenance, freshness, or policy continuity. These relationships must be established deterministically during trusted admission/evaluation. Missing, stale, conflicting, ambiguous, unauthorized, mutable-identity-dependent, root-impact-uncertain, or unverifiable security-relevant relationships fail closed."
+}
