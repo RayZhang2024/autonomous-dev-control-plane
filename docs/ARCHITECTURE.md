@@ -1,7 +1,7 @@
 # Autonomous Development v2 — Architecture
 
-**Status:** Phase 0 baseline  
-**Version:** 1.0  
+**Status:** Phase 0 frozen  
+**Version:** 1.2  
 **Repository:** `RayZhang2024/autonomous-dev-control-plane`  
 **Governing policy:** `docs/CORE_POLICY.md` v1.0
 
@@ -637,13 +637,13 @@ A GitHub issue provides human context and discussion.
 
 It is not itself the autonomous execution contract.
 
-An autonomously executable task has a canonical structured issue contract describing conceptually:
+An autonomously executable ordinary task has a canonical structured issue contract describing conceptually:
 
 ```text
 identity
 objective
 target registration identity
-authorized scope
+contract-bounded requested scope
 prohibited scope
 requested operations
 base constraints
@@ -657,6 +657,8 @@ delegation limits
 ```
 
 The exact format belongs in `schemas/issue-contract.schema.json`.
+
+Contract scope is a requested-work ceiling only. It does not establish authorization, authoritative risk, lifecycle state, evaluator authority, publication permission, controlled-runtime permission, merge authority, or root authority.
 
 Contract validity does not establish authority.
 
@@ -1407,21 +1409,30 @@ The architecture assumes events may be:
 - reordered;
 - observed after restart.
 
-Consequential requests SHOULD carry stable operation identities.
+Consequential operations use stable operation identities where required for provenance, idempotency, bounded-attempt accounting, protected-effect tracking, or reconciliation.
 
-Canonical state must distinguish:
+The canonical protected-operation lifecycle is defined by `STATE_MACHINE.md` and contains:
 
 ```text
-not attempted
-authorized
-performed
-already performed
+reserved
+performing
+succeeded
+failed
 conflict
+indeterminate
 ```
 
-An existing postcondition is accepted as idempotently complete only when exact identity proves it is the intended result of the intended operation.
+This section does not define a second operation-state vocabulary.
+
+Duplicate delivery of one operation identity MUST NOT silently create a second protected effect, consume an additional bounded attempt, or become a newly authorized operation.
+
+A retry that represents a genuinely new authorized attempt requires a new operation identity where `STATE_MACHINE.md` requires one.
+
+An existing external postcondition may be accepted as idempotently complete only when exact identity establishes that it is the intended result of the exact intended operation.
 
 Superficially similar state is insufficient.
+
+Uncertain protected effects require reconciliation according to `STATE_MACHINE.md`; uncertainty MUST NOT be interpreted as permission to repeat the operation.
 
 ---
 
@@ -1485,31 +1496,94 @@ Security-relevant target configuration becomes trusted only through authenticate
 
 ## 45. Root and self-modification path
 
-A trusted-core candidate follows:
+Trusted-core, active-policy, trusted-enforcement, trusted-membership, and other root-protected changes follow the separate root-change path.
+
+At architecture level, the transition is:
 
 ```text
-active core N
-      ↓
-candidate N+1
-      ↓
-validation under active N
-      ↓
+active trusted system N
+        ↓
+candidate trusted system N+1
+        ↓
+validation governed by N
+        ↓
 independent semantic review
-      ↓
-explicit root/human approval
-      ↓
-Root Activation
-      ↓
-active manifest N+1
+        ↓
+authenticated external root approval
+        ↓
+External Root Authority closes transition barrier
+        ↓
+quiescence / reconciliation
+        ↓
+N-governed readiness H
+        ↓
+External Root Authority seals H
+        ↓
+active-manifest pointer N → N+1
+while transition remains CLOSED
+        ↓
+establish or preserve independent
+pre-release capability fencing
+        ↓
+stage / deploy exact N+1 trusted contexts
+under that independent fence
+        ↓
+N-governed verification of:
+    actual deployed/executing N+1 identities
+    exact intended capability bindings
+    effective pre-release capability fencing
+        ↓
+N-governed release verification V
+        ↓
+External Root Authority seals V
+        ↓
+fresh release-state verification
+        ↓
+External Root Authority releases barrier
+        ↓
+N+1 governs newly starting protected operations
 ```
 
-Candidate `N+1` cannot establish the rules governing its own activation.
+The active-manifest pointer changing to `N+1` does **not** by itself complete the policy-epoch handover.
 
-Ordinary merge authority MUST NOT provide an alternate route around root activation.
+While the root transition remains closed:
 
-Trusted-core source may exist or even be merged without thereby becoming active.
+```text
+transition.from = N
+```
 
-Detailed bootstrap and activation rules belong in `SELF_MODIFICATION.md`.
+continues to identify the trusted predecessor governing transition-completion rules.
+
+Candidate `N+1` MUST NOT become the authoritative evaluator of whether its own transition is complete.
+
+Candidate `N+1` MUST NOT be capable of producing a protected consequential effect while the transition is closed.
+
+Any `N+1` trusted security context staged or executed before release MUST already be subject to an enforcement mechanism outside candidate `N+1` that independently prevents such protected effects.
+
+Candidate compliance with the closed barrier is not itself sufficient enforcement.
+
+Ordinary merge authority MUST NOT provide an alternate route around the root-change path.
+
+Trusted-core source may exist, be committed, or be merged without thereby becoming the governing trusted system.
+
+`SELF_MODIFICATION.md` defines the detailed root-transition protocol, including:
+
+- External Root Authority;
+- Root Trust Anchor;
+- root-impact determination;
+- predecessor-governed evaluation;
+- readiness and readiness sealing;
+- active-manifest pointer mutation;
+- pre-release capability fencing;
+- deployed-runtime verification;
+- release verification and sealing;
+- barrier release;
+- pre-release rollback;
+- recovery and external-root migration.
+
+The architectural invariant is:
+
+> **Candidate `N+1` becomes the normal governing policy for newly starting protected autonomous work only after the predecessor-governed root transition has successfully crossed the externally controlled release boundary.**
 
 ---
 
