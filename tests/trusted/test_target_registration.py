@@ -198,6 +198,47 @@ def test_publication_merge_and_ref_consistency() -> None:
     assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INCONSISTENT_CONFIGURATION
 
 
+def test_multiple_target_integration_refs_load_and_admit() -> None:
+    value = registration()
+    value["allowed_task_capabilities"].append("merge")
+    value["protected_refs"] = ["refs/heads/main", "refs/heads/release"]
+    value["merge"] = {
+        "service_identity": "merger",
+        "merge_profile_id": "merge-profile",
+        "allowed_integration_refs": ["refs/heads/main", "refs/heads/release"],
+    }
+    item = candidate(value)
+    assert tuple(ref.value for ref in item.merge.allowed_integration_refs) == (
+        "refs/heads/main", "refs/heads/release",
+    )
+    approval, policy, assessment = contexts(item)
+    result = admit_target_registration(item, approval, policy, assessment)
+    assert result.decision is Decision.ALLOW
+    assert tuple(ref.value for ref in result.admitted_registration.merge.allowed_integration_refs) == (
+        "refs/heads/main", "refs/heads/release",
+    )
+
+
+def test_repository_display_name_exact_length_grammar() -> None:
+    value = registration()
+    value["repository"]["display_name"] = ""
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INVALID_FIELD_VALUE
+    value["repository"]["display_name"] = "x" * 513
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INVALID_FIELD_VALUE
+    value["repository"]["display_name"] = "x" * 512
+    assert isinstance(load_candidate_target_registration(encode(value)), CandidateTargetRegistration)
+
+
+def test_mutation_change_type_cardinality_precedes_duplicates() -> None:
+    value = registration()
+    value["ordinary_allowed_scope"][0]["change_types"] = []
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.EMPTY_REQUIRED_SET
+    value["ordinary_allowed_scope"][0]["change_types"] = [
+        "add", "modify", "delete", "mode_change", "add",
+    ]
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INVALID_FIELD_VALUE
+
+
 def test_deferred_merge_duplicate_and_canonical_context_validation() -> None:
     value = registration()
     value["allowed_task_capabilities"].append("merge")

@@ -99,6 +99,8 @@ def test_semantic_duplicate_scope_rules_reject_change_order_variants() -> None:
             rule(selector, ChangeType.ADD, ChangeType.MODIFY),
             rule(selector, ChangeType.MODIFY, ChangeType.ADD),
         ))
+    with pytest.raises(ValueError):
+        MutationScopeRule(RepositorySelector(), ())
 
 
 def test_canonical_branch_ref_acceptance_and_rejections() -> None:

@@ -82,23 +82,24 @@ def epoch(char: str = "e") -> PolicyEpochIdentity:
 def admitted_target(
     current_epoch: PolicyEpochIdentity | None = None, *, display_name: str = "owner/repo",
     capabilities: list[str] | None = None, runtime_profiles: list[str] | None = None,
-    merge_ref: str | None = None,
+    merge_ref: str | list[str] | None = None,
 ):
     capabilities = capabilities or ["implementation"]
     runtime_profiles = runtime_profiles or []
+    merge_refs = [merge_ref] if type(merge_ref) is str else (merge_ref or [])
     value = {
         "format": "autodev.target-registration/v1",
         "repository": {"platform": "github", "repository_id": "1363823008", "display_name": display_name},
         "path_model": "git_utf8_regular_file/v1",
-        "protected_refs": [] if merge_ref is None else [merge_ref],
+        "protected_refs": merge_refs,
         "allowed_task_capabilities": capabilities,
         "ordinary_allowed_scope": [{"selector": {"kind": "repository"}, "change_types": ["modify"]}],
         "ordinary_forbidden_scope": [],
         "risk_ceiling": "supervised",
         "target_publication": None,
-        "merge": None if merge_ref is None else {
+        "merge": None if not merge_refs else {
             "service_identity": "merger", "merge_profile_id": "merge-profile",
-            "allowed_integration_refs": [merge_ref],
+            "allowed_integration_refs": merge_refs,
         },
         "validation_profile_ids": [],
         "controlled_runtime_profile_ids": runtime_profiles,
@@ -168,10 +169,39 @@ def load_proposal(target_id: TargetRegistrationId, **kwargs) -> CandidateAuthori
     return result
 
 
+def load_operational_proposal(
+    target_id: TargetRegistrationId, *, integration_ref: str | None = None,
+    runtime_profiles: list[str] | None = None, repair_max_attempts: int = 0,
+) -> CandidateAuthorizationProposal:
+    value = proposal_json(target_id)
+    capabilities = ["implementation"]
+    if integration_ref is not None:
+        capabilities.append("merge")
+    if runtime_profiles:
+        capabilities.append("controlled_runtime")
+    if repair_max_attempts:
+        capabilities.append("repair")
+    value["capabilities"] = capabilities
+    value["operational_constraints"] = {
+        "integration_refs": [] if integration_ref is None else [integration_ref],
+        "controlled_runtime_profile_ids": runtime_profiles or [],
+        "repair_max_attempts": repair_max_attempts,
+    }
+    result = load_candidate_authorization_proposal(json.dumps(value).encode())
+    assert isinstance(result, CandidateAuthorizationProposal)
+    return result
+
+
 def direct_contexts(proposal: CandidateAuthorizationProposal, target, current_epoch=None, auth_event="approval"):
     current_epoch = current_epoch or target.policy_epoch_identity
     principal = HumanPrincipalId("issuer")
-    empty_ops = AuthorizationOperationalConstraints((), (), 0)
+    delegable_capabilities = proposal.delegation.delegable_capabilities or (TaskCapability.IMPLEMENTATION,)
+    delegable_scope = (
+        proposal.delegation.delegable_mutation_scope
+        if proposal.delegation.delegable_mutation_scope.rules
+        else repo_scope()
+    )
+    delegation_risk_ceiling = proposal.delegation.risk_ceiling or RiskTier.SUPERVISED
     contract = _contract_authority_ceiling_for_test(
         task_id=proposal.task_id, contract_id=proposal.contract_id,
         contract_raw_sha256=proposal.contract_raw_sha256, target_registration_id=proposal.target_registration_id,
@@ -180,8 +210,8 @@ def direct_contexts(proposal: CandidateAuthorizationProposal, target, current_ep
         integration_ref=(None if not proposal.operational_constraints.integration_refs else proposal.operational_constraints.integration_refs[0]),
         controlled_runtime_profile_ids=proposal.operational_constraints.controlled_runtime_profile_ids,
         repair_max_attempts=proposal.operational_constraints.repair_max_attempts,
-        delegation_max_depth=3, delegable_capabilities=(TaskCapability.IMPLEMENTATION,),
-        delegation_risk_ceiling=RiskTier.SUPERVISED,
+        delegation_max_depth=3, delegable_capabilities=delegable_capabilities,
+        delegation_risk_ceiling=delegation_risk_ceiling,
     )
     policy = _authorization_policy_context_for_test(
         policy_epoch_identity=current_epoch, target_registration_id=proposal.target_registration_id,
@@ -190,9 +220,10 @@ def direct_contexts(proposal: CandidateAuthorizationProposal, target, current_ep
         mandatory_forbidden_mutation_scope=MutationScope(()), maximum_operational_constraints=proposal.operational_constraints,
         maximum_authorization_risk_ceiling=RiskTier.SUPERVISED,
         effective_authoritative_risk=RiskTier.ROUTINE, risk_relation=relation(),
-        maximum_delegation_depth=3, maximum_delegable_capabilities=(TaskCapability.IMPLEMENTATION,),
-        maximum_delegable_mutation_scope=repo_scope(), maximum_delegable_operational_constraints=empty_ops,
-        maximum_delegation_risk_ceiling=RiskTier.SUPERVISED,
+        maximum_delegation_depth=3, maximum_delegable_capabilities=delegable_capabilities,
+        maximum_delegable_mutation_scope=delegable_scope,
+        maximum_delegable_operational_constraints=proposal.delegation.delegable_operational_constraints,
+        maximum_delegation_risk_ceiling=delegation_risk_ceiling,
     )
     issuer = _direct_issuer_envelope_for_test(
         policy_epoch_identity=current_epoch, human_principal_id=principal,
@@ -200,9 +231,10 @@ def direct_contexts(proposal: CandidateAuthorizationProposal, target, current_ep
         contract_id=proposal.contract_id, contract_raw_sha256=proposal.contract_raw_sha256,
         maximum_capabilities=proposal.capabilities, maximum_mutation_scope=repo_scope(),
         maximum_operational_constraints=proposal.operational_constraints, maximum_authorization_risk_ceiling=RiskTier.SUPERVISED,
-        maximum_delegation_depth=3, maximum_delegable_capabilities=(TaskCapability.IMPLEMENTATION,),
-        maximum_delegable_mutation_scope=repo_scope(), maximum_delegable_operational_constraints=empty_ops,
-        maximum_delegation_risk_ceiling=RiskTier.SUPERVISED,
+        maximum_delegation_depth=3, maximum_delegable_capabilities=delegable_capabilities,
+        maximum_delegable_mutation_scope=delegable_scope,
+        maximum_delegable_operational_constraints=proposal.delegation.delegable_operational_constraints,
+        maximum_delegation_risk_ceiling=delegation_risk_ceiling,
     )
     approval = _authenticated_human_approval_for_test(
         human_principal_id=principal, authentication_event_id=AuthenticationEventId(auth_event),
@@ -254,6 +286,34 @@ def test_loader_duplicate_and_operational_zero_depth_consistency() -> None:
     assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
     value = proposal_json(target.target_registration_id)
     value["operational_constraints"]["repair_max_attempts"] = 0.5
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INVALID_FIELD_VALUE
+
+
+def test_duplicate_candidate_operational_and_delegable_scope_return_failures() -> None:
+    target = admitted_target()
+    value = proposal_json(target.target_registration_id)
+    value["capabilities"].append("controlled_runtime")
+    value["operational_constraints"]["controlled_runtime_profile_ids"] = ["runtime", "runtime"]
+    duplicate_profiles = load_candidate_authorization_proposal(json.dumps(value).encode())
+    assert duplicate_profiles.code is AuthorizationProposalFailureCode.DUPLICATE_IDENTITY
+
+    value = proposal_json(target.target_registration_id, depth=1)
+    value["delegation"]["delegable_mutation_scope"] = [
+        {"selector": {"kind": "repository"}, "change_types": ["add", "modify"]},
+        {"selector": {"kind": "repository"}, "change_types": ["modify", "add"]},
+    ]
+    duplicate_scope = load_candidate_authorization_proposal(json.dumps(value).encode())
+    assert duplicate_scope.code is AuthorizationProposalFailureCode.DUPLICATE_IDENTITY
+
+
+def test_authorization_mutation_change_type_cardinality_precedence() -> None:
+    target = admitted_target()
+    value = proposal_json(target.target_registration_id)
+    value["mutation_scope"][0]["change_types"] = []
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET
+    value["mutation_scope"][0]["change_types"] = [
+        "add", "modify", "delete", "mode_change", "add",
+    ]
     assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INVALID_FIELD_VALUE
 
 
@@ -463,6 +523,62 @@ def test_direct_operational_dimensions_precede_root_overlap() -> None:
     low_repair = _direct_issuer_envelope_for_test(**issuer_fields)
     assert admit_direct_authorization(proposal, target, contract, policy, approval, low_repair, protected_root).reason_code is AuthorizationAdmissionReasonCode.REPAIR_ATTEMPTS_NOT_PERMITTED
     assert admit_direct_authorization(proposal, target, contract, policy, approval, issuer, protected_root).reason_code is AuthorizationAdmissionReasonCode.ROOT_SCOPE_OVERLAP
+
+
+def test_target_operational_membership_uses_full_ref_and_runtime_allowlists_only() -> None:
+    target = admitted_target(
+        capabilities=["implementation", "merge", "controlled_runtime", "repair"],
+        runtime_profiles=["runtime-a", "runtime-b"],
+        merge_ref=["refs/heads/main", "refs/heads/release"],
+    )
+    for ref in ("refs/heads/main", "refs/heads/release"):
+        proposal = load_operational_proposal(
+            target.target_registration_id, integration_ref=ref,
+            runtime_profiles=["runtime-b"], repair_max_attempts=3,
+        )
+        result = admit_direct_authorization(proposal, target, *direct_contexts(proposal, target))
+        assert result.decision is Decision.ALLOW
+
+    outside = load_operational_proposal(
+        target.target_registration_id, integration_ref="refs/heads/other",
+        runtime_profiles=["runtime-a"], repair_max_attempts=3,
+    )
+    assert admit_direct_authorization(
+        outside, target, *direct_contexts(outside, target)
+    ).reason_code is AuthorizationAdmissionReasonCode.INTEGRATION_REF_NOT_PERMITTED
+
+    unbounded_by_target = load_operational_proposal(
+        target.target_registration_id,
+        repair_max_attempts=2**80,
+    )
+    result = admit_direct_authorization(
+        unbounded_by_target, target, *direct_contexts(unbounded_by_target, target)
+    )
+    assert result.decision is Decision.ALLOW
+
+
+def test_delegated_repair_intersection_has_no_target_repair_ceiling() -> None:
+    target = admitted_target(capabilities=["implementation", "repair"])
+    attempts = 2**80
+    parent_value = proposal_json(target.target_registration_id, depth=2)
+    parent_value["capabilities"] = ["implementation", "repair"]
+    parent_value["operational_constraints"]["repair_max_attempts"] = attempts
+    parent_value["delegation"]["delegable_capabilities"] = ["implementation", "repair"]
+    parent_value["delegation"]["delegable_operational_constraints"]["repair_max_attempts"] = attempts
+    parent = load_candidate_authorization_proposal(json.dumps(parent_value).encode())
+    assert isinstance(parent, CandidateAuthorizationProposal)
+    admitted_parent = admit_direct_authorization(parent, target, *direct_contexts(parent, target)).admitted_authorization
+
+    child_value = proposal_json(
+        target.target_registration_id, delegated_parent=admitted_parent.authorization_id
+    )
+    child_value["capabilities"] = ["implementation", "repair"]
+    child_value["operational_constraints"]["repair_max_attempts"] = attempts
+    child = load_candidate_authorization_proposal(json.dumps(child_value).encode())
+    assert isinstance(child, CandidateAuthorizationProposal)
+    contract, policy, _, _, root = direct_contexts(child, target)
+    result = admit_delegated_authorization(child, target, contract, policy, admitted_parent, root)
+    assert result.decision is Decision.ALLOW
 
 
 def test_direct_delegation_risk_cannot_exceed_own_authorization_ceiling() -> None:

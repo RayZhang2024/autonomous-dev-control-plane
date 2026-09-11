@@ -219,6 +219,8 @@ class MutationScopeRule:
         if type(self.selector) not in (RepositorySelector, ExactPathSelector, PathPrefixSelector):
             raise TypeError("selector has wrong exact type")
         _exact_tuple_of(self.change_types, ChangeType, len(ChangeType))
+        if not self.change_types:
+            raise ValueError("change_types must be non-empty")
 
     def semantic_key(self) -> tuple[object, frozenset[ChangeType]]:
         return (self.selector, frozenset(self.change_types))
@@ -360,10 +362,10 @@ def parse_mutation_scope_json(
         problem = _field_problem(item, ("selector", "change_types"))
         if problem is not None:
             return ScopeParseProblem(problem)
-        if type(item["change_types"]) is not tuple:
-            return ScopeParseProblem("type")
         selector_value = item["selector"]
         if type(selector_value) is not MappingProxyType:
+            return ScopeParseProblem("type")
+        if type(item["change_types"]) is not tuple:
             return ScopeParseProblem("type")
         if "kind" not in selector_value:
             return ScopeParseProblem("missing")
@@ -389,6 +391,8 @@ def parse_mutation_scope_json(
                 selector = PathPrefixSelector(CanonicalGitPath(selector_value["path_prefix"]))
         except ValueError:
             return ScopeParseProblem("value")
+        if len(item["change_types"]) > len(ChangeType):
+            return ScopeParseProblem("value")
         changes: list[ChangeType] = []
         seen_changes: set[ChangeType] = set()
         for raw_change in item["change_types"]:
@@ -405,6 +409,8 @@ def parse_mutation_scope_json(
                 continue
             seen_changes.add(change)
             changes.append(change)
+        if not changes:
+            return ScopeParseProblem("empty")
         rule = MutationScopeRule(selector, tuple(changes))
         key = rule.semantic_key()
         if key in keys:

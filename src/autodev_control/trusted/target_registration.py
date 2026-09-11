@@ -251,6 +251,7 @@ def _problem(kind: str) -> TargetRegistrationFailure:
         "unknown": TargetRegistrationFailureCode.UNKNOWN_FIELD,
         "value": TargetRegistrationFailureCode.INVALID_FIELD_VALUE,
         "duplicate": TargetRegistrationFailureCode.DUPLICATE_IDENTITY,
+        "empty": TargetRegistrationFailureCode.EMPTY_REQUIRED_SET,
     }
     return _failure(mapping[kind])
 
@@ -383,6 +384,8 @@ def load_candidate_target_registration(raw: object) -> CandidateTargetRegistrati
     try:
         repository_id = GitHubRepositoryId(repository["repository_id"])
     except ValueError:
+        return _failure(TargetRegistrationFailureCode.INVALID_FIELD_VALUE)
+    if not 1 <= len(repository["display_name"]) <= 512:
         return _failure(TargetRegistrationFailureCode.INVALID_FIELD_VALUE)
     if value["path_model"] != _PATH_MODEL:
         return _failure(TargetRegistrationFailureCode.INVALID_FIELD_VALUE)

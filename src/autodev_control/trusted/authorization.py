@@ -318,6 +318,7 @@ def _map_scope_problem(problem: ScopeParseProblem) -> AuthorizationProposalFailu
         "unknown": AuthorizationProposalFailureCode.UNKNOWN_FIELD,
         "value": AuthorizationProposalFailureCode.INVALID_FIELD_VALUE,
         "duplicate": AuthorizationProposalFailureCode.DUPLICATE_IDENTITY,
+        "empty": AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET,
     }
     return _failure(mapping[problem.kind])
 
@@ -385,7 +386,33 @@ def _parse_profiles(value: object) -> tuple[tuple[ImmutableConfigId, ...], bool]
     return tuple(result), duplicate
 
 
-def _parse_operational(value: object) -> tuple[AuthorizationOperationalConstraints, bool] | AuthorizationProposalFailure:
+@dataclass(frozen=True, slots=True)
+class _ParsedOperationalConstraints:
+    integration_refs: tuple[CanonicalBranchRef, ...]
+    controlled_runtime_profile_ids: tuple[ImmutableConfigId, ...]
+    repair_max_attempts: int
+    has_duplicates: bool
+
+    def canonical(self) -> AuthorizationOperationalConstraints:
+        return AuthorizationOperationalConstraints(
+            self.integration_refs,
+            self.controlled_runtime_profile_ids,
+            self.repair_max_attempts,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedDelegationAllowance:
+    remaining_depth: int
+    delegable_capabilities: tuple[TaskCapability, ...]
+    delegable_mutation_scope: ParsedMutationScope
+    delegable_operational_constraints: _ParsedOperationalConstraints
+    risk_ceiling: RiskTier | None
+    has_duplicates: bool
+    has_zero_depth_inconsistency: bool
+
+
+def _parse_operational(value: object) -> _ParsedOperationalConstraints | AuthorizationProposalFailure:
     fields = ("integration_refs", "controlled_runtime_profile_ids", "repair_max_attempts")
     problem = _field_set(value, fields)
     if problem is not None:
@@ -401,10 +428,12 @@ def _parse_operational(value: object) -> tuple[AuthorizationOperationalConstrain
     repair_max_attempts = value["repair_max_attempts"]
     if repair_max_attempts != repair_max_attempts.to_integral_value() or repair_max_attempts < 0:
         return _failure(AuthorizationProposalFailureCode.INVALID_FIELD_VALUE)
-    return AuthorizationOperationalConstraints(refs[0], profiles[0], int(repair_max_attempts)), refs[1] or profiles[1]
+    return _ParsedOperationalConstraints(
+        refs[0], profiles[0], int(repair_max_attempts), refs[1] or profiles[1]
+    )
 
 
-def _parse_delegation(value: object) -> tuple[DelegationAllowance, bool, bool] | AuthorizationProposalFailure:
+def _parse_delegation(value: object) -> _ParsedDelegationAllowance | AuthorizationProposalFailure:
     fields = (
         "remaining_depth", "delegable_capabilities", "delegable_mutation_scope",
         "delegable_operational_constraints", "risk_ceiling",
@@ -431,26 +460,20 @@ def _parse_delegation(value: object) -> tuple[DelegationAllowance, bool, bool] |
         risk = None if value["risk_ceiling"] is None else RiskTier(value["risk_ceiling"])
     except ValueError:
         return _failure(AuthorizationProposalFailureCode.INVALID_FIELD_VALUE)
-    duplicate = capabilities[1] or scope.has_duplicates or operational[1]
+    duplicate = capabilities[1] or scope.has_duplicates or operational.has_duplicates
     zero_inconsistent = depth == 0 and (
-        capabilities[0] or scope.rules or operational[0] != AuthorizationOperationalConstraints((), (), 0) or risk is not None
+        capabilities[0]
+        or scope.rules
+        or operational.integration_refs
+        or operational.controlled_runtime_profile_ids
+        or operational.repair_max_attempts != 0
+        or risk is not None
     )
     positive_inconsistent = depth > 0 and risk is None
-    if duplicate:
-        clean_scope = MutationScope(tuple(dict.fromkeys(scope.rules)))
-    else:
-        clean_scope = MutationScope(scope.rules)
-    try:
-        allowance = DelegationAllowance(depth, tuple(dict.fromkeys(capabilities[0])), clean_scope, operational[0], risk)
-    except ValueError:
-        allowance = object.__new__(DelegationAllowance)
-        for name, item in (
-            ("remaining_depth", depth), ("delegable_capabilities", tuple(dict.fromkeys(capabilities[0]))),
-            ("delegable_mutation_scope", clean_scope), ("delegable_operational_constraints", operational[0]),
-            ("risk_ceiling", risk),
-        ):
-            object.__setattr__(allowance, name, item)
-    return allowance, duplicate, zero_inconsistent or positive_inconsistent
+    return _ParsedDelegationAllowance(
+        depth, capabilities[0], scope, operational, risk, duplicate,
+        zero_inconsistent or positive_inconsistent,
+    )
 
 
 def load_candidate_authorization_proposal(raw: object) -> CandidateAuthorizationProposal | AuthorizationProposalFailure:
@@ -514,33 +537,40 @@ def load_candidate_authorization_proposal(raw: object) -> CandidateAuthorization
     delegation = _parse_delegation(value["delegation"])
     if type(delegation) is AuthorizationProposalFailure:
         return delegation
-    if capabilities[1] or scope.has_duplicates or operational[1] or delegation[1]:
+    if capabilities[1] or scope.has_duplicates or operational.has_duplicates or delegation.has_duplicates:
         return _failure(AuthorizationProposalFailureCode.DUPLICATE_IDENTITY)
     if not capabilities[0]:
         return _failure(AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET)
-    clean_scope = MutationScope(scope.rules)
     has_merge = TaskCapability.MERGE in capabilities[0]
     has_runtime = TaskCapability.CONTROLLED_RUNTIME in capabilities[0]
     has_repair = TaskCapability.REPAIR in capabilities[0]
-    if has_merge != (len(operational[0].integration_refs) == 1) or has_runtime != bool(operational[0].controlled_runtime_profile_ids) or has_repair != (operational[0].repair_max_attempts >= 1):
+    if has_merge != (len(operational.integration_refs) == 1) or has_runtime != bool(operational.controlled_runtime_profile_ids) or has_repair != (operational.repair_max_attempts >= 1):
         return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
-    delegable = delegation[0]
-    dops = delegable.delegable_operational_constraints
+    dops = delegation.delegable_operational_constraints
     if (
-        (TaskCapability.MERGE in delegable.delegable_capabilities) != (len(dops.integration_refs) == 1)
-        or (TaskCapability.CONTROLLED_RUNTIME in delegable.delegable_capabilities) != bool(dops.controlled_runtime_profile_ids)
-        or (TaskCapability.REPAIR in delegable.delegable_capabilities) != (dops.repair_max_attempts >= 1)
+        (TaskCapability.MERGE in delegation.delegable_capabilities) != (len(dops.integration_refs) == 1)
+        or (TaskCapability.CONTROLLED_RUNTIME in delegation.delegable_capabilities) != bool(dops.controlled_runtime_profile_ids)
+        or (TaskCapability.REPAIR in delegation.delegable_capabilities) != (dops.repair_max_attempts >= 1)
     ):
         return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
-    if delegation[2]:
+    if delegation.has_zero_depth_inconsistency:
         return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
+    clean_scope = MutationScope(scope.rules)
+    operational_constraints = operational.canonical()
+    delegable = DelegationAllowance(
+        delegation.remaining_depth,
+        delegation.delegable_capabilities,
+        MutationScope(delegation.delegable_mutation_scope.rules),
+        delegation.delegable_operational_constraints.canonical(),
+        delegation.risk_ceiling,
+    )
     return _new_private(
         CandidateAuthorizationProposal, _SUCCESS_KEY, _SUCCESS_KEY,
         source_document=document, proposal_raw_sha256=document.raw_sha256, kind=kind,
         issuer_principal_id=issuer, parent_authorization_id=parent, task_id=task_id,
         contract_id=contract_id, contract_raw_sha256=contract_sha, target_registration_id=target_id,
         capabilities=capabilities[0], mutation_scope=clean_scope,
-        operational_constraints=operational[0], risk_ceiling=risk_ceiling, delegation=delegable,
+        operational_constraints=operational_constraints, risk_ceiling=risk_ceiling, delegation=delegable,
     )
 
 
@@ -576,12 +606,18 @@ def _ops_fit(child: AuthorizationOperationalConstraints, ceiling: AuthorizationO
 def _ops_fit_all(
     child: AuthorizationOperationalConstraints,
     ceilings: tuple[AuthorizationOperationalConstraints, ...],
+    target: AdmittedTargetRegistration,
 ) -> AuthorizationAdmissionReasonCode | None:
-    if any(any(ref not in ceiling.integration_refs for ref in child.integration_refs) for ceiling in ceilings):
+    target_refs = () if target.merge is None else target.merge.allowed_integration_refs
+    if any(
+        ref not in target_refs or any(ref not in ceiling.integration_refs for ceiling in ceilings)
+        for ref in child.integration_refs
+    ):
         return AuthorizationAdmissionReasonCode.INTEGRATION_REF_NOT_PERMITTED
     if any(
-        any(profile not in ceiling.controlled_runtime_profile_ids for profile in child.controlled_runtime_profile_ids)
-        for ceiling in ceilings
+        profile not in target.controlled_runtime_profile_ids
+        or any(profile not in ceiling.controlled_runtime_profile_ids for ceiling in ceilings)
+        for profile in child.controlled_runtime_profile_ids
     ):
         return AuthorizationAdmissionReasonCode.RUNTIME_PROFILE_NOT_PERMITTED
     if any(child.repair_max_attempts > ceiling.repair_max_attempts for ceiling in ceilings):
@@ -717,9 +753,9 @@ def admit_direct_authorization(
     scope_reason = _scope_and_prohibitions(proposal, target, contract, policy, (issuer.maximum_mutation_scope,))
     if scope_reason is not None: return _result(scope_reason)
     reason = _ops_fit_all(proposal.operational_constraints, (
-        contract_to_ops(contract), target_to_ops(target), policy.maximum_operational_constraints,
+        contract_to_ops(contract), policy.maximum_operational_constraints,
         issuer.maximum_operational_constraints,
-    ))
+    ), target)
     if reason is not None: return _result(reason)
     if root.root_protected_mutation_scope is not None and scopes_overlap(proposal.mutation_scope, root.root_protected_mutation_scope):
         return _result(AuthorizationAdmissionReasonCode.ROOT_SCOPE_OVERLAP)
@@ -793,8 +829,8 @@ def admit_delegated_authorization(
     if scope_reason is not None: return _result(scope_reason)
     reason = _ops_fit_all(proposal.operational_constraints, (
         parent.delegation.delegable_operational_constraints, contract_to_ops(contract),
-        target_to_ops(target), policy.maximum_operational_constraints,
-    ))
+        policy.maximum_operational_constraints,
+    ), target)
     if reason is not None: return _result(reason)
     if root.root_protected_mutation_scope is not None and scopes_overlap(proposal.mutation_scope, root.root_protected_mutation_scope):
         return _result(AuthorizationAdmissionReasonCode.ROOT_SCOPE_OVERLAP)
@@ -830,11 +866,6 @@ def admit_delegated_authorization(
 def contract_to_ops(contract: ContractAuthorityCeiling) -> AuthorizationOperationalConstraints:
     refs = () if contract.integration_ref is None else (contract.integration_ref,)
     return AuthorizationOperationalConstraints(refs, contract.controlled_runtime_profile_ids, contract.repair_max_attempts)
-
-
-def target_to_ops(target: AdmittedTargetRegistration) -> AuthorizationOperationalConstraints:
-    refs = () if target.merge is None else target.merge.allowed_integration_refs
-    return AuthorizationOperationalConstraints(refs, target.controlled_runtime_profile_ids, 2**63 - 1)
 
 
 def _authenticated_human_approval_for_test(**fields: object) -> AuthenticatedHumanAuthorizationApproval:
