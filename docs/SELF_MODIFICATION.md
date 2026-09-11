@@ -1,7 +1,7 @@
 # Autonomous Development v2 — Self-Modification and Root Activation
 
 **Status:** Phase 0 frozen  
-**Version:** 1.0  
+**Version:** 1.1  
 **Repository:** `RayZhang2024/autonomous-dev-control-plane`
 
 ## 1. Purpose
@@ -1995,7 +1995,7 @@ It does not itself grant authority to open the barrier.
 
 ## 64. Release-verification sealing
 
-Before barrier release, the External Root Authority SHOULD seal the exact Release Verification Record identity into externally protected transition state.
+Before barrier release, the External Root Authority MUST seal the exact Release Verification Record identity into externally protected transition state.
 
 Suppose release verification `V` was established against:
 
