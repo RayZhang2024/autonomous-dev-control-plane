@@ -1,0 +1,27 @@
+"""The policy/action decision domain, deliberately separate from parsing."""
+
+from dataclasses import dataclass
+from enum import Enum
+
+from .errors import DecisionReasonCode
+from .identity import LogicalIdentifier
+
+
+class Decision(Enum):
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    ESCALATE = "ESCALATE"
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedDecision:
+    decision: Decision
+    reason_code: DecisionReasonCode
+    subject: LogicalIdentifier | None = None
+    explanation: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.decision) is not Decision:
+            raise TypeError("decision must be exactly Decision")
+        if type(self.reason_code) is not DecisionReasonCode:
+            raise TypeError("reason_code must be exactly DecisionReasonCode")
