@@ -7,7 +7,7 @@ from .errors import DecisionReasonCode
 from .identity import LogicalIdentifier
 
 
-class Decision(str, Enum):
+class Decision(Enum):
     ALLOW = "ALLOW"
     DENY = "DENY"
     ESCALATE = "ESCALATE"
@@ -19,3 +19,9 @@ class TrustedDecision:
     reason_code: DecisionReasonCode
     subject: LogicalIdentifier | None = None
     explanation: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.decision) is not Decision:
+            raise TypeError("decision must be exactly Decision")
+        if type(self.reason_code) is not DecisionReasonCode:
+            raise TypeError("reason_code must be exactly DecisionReasonCode")

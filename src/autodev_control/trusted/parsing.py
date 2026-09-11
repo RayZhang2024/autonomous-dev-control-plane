@@ -56,7 +56,7 @@ def _valid_limits(limits: object) -> bool:
 
 
 def _scan_depth(text: str, maximum: int) -> ParseFailure | None:
-    depth = 0
+    expected_closers: list[str] = []
     in_string = False
     escaped = False
     for char in text:
@@ -70,14 +70,18 @@ def _scan_depth(text: str, maximum: int) -> ParseFailure | None:
             continue
         if char == '"':
             in_string = True
-        elif char == "{" or char == "[":
-            depth += 1
-            if depth > maximum:
+        elif char == "{":
+            expected_closers.append("}")
+            if len(expected_closers) > maximum:
+                return ParseFailure(ParseFailureCode.DEPTH_LIMIT_EXCEEDED)
+        elif char == "[":
+            expected_closers.append("]")
+            if len(expected_closers) > maximum:
                 return ParseFailure(ParseFailureCode.DEPTH_LIMIT_EXCEEDED)
         elif char == "}" or char == "]":
-            depth -= 1
-            if depth < 0:
+            if not expected_closers or expected_closers[-1] != char:
                 return ParseFailure(ParseFailureCode.INVALID_JSON)
+            expected_closers.pop()
     return None
 
 

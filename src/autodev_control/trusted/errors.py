@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class DecisionReasonCode(str, Enum):
+class DecisionReasonCode(Enum):
     """Reason codes belonging only to policy/action decisions."""
 
     UNSPECIFIED = "UNSPECIFIED"
 
 
-class ParseFailureCode(str, Enum):
+class ParseFailureCode(Enum):
     INVALID_INPUT_TYPE = "INVALID_INPUT_TYPE"
     INVALID_LIMITS = "INVALID_LIMITS"
     BYTE_LIMIT_EXCEEDED = "BYTE_LIMIT_EXCEEDED"
@@ -24,7 +24,7 @@ class ParseFailureCode(str, Enum):
     NUMBER_LIMIT_EXCEEDED = "NUMBER_LIMIT_EXCEEDED"
 
 
-class IdentityValidationFailureCode(str, Enum):
+class IdentityValidationFailureCode(Enum):
     INVALID_TYPE = "INVALID_TYPE"
     INVALID_LENGTH = "INVALID_LENGTH"
     INVALID_FORMAT = "INVALID_FORMAT"
@@ -35,10 +35,16 @@ class ParseFailure:
     code: ParseFailureCode
     detail: str | None = None
 
+    def __post_init__(self) -> None:
+        if type(self.code) is not ParseFailureCode:
+            raise TypeError("code must be exactly ParseFailureCode")
+
 
 class IdentityValidationError(ValueError):
     """Construction failed lexical validation; it makes no external-state claim."""
 
     def __init__(self, code: IdentityValidationFailureCode) -> None:
+        if type(code) is not IdentityValidationFailureCode:
+            raise TypeError("code must be exactly IdentityValidationFailureCode")
         self.code = code
         super().__init__(code.value)
