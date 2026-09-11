@@ -102,6 +102,18 @@ def test_candidate_success_has_no_public_constructor_and_is_deeply_immutable() -
         candidate.root_managed_resources.append(object())
     with pytest.raises(AttributeError):
         candidate.trusted_core_members[0].member_id = object()
+    with pytest.raises(TypeError):
+        candidate.policy_resources[0] = RootManagedResourceId("changed")
+    with pytest.raises(AttributeError):
+        candidate.trusted_schemas.append(RootManagedResourceId("changed"))
+    with pytest.raises(TypeError):
+        candidate.trusted_configs[0] = object()
+    with pytest.raises(AttributeError):
+        candidate.external_tcb_dependencies.append(object())
+    with pytest.raises(AttributeError):
+        candidate.trusted_configs[0].resource = RootManagedResourceId("changed")
+    with pytest.raises(AttributeError):
+        candidate.external_tcb_dependencies[0].assumption_resource = RootManagedResourceId("changed")
     assert isinstance(candidate.trusted_core_members[0], TrustedCoreMember)
     assert isinstance(candidate.trusted_configs[0], TrustedConfigBinding)
     assert isinstance(candidate.external_tcb_dependencies[0], ExternalTcbDependency)
