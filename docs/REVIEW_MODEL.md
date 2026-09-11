@@ -1,11 +1,11 @@
 # Autonomous Development v2 — Review Model
 
-**Status:** Phase 0 baseline  
-**Version:** 1.0  
+**Status:** Phase 0 frozen  
+**Version:** 1.1  
 **Repository:** `RayZhang2024/autonomous-dev-control-plane`  
 **Governing policy:** `docs/CORE_POLICY.md` v1.0  
-**Governing architecture:** `docs/ARCHITECTURE.md` v1.0  
-**Lifecycle model:** `docs/STATE_MACHINE.md` v1.0
+**Governing architecture:** `docs/ARCHITECTURE.md` v1.2  
+**Lifecycle model:** `docs/STATE_MACHINE.md` v1.4
 
 ## 1. Purpose
 
