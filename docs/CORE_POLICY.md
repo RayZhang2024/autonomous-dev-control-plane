@@ -1,6 +1,6 @@
 # Autonomous Development v2 — Core Policy
 
-**Status:** Phase 0 baseline  
+**Status:** Phase 0 frozen  
 **Version:** 1.0  
 **Repository:** `RayZhang2024/autonomous-dev-control-plane`
 
