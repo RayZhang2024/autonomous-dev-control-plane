@@ -33,6 +33,7 @@ from autodev_control.trusted.identity import ImmutableConfigId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.scope import (
     AuthenticationEventId,
+    AuthorizationId,
     AuthorizationKind,
     ChangeType,
     ContractId,
@@ -283,7 +284,7 @@ def test_loader_duplicate_and_operational_zero_depth_consistency() -> None:
     assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET
     value = proposal_json(target.target_registration_id)
     value["capabilities"].append("merge")
-    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET
     value = proposal_json(target.target_registration_id)
     value["operational_constraints"]["repair_max_attempts"] = 0.5
     assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INVALID_FIELD_VALUE
@@ -304,6 +305,64 @@ def test_duplicate_candidate_operational_and_delegable_scope_return_failures() -
     ]
     duplicate_scope = load_candidate_authorization_proposal(json.dumps(value).encode())
     assert duplicate_scope.code is AuthorizationProposalFailureCode.DUPLICATE_IDENTITY
+
+
+def test_operational_collection_emptiness_consistency_and_ref_precedence() -> None:
+    target = admitted_target()
+
+    value = proposal_json(target.target_registration_id)
+    value["capabilities"].append("controlled_runtime")
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET
+
+    for capability in ("merge", "controlled_runtime"):
+        value = proposal_json(target.target_registration_id, depth=1)
+        value["delegation"]["delegable_capabilities"].append(capability)
+        assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET
+
+    value = proposal_json(target.target_registration_id)
+    value["operational_constraints"]["integration_refs"] = ["refs/heads/main"]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+
+    value = proposal_json(target.target_registration_id)
+    value["operational_constraints"]["controlled_runtime_profile_ids"] = ["runtime"]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+
+    value = proposal_json(target.target_registration_id)
+    value["capabilities"].append("repair")
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+    value = proposal_json(target.target_registration_id)
+    value["operational_constraints"]["repair_max_attempts"] = 1
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+
+    value = proposal_json(target.target_registration_id, depth=1)
+    value["delegation"]["delegable_capabilities"].append("repair")
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+    value = proposal_json(target.target_registration_id, depth=1)
+    value["delegation"]["delegable_operational_constraints"]["repair_max_attempts"] = 1
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION
+
+    value = proposal_json(target.target_registration_id)
+    value["operational_constraints"]["integration_refs"] = ["refs/heads/main", "refs/heads/main"]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.DUPLICATE_IDENTITY
+
+    value = proposal_json(target.target_registration_id, depth=1)
+    value["delegation"]["delegable_capabilities"].append("merge")
+    value["delegation"]["delegable_operational_constraints"]["integration_refs"] = [
+        "refs/heads/main", "refs/heads/main",
+    ]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.DUPLICATE_IDENTITY
+
+    value = proposal_json(target.target_registration_id)
+    value["capabilities"].append("merge")
+    value["operational_constraints"]["integration_refs"] = ["refs/heads/main", "refs/heads/release"]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INVALID_FIELD_VALUE
+
+    value = proposal_json(target.target_registration_id, depth=1)
+    value["delegation"]["delegable_capabilities"].append("merge")
+    value["delegation"]["delegable_operational_constraints"]["integration_refs"] = [
+        "refs/heads/main", "refs/heads/release",
+    ]
+    assert load_candidate_authorization_proposal(json.dumps(value).encode()).code is AuthorizationProposalFailureCode.INVALID_FIELD_VALUE
 
 
 def test_authorization_mutation_change_type_cardinality_precedence() -> None:
@@ -652,6 +711,43 @@ def test_delegated_capability_contract_depth_and_ancestry_guards(monkeypatch) ->
     monkeypatch.setattr(authorization_module, "_authorization_id", lambda *_: parent.authorization_id)
     assert admit_delegated_authorization(
         child, target, child_contract, child_policy, parent, child_root
+    ).reason_code is AuthorizationAdmissionReasonCode.ANCESTRY_INVALID
+
+
+def test_parent_ancestry_hard_bound_precedes_remaining_depth() -> None:
+    target = admitted_target()
+    parent_proposal = load_proposal(target.target_registration_id, depth=2)
+    parent = admit_direct_authorization(
+        parent_proposal, target, *direct_contexts(parent_proposal, target)
+    ).admitted_authorization
+    child = load_proposal(
+        target.target_registration_id, delegated_parent=parent.authorization_id, depth=1
+    )
+    child_contract, child_policy, _, _, child_root = direct_contexts(child, target)
+    ancestry = tuple(
+        AuthorizationId(RawSha256(f"{index:064x}")) for index in range(1, 65)
+    )
+
+    parent_at_63 = copy.copy(parent)
+    object.__setattr__(parent_at_63, "ancestry", ancestry[:63])
+    admitted = admit_delegated_authorization(
+        child, target, child_contract, child_policy, parent_at_63, child_root
+    )
+    assert admitted.decision is Decision.ALLOW
+    assert len(admitted.admitted_authorization.ancestry) == 64
+
+    parent_at_64 = copy.copy(parent)
+    object.__setattr__(parent_at_64, "ancestry", ancestry)
+    assert admit_delegated_authorization(
+        child, target, child_contract, child_policy, parent_at_64, child_root
+    ).reason_code is AuthorizationAdmissionReasonCode.ANCESTRY_INVALID
+
+    zero_depth_parent = copy.copy(parent_at_64)
+    zero_depth_allowance = copy.copy(parent.delegation)
+    object.__setattr__(zero_depth_allowance, "remaining_depth", 0)
+    object.__setattr__(zero_depth_parent, "delegation", zero_depth_allowance)
+    assert admit_delegated_authorization(
+        child, target, child_contract, child_policy, zero_depth_parent, child_root
     ).reason_code is AuthorizationAdmissionReasonCode.ANCESTRY_INVALID
 
 

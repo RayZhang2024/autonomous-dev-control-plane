@@ -347,8 +347,6 @@ def _parse_enum_list(value: object) -> tuple[tuple[TaskCapability, ...], bool] |
 def _parse_refs(value: object) -> tuple[tuple[CanonicalBranchRef, ...], bool] | AuthorizationProposalFailure:
     if type(value) is not tuple:
         return _failure(AuthorizationProposalFailureCode.INVALID_FIELD_TYPE)
-    if len(value) > 1:
-        return _failure(AuthorizationProposalFailureCode.INVALID_FIELD_VALUE)
     result = []
     seen = set()
     duplicate = False
@@ -362,6 +360,8 @@ def _parse_refs(value: object) -> tuple[tuple[CanonicalBranchRef, ...], bool] | 
         duplicate |= parsed in seen
         seen.add(parsed)
         result.append(parsed)
+    if len(result) > 1 and not duplicate:
+        return _failure(AuthorizationProposalFailureCode.INVALID_FIELD_VALUE)
     return tuple(result), duplicate
 
 
@@ -544,12 +544,21 @@ def load_candidate_authorization_proposal(raw: object) -> CandidateAuthorization
     has_merge = TaskCapability.MERGE in capabilities[0]
     has_runtime = TaskCapability.CONTROLLED_RUNTIME in capabilities[0]
     has_repair = TaskCapability.REPAIR in capabilities[0]
-    if has_merge != (len(operational.integration_refs) == 1) or has_runtime != bool(operational.controlled_runtime_profile_ids) or has_repair != (operational.repair_max_attempts >= 1):
-        return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
     dops = delegation.delegable_operational_constraints
+    delegable_has_merge = TaskCapability.MERGE in delegation.delegable_capabilities
+    delegable_has_runtime = TaskCapability.CONTROLLED_RUNTIME in delegation.delegable_capabilities
     if (
-        (TaskCapability.MERGE in delegation.delegable_capabilities) != (len(dops.integration_refs) == 1)
-        or (TaskCapability.CONTROLLED_RUNTIME in delegation.delegable_capabilities) != bool(dops.controlled_runtime_profile_ids)
+        (has_merge and not operational.integration_refs)
+        or (has_runtime and not operational.controlled_runtime_profile_ids)
+        or (delegable_has_merge and not dops.integration_refs)
+        or (delegable_has_runtime and not dops.controlled_runtime_profile_ids)
+    ):
+        return _failure(AuthorizationProposalFailureCode.EMPTY_REQUIRED_SET)
+    if has_merge != bool(operational.integration_refs) or has_runtime != bool(operational.controlled_runtime_profile_ids) or has_repair != (operational.repair_max_attempts >= 1):
+        return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
+    if (
+        delegable_has_merge != bool(dops.integration_refs)
+        or delegable_has_runtime != bool(dops.controlled_runtime_profile_ids)
         or (TaskCapability.REPAIR in delegation.delegable_capabilities) != (dops.repair_max_attempts >= 1)
     ):
         return _failure(AuthorizationProposalFailureCode.INCONSISTENT_CONFIGURATION)
@@ -816,7 +825,7 @@ def admit_delegated_authorization(
         return _result(AuthorizationAdmissionReasonCode.PARENT_POLICY_EPOCH_MISMATCH)
     if _binding_mismatch(proposal, contract, policy):
         return _result(AuthorizationAdmissionReasonCode.CONTRACT_BINDING_MISMATCH)
-    if len(parent.ancestry) > G3_MAX_DELEGATION_DEPTH or len(set(parent.ancestry)) != len(parent.ancestry) or parent.authorization_id in parent.ancestry:
+    if len(parent.ancestry) >= G3_MAX_DELEGATION_DEPTH or len(set(parent.ancestry)) != len(parent.ancestry) or parent.authorization_id in parent.ancestry:
         return _result(AuthorizationAdmissionReasonCode.ANCESTRY_INVALID)
     if parent.delegation.remaining_depth < 1:
         return _result(AuthorizationAdmissionReasonCode.DELEGATION_DEPTH_EXCEEDED)

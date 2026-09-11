@@ -323,6 +323,11 @@ def _merge(value: object) -> _ParsedMerge | None | TargetRegistrationFailure:
         return problem
     if type(value[fields[0]]) is not str or type(value[fields[1]]) is not str or type(value[fields[2]]) is not tuple:
         return _failure(TargetRegistrationFailureCode.INVALID_FIELD_TYPE)
+    try:
+        service_identity = ServicePrincipalId(value[fields[0]])
+        merge_profile_id = ImmutableConfigId(value[fields[1]])
+    except (IdentityValidationError, ValueError):
+        return _failure(TargetRegistrationFailureCode.INVALID_FIELD_VALUE)
     refs_result = _identity_values(value[fields[2]], CanonicalBranchRef, G3_MAX_PROTECTED_REFS)
     if type(refs_result) is TargetRegistrationFailure:
         return refs_result
@@ -332,9 +337,9 @@ def _merge(value: object) -> _ParsedMerge | None | TargetRegistrationFailure:
     try:
         unique_refs = tuple(dict.fromkeys(refs))
         return _ParsedMerge(MergeConfiguration(
-            ServicePrincipalId(value[fields[0]]), ImmutableConfigId(value[fields[1]]), unique_refs
+            service_identity, merge_profile_id, unique_refs
         ), duplicate)
-    except (IdentityValidationError, ValueError):
+    except ValueError:
         return _failure(TargetRegistrationFailureCode.INVALID_FIELD_VALUE)
 
 

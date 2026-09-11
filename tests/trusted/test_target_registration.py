@@ -191,6 +191,23 @@ def test_publication_merge_and_ref_consistency() -> None:
     value["target_publication"] = {"service_identity": "same", "publication_profile_id": "publish-profile"}
     value["merge"] = {"service_identity": "same", "merge_profile_id": "merge-profile", "allowed_integration_refs": ["refs/heads/main"]}
     assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INCONSISTENT_CONFIGURATION
+
+
+def test_merge_nested_value_duplicate_and_empty_precedence() -> None:
+    value = registration()
+    value["allowed_task_capabilities"].append("merge")
+    value["merge"] = {
+        "service_identity": "", "merge_profile_id": "merge-profile",
+        "allowed_integration_refs": [],
+    }
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INVALID_FIELD_VALUE
+    value["merge"]["service_identity"] = "merger"
+    value["merge"]["merge_profile_id"] = ""
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.INVALID_FIELD_VALUE
+    value["merge"]["merge_profile_id"] = "merge-profile"
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.EMPTY_REQUIRED_SET
+    value["merge"]["allowed_integration_refs"] = ["refs/heads/main", "refs/heads/main"]
+    assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.DUPLICATE_IDENTITY
     value["merge"]["service_identity"] = "merger"
     value["merge"]["allowed_integration_refs"] = []
     assert load_candidate_target_registration(encode(value)).code is TargetRegistrationFailureCode.EMPTY_REQUIRED_SET
