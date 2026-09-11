@@ -1,7 +1,7 @@
 # Autonomous Development v2 — Self-Modification and Root Activation
 
 **Status:** Phase 0 frozen  
-**Version:** 1.1  
+**Version:** 1.2  
 **Repository:** `RayZhang2024/autonomous-dev-control-plane`
 
 ## 1. Purpose
@@ -84,13 +84,19 @@ fresh applicability check under N
         ↓
 Root Activation N → N+1
         ↓
-N-governed/external deployed-state verification
+establish or preserve independent
+pre-release capability fencing
         ↓
-pre-release capability fence established
+stage / deploy exact N+1 trusted contexts
+under that independent fence
+        ↓
+N-governed/external deployed-state verification
         ↓
 N-governed release verification
         ↓
 release verification sealed externally
+        ↓
+fresh release-state verification
         ↓
 External Root Authority releases barrier
         ↓
@@ -757,7 +763,7 @@ required external root-approval configuration identity
 
 activation subject
 
-canonical external Root Trust Anchor identity
+canonical Root Trust Anchor identity
 
 pre-release rollback target N
 ```
@@ -887,9 +893,13 @@ fresh mutable-applicability verification under N
         ↓
 External Root Authority activates N+1
         ↓
-N-governed/external deployed-state verification
+establish or preserve independent
+pre-release capability fencing
         ↓
-establish pre-release capability fencing
+stage / deploy exact N+1 trusted contexts
+under that independent fence
+        ↓
+N-governed/external deployed-state verification
         ↓
 N-governed Release Verification Record V
         ↓
