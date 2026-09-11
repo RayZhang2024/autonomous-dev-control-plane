@@ -763,7 +763,7 @@ required external root-approval configuration identity
 
 activation subject
 
-canonical Root Trust Anchor identity
+canonical external Root Trust Anchor identity
 
 pre-release rollback target N
 ```
