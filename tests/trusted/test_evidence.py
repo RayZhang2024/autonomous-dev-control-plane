@@ -23,6 +23,12 @@ def mint(cls, **fields):
     return value
 
 
+def minted_copy(value, **changes):
+    fields = {name: getattr(value, name) for name in value.__dataclass_fields__}
+    fields.update(changes)
+    return mint(type(value), **fields)
+
+
 def verdict(verdict_value="approved", duplicate=False, overall=None, unable=None):
     result = {"requirement_id": "r1", "verdict": verdict_value, "rationale": "human prose", "finding_ids": []}
     if unable:
@@ -36,7 +42,13 @@ def verdict(verdict_value="approved", duplicate=False, overall=None, unable=None
 
 def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=DisclosureApplicability.NOT_APPLICABLE):
     raw = verdict() if raw is None else raw
-    profile = ReviewerProfileBinding(ReviewerProfileId("profile"), ImmutableConfigId("profile-config"), ReviewerServiceId("service"), ImmutableConfigId("schema"), ParseLimits(100000, 20), ToolMode.NO_TOOLS)
+    profile = ReviewerProfileBinding(
+        ReviewerProfileId("profile"), ImmutableConfigId("profile-config"), ReviewerServiceId("service"),
+        ImmutableConfigId("schema"), ParseLimits(100000, 20), ToolMode.NO_TOOLS,
+        (ReviewerServiceConstraintId("service-constraint"),),
+        (ProviderMetadataRequirementId("provider-metadata"),),
+        ImmutableConfigId("rereview-policy"), ImmutableConfigId("disclosure-policy"),
+    )
     slot = ReviewSlot(ReviewSlotId("slot"), profile, RAW)
     composition = SemanticReviewCompositionRule(CompositionRuleId("composition"), CompositionMode.SINGLE_REQUIRED_INVOCATION, (slot,))
     effective = mint(
@@ -44,37 +56,80 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         task_id=TaskId("task"), candidate_id=CandidateId("candidate"), contract_id=ContractId("contract"),
         contract_raw_sha256=RAW, authorization_id=AuthorizationId(RAW), task_admission_event_id=AdmissionEventId("task-admission"),
         target_registration_id=TargetRegistrationId(RAW), policy_epoch_identity=EPOCH, base=GitSha("a" * 40),
-        target_context_id=TargetContextId("target"), requirement_ids=(SemanticRequirementId("r1"),),
+        target_context_id=TargetContextId("target"), pr_id=PullRequestIdentity("pr"), requirement_ids=(SemanticRequirementId("r1"),),
         required_material_ids=(MaterialIdentity("m"),), required_context_ids=(TrustedContextId("c"),),
         composition_rule_id=composition.composition_rule_id,
     )
     subject = EvidenceSubject(
         effective.repository_id, effective.task_id, effective.contract_id, RAW,
         effective.task_admission_event_id, effective.authorization_id, effective.target_registration_id,
-        EPOCH, effective.candidate_id, effective.base, effective.target_context_id,
-        effective.requirement_ids, ReviewInvocationId("inv"), slot.slot_id,
+        EPOCH, effective.candidate_id, effective.base, effective.target_context_id, effective.pr_id,
+        effective.requirement_ids, effective.required_material_ids, effective.required_context_ids,
+        ReviewInvocationId("inv"), slot.slot_id,
         profile.profile_id, profile.config_id, profile.verdict_schema_id,
     )
-    manifest = ReviewInputManifest(ReviewInputManifestId("manifest"), subject.invocation_id, CanonicalRequestId("request"), effective.subject_id, slot.slot_id, profile.profile_id, profile.config_id, effective.required_material_ids, effective.required_context_ids)
-    envelope = TrustedReviewEnvelope(ReviewEnvelopeId("envelope"), subject.invocation_id, CanonicalRequestId("request"), AssignmentIdentity("assignment"), effective.subject_id, slot.slot_id, profile, (), manifest)
+    assignment = mint(
+        SemanticReviewAssignment, assignment_id=AssignmentIdentity("assignment"), repository_id=subject.repository_id,
+        task_id=subject.task_id, contract_id=subject.contract_id, contract_raw_sha256=subject.contract_raw_sha256,
+        target_registration_id=subject.target_registration_id, policy_epoch_identity=subject.policy_epoch_identity,
+        candidate_id=subject.candidate_id, requirements=(SemanticRequirement(SemanticRequirementId("r1"), RAW),),
+        material_assignments=(RequirementMaterialAssignment(SemanticRequirementId("r1"), subject.required_material_ids, subject.required_context_ids, ()),),
+        required_context_ids=subject.required_context_ids, composition_rule=composition,
+        partition_rule=ReviewPartitionRule.SINGLE_REVIEW_PACKAGE,
+    )
+    manifest = ReviewInputManifest(
+        ReviewInputManifestId("manifest"), subject.invocation_id, CanonicalRequestId("request"),
+        effective.subject_id, slot.slot_id, profile.profile_id, profile.config_id,
+        profile.service_id, AssignmentIdentity("assignment"), subject, effective.requirement_ids,
+        effective.required_material_ids, (), (), effective.required_context_ids, (), profile.verdict_schema_id,
+    )
+    changed_material = MaterialBinding(
+        effective.required_material_ids[0], subject.repository_id, MaterialKind.CHANGED_CONTENT,
+        "src/a.py", "content", subject.candidate_id, subject.base,
+    )
+    trusted_context = MaterialBinding(
+        MaterialIdentity("context-material"), subject.repository_id, MaterialKind.TRUSTED_CONTEXT,
+        "policy", "context-content", None, subject.base, trusted_context_id=effective.required_context_ids[0],
+    )
+    envelope = TrustedReviewEnvelope(
+        ReviewEnvelopeId("envelope"), subject.invocation_id, CanonicalRequestId("request"),
+        AssignmentIdentity("assignment"), effective.subject_id, slot.slot_id, profile,
+        effective, subject, effective.requirement_ids, (changed_material, trusted_context), (), manifest,
+    )
     invocation = mint(
         TrustedReviewInvocationRecord, invocation_id=subject.invocation_id, envelope_id=envelope.envelope_id,
-        manifest_id=manifest.manifest_id, slot_id=slot.slot_id, profile=profile,
+        manifest_id=manifest.manifest_id, assignment_id=assignment.assignment_id,
+        slot_id=slot.slot_id, profile=profile,
         canonical_request_id=CanonicalRequestId("request"), submission_event_id=SubmissionEventId("submit"),
         raw_response_id=RawReviewResponseId("response"), raw_response_sha256=RawSha256(hashlib.sha256(raw).hexdigest()),
+        verdict_schema_id=profile.verdict_schema_id, required_material_ids=subject.required_material_ids,
+        representation_ids=(),
+        required_context_ids=subject.required_context_ids, supplemental_context_ids=(),
+        observed_provider_metadata_requirement_ids=profile.provider_metadata_requirement_ids,
         subject=effective,
     )
-    intent = mint(OperationIntent, operation_id=OperationId("operation"), task_id=subject.task_id, candidate_id=subject.candidate_id)
+    intent = mint(
+        OperationIntent, operation_id=OperationId("operation"), task_id=subject.task_id,
+        candidate_id=subject.candidate_id, contract_id=subject.contract_id,
+        contract_raw_sha256=subject.contract_raw_sha256, authorization_id=subject.authorization_id,
+        admission_event_id=subject.task_admission_event_id, target_registration_id=subject.target_registration_id,
+        policy_epoch_identity=subject.policy_epoch_identity,
+    )
     operation = OperationRecord(intent, 2, operation_state)
     binding = mint(
         TrustedReviewOperationBinding, invocation_id=subject.invocation_id, slot_id=slot.slot_id,
-        operation_id=intent.operation_id, canonical_request_id=CanonicalRequestId("request"),
-        task_id=subject.task_id, candidate_id=subject.candidate_id, role=ReviewOperationRole.SEMANTIC_REVIEW,
+        operation_id=intent.operation_id, operation_revision=operation.revision,
+        canonical_request_id=CanonicalRequestId("request"),
+        task_id=subject.task_id, candidate_id=subject.candidate_id, contract_id=subject.contract_id,
+        contract_raw_sha256=subject.contract_raw_sha256, authorization_id=subject.authorization_id,
+        task_admission_event_id=subject.task_admission_event_id,
+        target_registration_id=subject.target_registration_id, policy_epoch_identity=subject.policy_epoch_identity,
+        role=ReviewOperationRole.SEMANTIC_REVIEW,
     )
     disclosure_requirement = mint(
         TrustedDisclosureRequirement, applicability=disclosure, invocation_id=subject.invocation_id,
         slot_id=slot.slot_id, profile_id=profile.profile_id, service_id=profile.service_id,
-        canonical_request_id=CanonicalRequestId("request"),
+        canonical_request_id=CanonicalRequestId("request"), disclosed_classifications=(),
     )
     history = mint(TrustedEffectiveSubjectEvidenceSnapshot, subject=effective, membership_binding=EvidenceHistoryMembershipBindingId("H0"), admitted_bindings=())
     attempt = ReviewSlotAttempt(subject.invocation_id, slot.slot_id, intent.operation_id, operation_state, CanonicalRequestId("request"))
@@ -84,6 +139,10 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         profile.verdict_schema_id, subject, effective, slot, composition, envelope, invocation, binding,
         operation, disclosure_requirement, None, mint(TrustedCurrentEvidenceContext, subject=subject),
         history, attempts, EvidenceRecordProposalIdentity(EvidenceId("evidence"), EvidenceAdmissionEventId("evidence-admission"), EvidenceProducerEventId("producer")),
+        mint(TrustedReviewProfileAdmissionContext, baseline_config_id=ImmutableConfigId("baseline-parser"),
+             policy_epoch_identity=subject.policy_epoch_identity, profile_id=profile.profile_id, profile_config_id=profile.config_id,
+             baseline_limits=ParseLimits(200000, 30), active_policy_limits=ParseLimits(150000, 25), profile_limits=profile.raw_limits),
+        invocation.raw_response_id, None, None, assignment,
     )
     return request
 
@@ -105,6 +164,12 @@ def test_operation_success_is_required_but_does_not_imply_approval():
     assert admit_semantic_review(fixture(operation_state=OperationState.PERFORMING)).reason_code is EvidenceAdmissionReasonCode.OPERATION_NOT_SUCCEEDED
 
 
+def test_operation_binding_includes_exact_revision_and_full_g4_context():
+    request = fixture()
+    bad = minted_copy(request.operation_binding, operation_revision=99)
+    assert admit_semantic_review(replace(request, operation_binding=bad)).reason_code is EvidenceAdmissionReasonCode.OPERATION_BINDING_MISMATCH
+
+
 def test_duplicate_requirement_result_precedes_set_equality():
     result = admit_semantic_review(fixture(verdict(duplicate=True)))
     assert result.reason_code is EvidenceAdmissionReasonCode.DUPLICATE_REQUIREMENT_RESULT
@@ -118,7 +183,63 @@ def test_unavailable_and_unsupported_schema_are_distinct():
 
 
 def test_finite_limits_precede_raw_parse_and_schema():
-    assert admit_semantic_review(replace(fixture(), parse_limits=None, raw_response=b"bad")).reason_code is EvidenceAdmissionReasonCode.RAW_LIMIT_CONTEXT_UNAVAILABLE
+    assert admit_semantic_review(replace(fixture(), profile_admission_context=None, raw_response=b"bad")).reason_code is EvidenceAdmissionReasonCode.RAW_LIMIT_CONTEXT_UNAVAILABLE
+
+
+def test_untrusted_more_permissive_parse_limit_cannot_bypass_profile_limit():
+    request = fixture()
+    raw = verdict()
+    context = mint(
+        TrustedReviewProfileAdmissionContext, baseline_config_id=ImmutableConfigId("baseline-parser"),
+        policy_epoch_identity=request.subject.policy_epoch_identity, profile_id=request.subject.profile_id,
+        profile_config_id=request.subject.profile_config_id,
+        baseline_limits=ParseLimits(100000, 30), active_policy_limits=ParseLimits(100000, 30),
+        profile_limits=ParseLimits(len(raw) - 1, 20),
+    )
+    result = admit_semantic_review(replace(request, raw_response=raw, parse_limits=ParseLimits(100000, 30), profile_admission_context=context))
+    assert result.reason_code is EvidenceAdmissionReasonCode.RAW_RESPONSE_TOO_LARGE
+
+
+def test_raw_response_identity_and_digest_are_exact():
+    request = fixture()
+    assert admit_semantic_review(replace(request, raw_response_id=RawReviewResponseId("other"))).reason_code is EvidenceAdmissionReasonCode.RESPONSE_BINDING_MISMATCH
+    invocation = minted_copy(request.invocation, raw_response_sha256=RawSha256("9" * 64))
+    assert admit_semantic_review(replace(request, invocation=invocation)).reason_code is EvidenceAdmissionReasonCode.RESPONSE_BINDING_MISMATCH
+
+
+def test_envelope_manifest_and_assignment_bindings_are_exact():
+    request = fixture()
+    assert admit_semantic_review(replace(request, envelope=replace(request.envelope, envelope_id=ReviewEnvelopeId("other")))).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
+    bad_manifest = replace(request.envelope.input_manifest, manifest_id=ReviewInputManifestId("other"))
+    assert admit_semantic_review(replace(request, envelope=replace(request.envelope, input_manifest=bad_manifest))).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
+    for field, value in (
+        ("contract_id", ContractId("other")), ("contract_raw_sha256", RawSha256("8" * 64)),
+        ("target_registration_id", TargetRegistrationId(RawSha256("7" * 64))),
+        ("policy_epoch_identity", PolicyEpochIdentity(TrustedManifestId(RawSha256("6" * 64)))),
+        ("requirements", (SemanticRequirement(SemanticRequirementId("other"), RAW),)),
+    ):
+        bad_assignment = minted_copy(request.assignment, **{field: value})
+        assert admit_semantic_review(replace(request, assignment=bad_assignment)).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("contract_id", ContractId("other")),
+    ("contract_raw_sha256", RawSha256("8" * 64)),
+    ("target_registration_id", TargetRegistrationId(RawSha256("7" * 64))),
+    ("policy_epoch_identity", PolicyEpochIdentity(TrustedManifestId(RawSha256("6" * 64)))),
+    ("requirement_ids", (SemanticRequirementId("other"),)),
+])
+def test_effective_subject_mismatch_is_denied_before_request_package(field, value):
+    request = fixture()
+    effective = minted_copy(request.effective_subject, **{field: value})
+    assert admit_semantic_review(replace(request, effective_subject=effective)).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
+
+
+def test_schema_identity_is_cross_checked_across_complete_package():
+    request = fixture()
+    bad_manifest = replace(request.envelope.input_manifest, verdict_schema_id=ImmutableConfigId("other"))
+    assert admit_semantic_review(replace(request, envelope=replace(request.envelope, input_manifest=bad_manifest))).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
+    assert admit_semantic_review(replace(request, subject=replace(request.subject, verdict_schema_id=ImmutableConfigId("other")))).reason_code is EvidenceAdmissionReasonCode.PROFILE_BINDING_MISMATCH
 
 
 def test_disclosure_required_unavailable_escalates_and_contradiction_denies():
@@ -127,6 +248,36 @@ def test_disclosure_required_unavailable_escalates_and_contradiction_denies():
     assert (result.decision, result.reason_code) == (EvidenceAdmissionDecision.ESCALATE, EvidenceAdmissionReasonCode.DISCLOSURE_CONTEXT_UNAVAILABLE)
     contradiction = replace(fixture(), disclosure_authorization=mint(TrustedDisclosureAuthorizationBinding))
     assert admit_semantic_review(contradiction).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+def test_disclosure_requirement_and_authorization_bind_every_identity():
+    request = fixture(disclosure=DisclosureApplicability.REQUIRED)
+    requirement = request.disclosure_requirement
+    for field, value in (
+        ("invocation_id", ReviewInvocationId("other")), ("slot_id", ReviewSlotId("other")),
+        ("profile_id", ReviewerProfileId("other")), ("canonical_request_id", CanonicalRequestId("other")),
+    ):
+        assert admit_semantic_review(replace(request, disclosure_requirement=minted_copy(requirement, **{field: value}))).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+    auth = mint(
+        TrustedDisclosureAuthorizationBinding, target_registration_id=request.subject.target_registration_id,
+        repository_id=request.subject.repository_id, authorization_id=request.subject.authorization_id,
+        policy_epoch_identity=request.subject.policy_epoch_identity, profile_id=request.subject.profile_id,
+        service_id=request.slot.profile.service_id, canonical_request_id=request.invocation.canonical_request_id,
+        decision_id=DisclosureDecisionId("decision"), permitted_classifications=(),
+    )
+    assert admit_semantic_review(replace(request, disclosure_authorization=auth)).decision is EvidenceAdmissionDecision.ADMIT
+    wrong_repo = minted_copy(auth, repository_id=GitHubRepositoryId("2"))
+    assert admit_semantic_review(replace(request, disclosure_authorization=wrong_repo)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+    wrong_classes = minted_copy(auth, permitted_classifications=(MaterialClassificationId("source"),))
+    assert admit_semantic_review(replace(request, disclosure_authorization=wrong_classes)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+def test_subject_echo_pr_identity_is_exact():
+    body = json.loads(verdict())
+    body["subject_echo"] = {"repository_id": "1", "task_id": "task", "contract_id": "contract", "candidate_id": "candidate", "pr_id": "other"}
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    request = fixture(raw=raw)
+    assert admit_semantic_review(request).reason_code is EvidenceAdmissionReasonCode.SUBJECT_ECHO_MISMATCH
 
 
 def test_original_mismatch_precedes_current_staleness():
@@ -141,16 +292,38 @@ def test_original_mismatch_precedes_current_staleness():
     assert admit_semantic_review(stale).reason_code is EvidenceAdmissionReasonCode.ADMISSION_CONTEXT_STALE
 
 
+def test_admission_revalidates_rereview_retry_and_exact_snapshot_subjects():
+    request = fixture()
+    existing = AdmittedSemanticEvidenceBinding(EvidenceId("earlier"), ReviewInvocationId("earlier-inv"), request.slot.slot_id, True)
+    history = minted_copy(request.evidence_history, admitted_bindings=(existing,))
+    assert admit_semantic_review(replace(request, evidence_history=history)).reason_code is EvidenceAdmissionReasonCode.REREVIEW_NOT_PERMITTED
+    rereview = mint(TrustedReReviewAuthorization, authorization_id=ReReviewAuthorizationId("rr"), subject_id=request.effective_subject.subject_id, slot_id=request.slot.slot_id, reason=ReReviewReason.AUTHORIZED_ADJUDICATION)
+    assert admit_semantic_review(replace(request, evidence_history=history, rereview_authorization=rereview)).decision is EvidenceAdmissionDecision.ADMIT
+
+    prior = ReviewSlotAttempt(ReviewInvocationId("prior"), request.slot.slot_id, OperationId("prior-op"), OperationState.FAILED, CanonicalRequestId("prior-request"))
+    attempts = minted_copy(request.slot_attempt_history, attempts=(prior, *request.slot_attempt_history.attempts))
+    assert admit_semantic_review(replace(request, slot_attempt_history=attempts)).reason_code is EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT
+    retry = mint(TrustedOperationalRetryAuthorization, subject_id=request.effective_subject.subject_id, slot_id=request.slot.slot_id, prior_operation_id=prior.operation_id)
+    assert admit_semantic_review(replace(request, slot_attempt_history=attempts, operational_retry_authorization=retry)).decision is EvidenceAdmissionDecision.ADMIT
+
+    other_subject = minted_copy(request.effective_subject, candidate_id=CandidateId("other"))
+    assert admit_semantic_review(replace(request, evidence_history=minted_copy(request.evidence_history, subject=other_subject))).reason_code is EvidenceAdmissionReasonCode.REREVIEW_NOT_PERMITTED
+    assert admit_semantic_review(replace(request, slot_attempt_history=minted_copy(request.slot_attempt_history, subject=other_subject))).reason_code is EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT
+    assert admit_semantic_review(replace(request, slot_attempt_history=minted_copy(request.slot_attempt_history, attempts=()))).reason_code is EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT
+
+
 @pytest.mark.parametrize(("field", "reason"), [
     ("candidate_id", EvidenceApplicabilityReason.CANDIDATE_CHANGED),
     ("base", EvidenceApplicabilityReason.BASE_CHANGED),
     ("slot_id", EvidenceApplicabilityReason.REVIEW_SLOT_CHANGED),
     ("profile_id", EvidenceApplicabilityReason.REVIEWER_PROFILE_CHANGED),
     ("profile_config_id", EvidenceApplicabilityReason.REVIEWER_PROFILE_CONFIG_CHANGED),
+    ("required_material_ids", EvidenceApplicabilityReason.REQUIRED_MATERIAL_CHANGED),
+    ("required_context_ids", EvidenceApplicabilityReason.REQUIRED_CONTEXT_CHANGED),
 ])
 def test_post_admission_applicability_is_exact(field, reason):
     record = admit_semantic_review(fixture()).proposed_evidence_record
-    replacements = {"candidate_id": CandidateId("new"), "base": GitSha("b" * 40), "slot_id": ReviewSlotId("new"), "profile_id": ReviewerProfileId("new"), "profile_config_id": ImmutableConfigId("new")}
+    replacements = {"candidate_id": CandidateId("new"), "base": GitSha("b" * 40), "slot_id": ReviewSlotId("new"), "profile_id": ReviewerProfileId("new"), "profile_config_id": ImmutableConfigId("new"), "required_material_ids": (MaterialIdentity("new"),), "required_context_ids": (TrustedContextId("new"),)}
     current = replace(record.subject, **{field: replacements[field]})
     result = evaluate_evidence_applicability(record, current)
     assert (result.decision, result.reason) == (EvidenceApplicabilityDecision.STALE, reason)
@@ -171,6 +344,49 @@ def test_task_and_evidence_admission_event_ids_are_distinct_and_values_non_beare
     assert not hasattr(record, "persist") and not hasattr(record.evidence_id, "authority")
     with pytest.raises(FrozenInstanceError):
         record.evidence_id = EvidenceId("other")
+
+
+def test_semantic_status_composition_conflict_and_structured_supersession():
+    request = fixture()
+    approved = admit_semantic_review(request).proposed_evidence_record
+    assert semantic_status_for_verdict(SemanticVerdict.APPROVED) is __import__('autodev_control.trusted.state', fromlist=['ConditionStatus']).ConditionStatus.SATISFIED
+    changed_request = fixture(raw=verdict("changes_required", overall="changes_required"))
+    changed = replace(admit_semantic_review(changed_request).proposed_evidence_record, evidence_id=EvidenceId("later"))
+    conflict = compose_semantic_evidence((approved, changed), approved.subject, request.composition_rule)
+    assert conflict.reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE
+
+    early = mint(TrustedAdmittedEvidenceRecord, record=approved, membership_binding=EvidenceHistoryMembershipBindingId("H1"))
+    late = mint(TrustedAdmittedEvidenceRecord, record=changed, membership_binding=EvidenceHistoryMembershipBindingId("H2"))
+    authorization = mint(
+        TrustedSupersessionAuthorization, decision_id=SupersessionDecisionId("decision"),
+        subject_id=approved.payload.effective_subject_id, policy_epoch_identity=approved.subject.policy_epoch_identity,
+        earlier_evidence_id=approved.evidence_id, later_evidence_id=changed.evidence_id,
+        authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
+    )
+    relation = build_evidence_supersession_record(early, late, authorization)
+    composed = compose_semantic_evidence((approved, changed), approved.subject, request.composition_rule, (relation,))
+    assert composed.reason is SemanticCompositionReason.COMPOSED
+    assert composed.requirement_statuses[0].status.name == "UNSATISFIED"
+    assert approved.payload.aggregate is SemanticVerdict.APPROVED
+
+
+@pytest.mark.parametrize(("verdict_value", "status"), [
+    (SemanticVerdict.APPROVED, "SATISFIED"),
+    (SemanticVerdict.CHANGES_REQUIRED, "UNSATISFIED"),
+    (SemanticVerdict.UNABLE_TO_DETERMINE, "INDETERMINATE"),
+])
+def test_per_requirement_semantic_status_is_closed(verdict_value, status):
+    assert semantic_status_for_verdict(verdict_value).name == status
+
+
+def test_g5_public_value_constructors_reject_mutable_nested_inputs():
+    request = fixture()
+    with pytest.raises(TypeError):
+        replace(request.subject, required_context_ids=[])
+    with pytest.raises(TypeError):
+        replace(request.envelope.input_manifest, supplemental_context_ids=[])
+    with pytest.raises(TypeError):
+        replace(admit_semantic_review(request).proposed_evidence_record.payload, findings=[])
 
 
 def test_production_evidence_module_exposes_no_fixture_minting_helper():

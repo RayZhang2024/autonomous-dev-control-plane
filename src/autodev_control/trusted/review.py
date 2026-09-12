@@ -5,6 +5,7 @@ review invocation, disclosure, persistence, provider access, or external effect.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 
@@ -14,7 +15,10 @@ from .operation import (
     AdmissionEventId, CandidateId, EvidenceId, OperationId,
     OperationMembershipBindingId, OperationRecord, OperationState,
 )
-from .parsing import ParseFailure, ParseFailureCode, ParseLimits, ParsedJsonDocument, parse_trusted_json
+from .parsing import (
+    ABSOLUTE_MAX_BYTES, ABSOLUTE_MAX_DEPTH, ParseFailure, ParseFailureCode,
+    ParseLimits, ParsedJsonDocument, parse_trusted_json,
+)
 from .scope import AuthorizationId, ContractId, GitHubRepositoryId, TargetRegistrationId, TaskId
 
 
@@ -50,6 +54,9 @@ DisclosureDecisionId = _identity_type("DisclosureDecisionId")
 EvidenceHistoryMembershipBindingId = _identity_type("EvidenceHistoryMembershipBindingId")
 CompositionRuleId = _identity_type("CompositionRuleId")
 TrustedContextId = _identity_type("TrustedContextId")
+MaterialClassificationId = _identity_type("MaterialClassificationId")
+ReviewerServiceConstraintId = _identity_type("ReviewerServiceConstraintId")
+ProviderMetadataRequirementId = _identity_type("ProviderMetadataRequirementId")
 
 
 def _tuple(values: object, item_type: type, name: str, *, unique: bool = True) -> tuple:
@@ -63,6 +70,14 @@ def _tuple(values: object, item_type: type, name: str, *, unique: bool = True) -
             raise ValueError(f"duplicate {name} identity")
         seen.add(item)
     return values
+
+
+def _reject_mutable(value: object, name: str) -> None:
+    if type(value) in (list, dict, set):
+        raise TypeError(f"{name} must not contain mutable containers")
+    if type(value) is tuple:
+        for item in value:
+            _reject_mutable(item, name)
 
 
 class SemanticVerdict(Enum):
@@ -125,6 +140,11 @@ class MaterialKind(Enum):
     SUPPLEMENTAL_UNTRUSTED_CONTEXT = "SUPPLEMENTAL_UNTRUSTED_CONTEXT"
 
 
+class SupersessionReason(Enum):
+    AUTHORIZED_ADJUDICATION = "AUTHORIZED_ADJUDICATION"
+    POLICY_DEFINED_REREVIEW = "POLICY_DEFINED_REREVIEW"
+
+
 class VerdictValidationReason(Enum):
     VALID = "VALID"
     RAW_RESPONSE_TOO_LARGE = "RAW_RESPONSE_TOO_LARGE"
@@ -139,6 +159,18 @@ class ReviewLocation:
     line_start: int | None
     line_end: int | None
 
+    def __post_init__(self) -> None:
+        if type(self.path) is not str or not 1 <= len(self.path) <= 4096:
+            raise ValueError("invalid path")
+        if self.content_id is not None and (type(self.content_id) is not str or not 1 <= len(self.content_id) <= 512):
+            raise TypeError("content_id must be a non-empty string or None")
+        if self.line_start is not None and (type(self.line_start) is not int or self.line_start < 1):
+            raise TypeError("line_start must be a positive integer or None")
+        if self.line_end is not None and (type(self.line_end) is not int or self.line_end < 1):
+            raise TypeError("line_end must be a positive integer or None")
+        if self.line_end is not None and self.line_start is None:
+            raise ValueError("line_end requires line_start")
+
 
 @dataclass(frozen=True, slots=True)
 class RequirementResult:
@@ -147,6 +179,17 @@ class RequirementResult:
     rationale: str
     finding_ids: tuple[FindingId, ...]
     unable_reason_code: UnableReasonCode | None
+
+    def __post_init__(self) -> None:
+        if type(self.requirement_id) is not SemanticRequirementId or type(self.verdict) is not SemanticVerdict:
+            raise TypeError("invalid requirement result identity or verdict")
+        if type(self.rationale) is not str or not 1 <= len(self.rationale) <= 16384:
+            raise ValueError("invalid rationale")
+        _tuple(self.finding_ids, FindingId, "finding_ids")
+        if self.unable_reason_code is not None and type(self.unable_reason_code) is not UnableReasonCode:
+            raise TypeError("invalid unable reason")
+        if (self.verdict is SemanticVerdict.UNABLE_TO_DETERMINE) != (self.unable_reason_code is not None):
+            raise ValueError("unable reason applicability mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +201,20 @@ class ReviewFinding:
     rationale: str
     locations: tuple[ReviewLocation, ...]
     suggested_remediation: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.finding_id) is not FindingId or type(self.kind) is not FindingKind:
+            raise TypeError("invalid finding identity or kind")
+        _tuple(self.requirement_ids, SemanticRequirementId, "requirement_ids")
+        _tuple(self.locations, ReviewLocation, "locations", unique=False)
+        if type(self.summary) is not str or not 1 <= len(self.summary) <= 4096:
+            raise ValueError("invalid finding summary")
+        if type(self.rationale) is not str or not 1 <= len(self.rationale) <= 16384:
+            raise ValueError("invalid finding rationale")
+        if self.suggested_remediation is not None and (type(self.suggested_remediation) is not str or not 1 <= len(self.suggested_remediation) <= 16384):
+            raise TypeError("invalid suggested remediation")
+        if self.kind is FindingKind.REQUIREMENT_ISSUE and not self.requirement_ids:
+            raise ValueError("requirement issue must identify a requirement")
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +229,14 @@ class SubjectEcho:
     target_context_id: str | None = None
     pr_id: str | None = None
 
+    def __post_init__(self) -> None:
+        for value in (self.repository_id, self.task_id, self.contract_id, self.candidate_id):
+            if not _identifier(value):
+                raise ValueError("invalid required subject echo")
+        for value in (self.target_registration_id, self.active_policy_id, self.base_id, self.target_context_id, self.pr_id):
+            if value is not None and not _identifier(value):
+                raise TypeError("invalid optional subject echo")
+
 
 @dataclass(frozen=True, slots=True)
 class RawSemanticVerdict:
@@ -182,6 +247,18 @@ class RawSemanticVerdict:
     findings: tuple[ReviewFinding, ...]
     overall_verdict: SemanticVerdict | None
     reviewer_summary: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.source_document) is not ParsedJsonDocument or type(self.review_invocation_id) is not ReviewInvocationId:
+            raise TypeError("invalid raw verdict provenance")
+        if self.subject_echo is not None and type(self.subject_echo) is not SubjectEcho:
+            raise TypeError("invalid subject echo")
+        _tuple(self.requirement_results, RequirementResult, "requirement_results", unique=False)
+        _tuple(self.findings, ReviewFinding, "findings", unique=False)
+        if self.overall_verdict is not None and type(self.overall_verdict) is not SemanticVerdict:
+            raise TypeError("invalid overall verdict")
+        if self.reviewer_summary is not None and (type(self.reviewer_summary) is not str or not 1 <= len(self.reviewer_summary) <= 16384):
+            raise TypeError("invalid reviewer summary")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +284,10 @@ def _identifier(value: object) -> bool:
     return _string(value, 512)
 
 
+def _positive_json_integer(value: object) -> bool:
+    return type(value) is Decimal and value >= 1 and value == value.to_integral_value()
+
+
 def _enum(enum_type: type[Enum], value: object):
     if type(value) is not str:
         raise ValueError
@@ -226,15 +307,19 @@ def _location(value: object) -> ReviewLocation:
         raise ValueError
     content = value.get("content_id")
     start, end = value.get("line_start"), value.get("line_end")
-    if content is not None and not _identifier(content):
+    if "content_id" in value and not _identifier(content):
         raise ValueError
-    if start is not None and (type(start) is not int or start < 1):
+    if "line_start" in value and not _positive_json_integer(start):
         raise ValueError
-    if end is not None and (type(end) is not int or end < 1):
+    if "line_end" in value and not _positive_json_integer(end):
         raise ValueError
     if end is not None and start is None:
         raise ValueError
-    return ReviewLocation(value["path"], content, start, end)
+    return ReviewLocation(
+        value["path"], content,
+        None if start is None else int(start),
+        None if end is None else int(end),
+    )
 
 
 def _requirement_result(value: object) -> RequirementResult:
@@ -250,7 +335,7 @@ def _requirement_result(value: object) -> RequirementResult:
     unable = value.get("unable_reason_code")
     if verdict is SemanticVerdict.UNABLE_TO_DETERMINE:
         unable = _enum(UnableReasonCode, unable)
-    elif unable is not None:
+    elif "unable_reason_code" in value:
         raise ValueError
     return RequirementResult(
         SemanticRequirementId(value["requirement_id"]), verdict, value["rationale"],
@@ -275,7 +360,7 @@ def _finding(value: object) -> ReviewFinding:
     if type(locations) is not tuple or len(locations) > 256:
         raise ValueError
     remediation = value.get("suggested_remediation")
-    if remediation is not None and not _string(remediation, 16384):
+    if "suggested_remediation" in value and not _string(remediation, 16384):
         raise ValueError
     return ReviewFinding(
         FindingId(value["finding_id"]), kind,
@@ -307,7 +392,7 @@ def validate_review_verdict_v1(raw: object, limits: object) -> VerdictValidation
         echo = _subject_echo(value["subject_echo"]) if "subject_echo" in value else None
         overall = _enum(SemanticVerdict, value["overall_verdict"]) if "overall_verdict" in value else None
         summary = value.get("reviewer_summary")
-        if summary is not None and not _string(summary, 16384):
+        if "reviewer_summary" in value and not _string(summary, 16384):
             raise ValueError
         verdict = RawSemanticVerdict(
             parsed, ReviewInvocationId(value["review_invocation_id"]), echo,
@@ -327,12 +412,65 @@ class ReviewerProfileBinding:
     verdict_schema_id: ImmutableConfigId
     raw_limits: ParseLimits
     tool_mode: ToolMode
+    service_constraint_ids: tuple[ReviewerServiceConstraintId, ...]
+    provider_metadata_requirement_ids: tuple[ProviderMetadataRequirementId, ...]
+    rereview_policy_id: ImmutableConfigId
+    disclosure_policy_id: ImmutableConfigId
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.profile_id, ReviewerProfileId), (self.config_id, ImmutableConfigId),
+            (self.service_id, ReviewerServiceId), (self.verdict_schema_id, ImmutableConfigId),
+            (self.raw_limits, ParseLimits), (self.tool_mode, ToolMode),
+            (self.rereview_policy_id, ImmutableConfigId), (self.disclosure_policy_id, ImmutableConfigId),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("reviewer profile field has wrong exact type")
+        if (
+            type(self.raw_limits.max_bytes) is not int or not 1 <= self.raw_limits.max_bytes <= ABSOLUTE_MAX_BYTES
+            or type(self.raw_limits.max_depth) is not int or not 1 <= self.raw_limits.max_depth <= ABSOLUTE_MAX_DEPTH
+        ):
+            raise TypeError("reviewer raw limits must be finite positive integers")
+        _tuple(self.service_constraint_ids, ReviewerServiceConstraintId, "service_constraint_ids")
+        _tuple(self.provider_metadata_requirement_ids, ProviderMetadataRequirementId, "provider_metadata_requirement_ids")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class TrustedReviewProfileAdmissionContext:
+    baseline_config_id: ImmutableConfigId
+    policy_epoch_identity: PolicyEpochIdentity
+    profile_id: ReviewerProfileId
+    profile_config_id: ImmutableConfigId
+    baseline_limits: ParseLimits
+    active_policy_limits: ParseLimits
+    profile_limits: ParseLimits
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("review profile admission context must come from trusted configuration")
+
+
+def effective_review_parse_limits(context: TrustedReviewProfileAdmissionContext) -> ParseLimits:
+    if type(context) is not TrustedReviewProfileAdmissionContext:
+        raise TypeError("trusted review profile admission context required")
+    limits = (context.baseline_limits, context.active_policy_limits, context.profile_limits)
+    if any(
+        type(item) is not ParseLimits
+        or type(item.max_bytes) is not int or not 1 <= item.max_bytes <= ABSOLUTE_MAX_BYTES
+        or type(item.max_depth) is not int or not 1 <= item.max_depth <= ABSOLUTE_MAX_DEPTH
+        for item in limits
+    ):
+        raise ValueError("finite trusted parser limits required")
+    return ParseLimits(min(item.max_bytes for item in limits), min(item.max_depth for item in limits))
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticRequirement:
     requirement_id: SemanticRequirementId
     statement_binding: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.requirement_id) is not SemanticRequirementId or type(self.statement_binding) is not RawSha256:
+            raise TypeError("semantic requirement has wrong exact type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +479,13 @@ class RequirementMaterialAssignment:
     required_material_ids: tuple[MaterialIdentity, ...]
     required_context_ids: tuple[TrustedContextId, ...]
     permitted_representation_ids: tuple[RepresentationIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.requirement_id) is not SemanticRequirementId:
+            raise TypeError("requirement_id has wrong exact type")
+        _tuple(self.required_material_ids, MaterialIdentity, "required_material_ids")
+        _tuple(self.required_context_ids, TrustedContextId, "required_context_ids")
+        _tuple(self.permitted_representation_ids, RepresentationIdentity, "permitted_representation_ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +498,24 @@ class MaterialBinding:
     candidate_id: CandidateId | None
     base: GitSha | None
     representation_id: RepresentationIdentity | None = None
+    trusted_context_id: TrustedContextId | None = None
+    represented_material_id: MaterialIdentity | None = None
+    classification_id: MaterialClassificationId | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.material_id) is not MaterialIdentity or type(self.repository_id) is not GitHubRepositoryId or type(self.kind) is not MaterialKind:
+            raise TypeError("material binding has wrong exact identity type")
+        if type(self.path_or_resource) is not str or not self.path_or_resource or type(self.content_or_deletion_identity) is not str or not self.content_or_deletion_identity:
+            raise ValueError("material binding strings must be non-empty")
+        optional = ((self.candidate_id, CandidateId), (self.base, GitSha), (self.representation_id, RepresentationIdentity),
+                    (self.trusted_context_id, TrustedContextId), (self.represented_material_id, MaterialIdentity),
+                    (self.classification_id, MaterialClassificationId))
+        if any(value is not None and type(value) is not expected for value, expected in optional):
+            raise TypeError("material binding optional field has wrong exact type")
+        if self.kind is MaterialKind.TRUSTED_CONTEXT and self.trusted_context_id is None:
+            raise ValueError("trusted context requires explicit context identity")
+        if self.kind is MaterialKind.TRANSFORMED_REPRESENTATION and (self.representation_id is None or self.represented_material_id is None):
+            raise ValueError("transformed representation requires exact source and representation identities")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +523,10 @@ class ReviewSlot:
     slot_id: ReviewSlotId
     profile: ReviewerProfileBinding
     independence_binding: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.slot_id) is not ReviewSlotId or type(self.profile) is not ReviewerProfileBinding or type(self.independence_binding) is not RawSha256:
+            raise TypeError("review slot has wrong exact type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +536,8 @@ class SemanticReviewCompositionRule:
     required_slots: tuple[ReviewSlot, ...]
 
     def __post_init__(self) -> None:
+        if type(self.composition_rule_id) is not CompositionRuleId or type(self.mode) is not CompositionMode:
+            raise TypeError("composition rule field has wrong exact type")
         _tuple(self.required_slots, ReviewSlot, "required_slots")
         if len({slot.slot_id for slot in self.required_slots}) != len(self.required_slots):
             raise ValueError("duplicate required slot")
@@ -379,6 +548,7 @@ class SemanticReviewCompositionRule:
 @dataclass(frozen=True, slots=True, init=False)
 class SemanticReviewAssignment:
     assignment_id: AssignmentIdentity
+    repository_id: GitHubRepositoryId
     task_id: TaskId
     contract_id: ContractId
     contract_raw_sha256: RawSha256
@@ -409,6 +579,7 @@ class SemanticReviewEffectiveSubject:
     policy_epoch_identity: PolicyEpochIdentity
     base: GitSha
     target_context_id: TargetContextId | None
+    pr_id: PullRequestIdentity | None
     requirement_ids: tuple[SemanticRequirementId, ...]
     required_material_ids: tuple[MaterialIdentity, ...]
     required_context_ids: tuple[TrustedContextId, ...]
@@ -427,8 +598,41 @@ class ReviewInputManifest:
     slot_id: ReviewSlotId
     profile_id: ReviewerProfileId
     profile_config_id: ImmutableConfigId
+    reviewer_service_id: ReviewerServiceId
+    assignment_id: AssignmentIdentity
+    evidence_subject: object
+    requirement_ids: tuple[SemanticRequirementId, ...]
     changed_material_ids: tuple[MaterialIdentity, ...]
+    representation_ids: tuple[RepresentationIdentity, ...]
+    represented_material_ids: tuple[MaterialIdentity, ...]
     trusted_context_ids: tuple[TrustedContextId, ...]
+    supplemental_context_ids: tuple[MaterialIdentity, ...]
+    verdict_schema_id: ImmutableConfigId
+
+    def __post_init__(self) -> None:
+        from .evidence import EvidenceSubject
+        exact = (
+            (self.manifest_id, ReviewInputManifestId), (self.invocation_id, ReviewInvocationId),
+            (self.canonical_request_id, CanonicalRequestId), (self.subject_id, SemanticReviewEffectiveSubjectId),
+            (self.slot_id, ReviewSlotId), (self.profile_id, ReviewerProfileId),
+            (self.profile_config_id, ImmutableConfigId), (self.assignment_id, AssignmentIdentity),
+            (self.reviewer_service_id, ReviewerServiceId),
+            (self.verdict_schema_id, ImmutableConfigId),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("manifest field has wrong exact type")
+        if type(self.evidence_subject) is not EvidenceSubject:
+            raise TypeError("evidence_subject must be exactly EvidenceSubject")
+        _reject_mutable(self.evidence_subject, "evidence_subject")
+        parameters = getattr(type(self.evidence_subject), "__dataclass_params__", None)
+        if parameters is None or not parameters.frozen:
+            raise TypeError("evidence_subject must be a frozen record")
+        _tuple(self.requirement_ids, SemanticRequirementId, "manifest requirement_ids")
+        _tuple(self.changed_material_ids, MaterialIdentity, "manifest changed_material_ids")
+        _tuple(self.representation_ids, RepresentationIdentity, "manifest representation_ids")
+        _tuple(self.represented_material_ids, MaterialIdentity, "manifest represented_material_ids", unique=False)
+        _tuple(self.trusted_context_ids, TrustedContextId, "manifest trusted_context_ids")
+        _tuple(self.supplemental_context_ids, MaterialIdentity, "manifest supplemental_context_ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,8 +644,33 @@ class TrustedReviewEnvelope:
     subject_id: SemanticReviewEffectiveSubjectId
     slot_id: ReviewSlotId
     profile: ReviewerProfileBinding
+    effective_subject: SemanticReviewEffectiveSubject
+    evidence_subject: object
+    requirement_ids: tuple[SemanticRequirementId, ...]
     materials: tuple[MaterialBinding, ...]
+    supplemental_context: tuple[MaterialBinding, ...]
     input_manifest: ReviewInputManifest
+
+    def __post_init__(self) -> None:
+        from .evidence import EvidenceSubject
+        exact = (
+            (self.envelope_id, ReviewEnvelopeId), (self.invocation_id, ReviewInvocationId),
+            (self.canonical_request_id, CanonicalRequestId), (self.assignment_id, AssignmentIdentity),
+            (self.subject_id, SemanticReviewEffectiveSubjectId), (self.slot_id, ReviewSlotId),
+            (self.profile, ReviewerProfileBinding), (self.effective_subject, SemanticReviewEffectiveSubject),
+            (self.input_manifest, ReviewInputManifest),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("envelope field has wrong exact type")
+        if type(self.evidence_subject) is not EvidenceSubject:
+            raise TypeError("evidence_subject must be exactly EvidenceSubject")
+        _reject_mutable(self.evidence_subject, "evidence_subject")
+        parameters = getattr(type(self.evidence_subject), "__dataclass_params__", None)
+        if parameters is None or not parameters.frozen:
+            raise TypeError("evidence_subject must be a frozen record")
+        _tuple(self.requirement_ids, SemanticRequirementId, "envelope requirement_ids")
+        _tuple(self.materials, MaterialBinding, "envelope materials", unique=False)
+        _tuple(self.supplemental_context, MaterialBinding, "supplemental_context", unique=False)
 
 
 class EnvelopeReason(Enum):
@@ -462,33 +691,109 @@ def build_trusted_review_envelope(
     slot: ReviewSlot, changed_inventory: tuple[MaterialBinding, ...],
     trusted_context_inventory: tuple[MaterialBinding, ...], invocation_id: ReviewInvocationId,
     envelope_id: ReviewEnvelopeId, manifest_id: ReviewInputManifestId,
-    canonical_request_id: CanonicalRequestId,
+    canonical_request_id: CanonicalRequestId, evidence_subject: object,
+    representation_inventory: tuple[MaterialBinding, ...] = (),
+    supplemental_context_inventory: tuple[MaterialBinding, ...] = (),
 ) -> EnvelopeBuildResult:
+    from .evidence import EvidenceSubject
+    if type(evidence_subject) is not EvidenceSubject:
+        raise TypeError("evidence_subject must be exactly EvidenceSubject")
+    for values in (changed_inventory, trusted_context_inventory, representation_inventory, supplemental_context_inventory):
+        if type(values) is not tuple or any(type(item) is not MaterialBinding for item in values):
+            raise TypeError("review inventories must be tuples of MaterialBinding")
     if assignment.partition_rule is not ReviewPartitionRule.SINGLE_REVIEW_PACKAGE:
         return EnvelopeBuildResult(EnvelopeReason.UNSUPPORTED_REVIEW_PARTITIONING)
-    if assignment.task_id != subject.task_id or assignment.candidate_id != subject.candidate_id or assignment.composition_rule.composition_rule_id != subject.composition_rule_id:
+    identity_pairs = (
+        (assignment.repository_id, subject.repository_id), (assignment.task_id, subject.task_id),
+        (assignment.candidate_id, subject.candidate_id), (assignment.contract_id, subject.contract_id),
+        (assignment.contract_raw_sha256, subject.contract_raw_sha256),
+        (assignment.target_registration_id, subject.target_registration_id),
+        (assignment.policy_epoch_identity, subject.policy_epoch_identity),
+        (assignment.composition_rule.composition_rule_id, subject.composition_rule_id),
+    )
+    if type(assignment.requirements) is not tuple or any(type(item) is not SemanticRequirement for item in assignment.requirements):
+        raise TypeError("assignment requirements must be an immutable exact tuple")
+    requirement_ids = tuple(item.requirement_id for item in assignment.requirements)
+    if any(left != right for left, right in identity_pairs) or requirement_ids != subject.requirement_ids:
+        return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
+    if len(set(requirement_ids)) != len(requirement_ids):
         return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
     slots = {item.slot_id: item for item in assignment.composition_rule.required_slots}
     if slots.get(slot.slot_id) != slot:
         return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
+    subject_fields = (
+        ("repository_id", subject.repository_id), ("task_id", subject.task_id),
+        ("candidate_id", subject.candidate_id), ("contract_id", subject.contract_id),
+        ("contract_raw_sha256", subject.contract_raw_sha256),
+        ("authorization_id", subject.authorization_id),
+        ("task_admission_event_id", subject.task_admission_event_id),
+        ("target_registration_id", subject.target_registration_id),
+        ("policy_epoch_identity", subject.policy_epoch_identity), ("base", subject.base),
+        ("target_context_id", subject.target_context_id), ("pr_id", subject.pr_id),
+        ("requirement_ids", subject.requirement_ids), ("slot_id", slot.slot_id),
+        ("profile_id", slot.profile.profile_id), ("profile_config_id", slot.profile.config_id),
+        ("verdict_schema_id", slot.profile.verdict_schema_id),
+    )
+    if any(not hasattr(evidence_subject, name) or getattr(evidence_subject, name) != expected for name, expected in subject_fields):
+        return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
+    assignments = assignment.material_assignments
+    if type(assignments) is not tuple or any(type(item) is not RequirementMaterialAssignment for item in assignments):
+        raise TypeError("material_assignments must be an immutable exact tuple")
+    assignment_requirement_ids = tuple(item.requirement_id for item in assignments)
+    if len(set(assignment_requirement_ids)) != len(assignment_requirement_ids) or set(assignment_requirement_ids) != set(requirement_ids):
+        return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
+    if type(assignment.required_context_ids) is not tuple or any(type(item) is not TrustedContextId for item in assignment.required_context_ids):
+        raise TypeError("assignment required_context_ids must be an exact tuple")
     changed_ids = tuple(item.material_id for item in changed_inventory)
-    context_ids = tuple(TrustedContextId(item.material_id.value) for item in trusted_context_inventory)
-    if len(set(changed_ids)) != len(changed_ids) or len(set(context_ids)) != len(context_ids):
+    context_ids = tuple(item.trusted_context_id for item in trusted_context_inventory)
+    supplemental_ids = tuple(item.material_id for item in supplemental_context_inventory)
+    representation_ids = tuple(item.representation_id for item in representation_inventory)
+    if (
+        len(set(changed_ids)) != len(changed_ids)
+        or len(set(context_ids)) != len(context_ids)
+        or len(set(supplemental_ids)) != len(supplemental_ids)
+        or len(set(representation_ids)) != len(representation_ids)
+    ):
         return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+    if any(item.kind not in (MaterialKind.CHANGED_CONTENT, MaterialKind.DELETION) for item in changed_inventory):
+        return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+    if any(item.kind is not MaterialKind.TRUSTED_CONTEXT or item.trusted_context_id is None for item in trusted_context_inventory):
+        return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+    if any(item.kind is not MaterialKind.SUPPLEMENTAL_UNTRUSTED_CONTEXT for item in supplemental_context_inventory):
+        return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+    if any(item.repository_id != subject.repository_id for item in (*changed_inventory, *trusted_context_inventory, *representation_inventory, *supplemental_context_inventory)):
+        return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
     assigned_material = tuple(mid for item in assignment.material_assignments for mid in item.required_material_ids)
     assigned_context = tuple(cid for item in assignment.material_assignments for cid in item.required_context_ids)
     if not set(assigned_material).issubset(changed_ids) or not set((*assignment.required_context_ids, *assigned_context)).issubset(context_ids):
         return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
-    if set(changed_ids) != set(subject.required_material_ids) or set(context_ids) != set(subject.required_context_ids):
+    if changed_ids != subject.required_material_ids or context_ids != subject.required_context_ids:
         return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+    permitted_by_material = {
+        material_id: frozenset(item.permitted_representation_ids)
+        for item in assignments for material_id in item.required_material_ids
+    }
+    for representation in representation_inventory:
+        if representation.kind is not MaterialKind.TRANSFORMED_REPRESENTATION:
+            return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+        if representation.represented_material_id not in set(changed_ids):
+            return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
+        if representation.representation_id not in permitted_by_material.get(representation.represented_material_id, frozenset()):
+            return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
     manifest = ReviewInputManifest(
         manifest_id, invocation_id, canonical_request_id, subject.subject_id, slot.slot_id,
-        slot.profile.profile_id, slot.profile.config_id, changed_ids, context_ids,
+        slot.profile.profile_id, slot.profile.config_id, slot.profile.service_id, assignment.assignment_id,
+        evidence_subject, requirement_ids, changed_ids,
+        tuple(item.representation_id for item in representation_inventory),
+        tuple(item.represented_material_id for item in representation_inventory),
+        context_ids, supplemental_ids,
+        slot.profile.verdict_schema_id,
     )
     return EnvelopeBuildResult(EnvelopeReason.BUILT, TrustedReviewEnvelope(
         envelope_id, invocation_id, canonical_request_id, assignment.assignment_id,
-        subject.subject_id, slot.slot_id, slot.profile,
-        (*changed_inventory, *trusted_context_inventory), manifest,
+        subject.subject_id, slot.slot_id, slot.profile, subject, evidence_subject,
+        requirement_ids, (*changed_inventory, *trusted_context_inventory, *representation_inventory),
+        supplemental_context_inventory, manifest,
     ))
 
 
@@ -498,6 +803,10 @@ class AdmittedSemanticEvidenceBinding:
     invocation_id: ReviewInvocationId
     slot_id: ReviewSlotId
     substantive: bool
+
+    def __post_init__(self) -> None:
+        if type(self.evidence_id) is not EvidenceId or type(self.invocation_id) is not ReviewInvocationId or type(self.slot_id) is not ReviewSlotId or type(self.substantive) is not bool:
+            raise TypeError("admitted evidence binding has wrong exact type")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -516,6 +825,13 @@ class ReviewSlotAttempt:
     operation_id: OperationId
     operation_state: OperationState
     canonical_request_id: CanonicalRequestId
+
+    def __post_init__(self) -> None:
+        exact = ((self.invocation_id, ReviewInvocationId), (self.slot_id, ReviewSlotId),
+                 (self.operation_id, OperationId), (self.operation_state, OperationState),
+                 (self.canonical_request_id, CanonicalRequestId))
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("review attempt field has wrong exact type")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -601,10 +917,12 @@ def evaluate_review_invocation_eligibility(
         return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, reason, expected)
     terminal = tuple(item for item in attempts if item.operation_state in (OperationState.FAILED, OperationState.CONFLICT))
     if terminal:
-        latest = terminal[-1]
+        if len(terminal) != 1:
+            return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, EligibilityReason.AUTHORIZATION_INVALID, expected)
+        prior = terminal[0]
         if operational_retry_authorization is None:
             return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, EligibilityReason.RETRY_AUTHORIZATION_REQUIRED, expected)
-        if (operational_retry_authorization.subject_id, operational_retry_authorization.slot_id, operational_retry_authorization.prior_operation_id) != (subject.subject_id, slot.slot_id, latest.operation_id):
+        if (operational_retry_authorization.subject_id, operational_retry_authorization.slot_id, operational_retry_authorization.prior_operation_id) != (subject.subject_id, slot.slot_id, prior.operation_id):
             return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, EligibilityReason.AUTHORIZATION_INVALID, expected)
         return ReviewEligibilityResult(EligibilityDecision.ELIGIBLE, EligibilityReason.AUTHORIZED_OPERATIONAL_RETRY, expected)
     if evidence:
@@ -621,12 +939,19 @@ class TrustedReviewInvocationRecord:
     invocation_id: ReviewInvocationId
     envelope_id: ReviewEnvelopeId
     manifest_id: ReviewInputManifestId
+    assignment_id: AssignmentIdentity
     slot_id: ReviewSlotId
     profile: ReviewerProfileBinding
     canonical_request_id: CanonicalRequestId
     submission_event_id: SubmissionEventId
     raw_response_id: RawReviewResponseId
     raw_response_sha256: RawSha256
+    verdict_schema_id: ImmutableConfigId
+    required_material_ids: tuple[MaterialIdentity, ...]
+    representation_ids: tuple[RepresentationIdentity, ...]
+    required_context_ids: tuple[TrustedContextId, ...]
+    supplemental_context_ids: tuple[MaterialIdentity, ...]
+    observed_provider_metadata_requirement_ids: tuple[ProviderMetadataRequirementId, ...]
     subject: SemanticReviewEffectiveSubject
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("invocation provenance must come from trusted boundary")
@@ -637,9 +962,16 @@ class TrustedReviewOperationBinding:
     invocation_id: ReviewInvocationId
     slot_id: ReviewSlotId
     operation_id: OperationId
+    operation_revision: int
     canonical_request_id: CanonicalRequestId
     task_id: TaskId
     candidate_id: CandidateId
+    contract_id: ContractId
+    contract_raw_sha256: RawSha256
+    authorization_id: AuthorizationId
+    task_admission_event_id: AdmissionEventId
+    target_registration_id: TargetRegistrationId
+    policy_epoch_identity: PolicyEpochIdentity
     role: ReviewOperationRole
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("operation correlation must come from trusted boundary")
@@ -653,6 +985,7 @@ class TrustedDisclosureRequirement:
     profile_id: ReviewerProfileId
     service_id: ReviewerServiceId
     canonical_request_id: CanonicalRequestId
+    disclosed_classifications: tuple[MaterialClassificationId, ...]
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("disclosure requirement must come from trusted boundary")
 
@@ -667,6 +1000,6 @@ class TrustedDisclosureAuthorizationBinding:
     service_id: ReviewerServiceId
     canonical_request_id: CanonicalRequestId
     decision_id: DisclosureDecisionId
-    permitted_classifications: tuple[str, ...]
+    permitted_classifications: tuple[MaterialClassificationId, ...]
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("disclosure authorization must come from trusted boundary")

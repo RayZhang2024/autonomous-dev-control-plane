@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from autodev_control.trusted.evidence import EvidenceSubject
 from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import AdmissionEventId, CandidateId, EvidenceId, OperationId, OperationMembershipBindingId, OperationState
@@ -32,7 +33,13 @@ def raw_verdict(**changes):
 
 
 def profile(name="profile"):
-    return ReviewerProfileBinding(ReviewerProfileId(name), ImmutableConfigId(f"{name}-config"), ReviewerServiceId("service"), ImmutableConfigId("schema"), ParseLimits(100000, 20), ToolMode.NO_TOOLS)
+    return ReviewerProfileBinding(
+        ReviewerProfileId(name), ImmutableConfigId(f"{name}-config"), ReviewerServiceId("service"),
+        ImmutableConfigId("schema"), ParseLimits(100000, 20), ToolMode.NO_TOOLS,
+        (ReviewerServiceConstraintId("service-constraint"),),
+        (ProviderMetadataRequirementId("provider-metadata"),),
+        ImmutableConfigId("rereview-policy"), ImmutableConfigId("disclosure-policy"),
+    )
 
 
 def subject():
@@ -41,7 +48,7 @@ def subject():
         repository_id=GitHubRepositoryId("1"), task_id=TaskId("task"), candidate_id=CandidateId("candidate"),
         contract_id=ContractId("contract"), contract_raw_sha256=RAW, authorization_id=AuthorizationId(RAW),
         task_admission_event_id=AdmissionEventId("task-admission"), target_registration_id=TargetRegistrationId(RAW),
-        policy_epoch_identity=EPOCH, base=GitSha("a" * 40), target_context_id=TargetContextId("target"),
+        policy_epoch_identity=EPOCH, base=GitSha("a" * 40), target_context_id=TargetContextId("target"), pr_id=PullRequestIdentity("pr"),
         requirement_ids=(SemanticRequirementId("r1"),), required_material_ids=(MaterialIdentity("m1"),),
         required_context_ids=(TrustedContextId("c1"),), composition_rule_id=CompositionRuleId("composition"),
     )
@@ -73,6 +80,23 @@ def test_closed_schema_rejects_structural_violations(mutation):
     assert validate_review_verdict_v1(raw_verdict(**mutation), ParseLimits(100000, 20)).reason is VerdictValidationReason.SCHEMA_VALIDATION_FAILED
 
 
+@pytest.mark.parametrize("mutation", [
+    {"reviewer_summary": None},
+    {"requirement_results": [{"requirement_id": "r1", "verdict": "approved", "rationale": "ok", "finding_ids": [], "unable_reason_code": None}]},
+    {"findings": [{"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "suggested_remediation": None}]},
+    {"findings": [{"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "locations": [{"path": "x", "content_id": None}]}]},
+    {"findings": [{"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "locations": [{"path": "x", "line_start": None}]}]},
+    {"findings": [{"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "locations": [{"path": "x", "line_end": None}]}]},
+])
+def test_optional_schema_properties_reject_explicit_null(mutation):
+    assert validate_review_verdict_v1(raw_verdict(**mutation), ParseLimits(100000, 20)).reason is VerdictValidationReason.SCHEMA_VALIDATION_FAILED
+
+
+def test_optional_schema_properties_accept_absence():
+    finding = {"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "locations": [{"path": "x"}]}
+    assert validate_review_verdict_v1(raw_verdict(findings=[finding]), ParseLimits(100000, 20)).reason is VerdictValidationReason.VALID
+
+
 def test_strict_parser_and_raw_ceiling_are_distinct():
     assert validate_review_verdict_v1(b'{"a":1,"a":2}', ParseLimits(1000, 10)).reason is VerdictValidationReason.RAW_RESPONSE_PARSE_FAILED
     assert validate_review_verdict_v1(raw_verdict(), ParseLimits(5, 10)).reason is VerdictValidationReason.RAW_RESPONSE_TOO_LARGE
@@ -85,6 +109,13 @@ def test_unable_reason_condition_and_location_shape():
     assert validate_review_verdict_v1(raw_verdict(requirement_results=[unable]), ParseLimits(100000, 20)).reason is VerdictValidationReason.SCHEMA_VALIDATION_FAILED
     unable["unable_reason_code"] = "other"
     assert validate_review_verdict_v1(raw_verdict(requirement_results=[unable], overall_verdict="unable_to_determine"), ParseLimits(100000, 20)).reason is VerdictValidationReason.VALID
+
+
+def test_schema_integer_locations_accept_integers_and_reject_nonintegers():
+    finding = {"finding_id": "f", "kind": "advisory_observation", "requirement_ids": [], "summary": "s", "rationale": "r", "locations": [{"path": "a.py", "line_start": 1, "line_end": 2}]}
+    assert validate_review_verdict_v1(raw_verdict(findings=[finding]), ParseLimits(100000, 20)).reason is VerdictValidationReason.VALID
+    finding["locations"][0]["line_start"] = 1.5
+    assert validate_review_verdict_v1(raw_verdict(findings=[finding]), ParseLimits(100000, 20)).reason is VerdictValidationReason.SCHEMA_VALIDATION_FAILED
 
 
 def test_trusted_provenance_and_assignment_constructors_are_closed():
@@ -129,3 +160,60 @@ def test_profile_cycling_cannot_manufacture_slot_and_history_unavailable_is_inde
     history, attempts = histories(subj)
     assert evaluate_review_invocation_eligibility(subj, changed, composition(required), history, attempts).reason is EligibilityReason.SLOT_PROFILE_MISMATCH
     assert evaluate_review_invocation_eligibility(subj, required, composition(required), None, attempts).decision is EligibilityDecision.INDETERMINATE
+
+
+def test_ordinary_g5_values_reject_mutable_nested_containers():
+    with pytest.raises(TypeError):
+        ReviewerProfileBinding(
+            ReviewerProfileId("p"), ImmutableConfigId("pc"), ReviewerServiceId("s"), ImmutableConfigId("schema"),
+            ParseLimits(10, 2), ToolMode.NO_TOOLS, [], (), ImmutableConfigId("rr"), ImmutableConfigId("dp"),
+        )
+    with pytest.raises(TypeError):
+        SemanticReviewCompositionRule(CompositionRuleId("c"), CompositionMode.ALL_REQUIRED_INVOCATIONS, [])
+    with pytest.raises(TypeError):
+        RequirementMaterialAssignment(SemanticRequirementId("r"), [], (), ())
+
+
+def test_envelope_binds_exact_assignment_context_and_representation_rules():
+    subj, prof = subject(), profile()
+    slot = ReviewSlot(ReviewSlotId("a"), prof, RAW)
+    rule = SemanticReviewCompositionRule(CompositionRuleId("composition"), CompositionMode.SINGLE_REQUIRED_INVOCATION, (slot,))
+    assignment = mint(
+        SemanticReviewAssignment, assignment_id=AssignmentIdentity("assignment"), repository_id=subj.repository_id,
+        task_id=subj.task_id, contract_id=subj.contract_id, contract_raw_sha256=subj.contract_raw_sha256,
+        target_registration_id=subj.target_registration_id, policy_epoch_identity=subj.policy_epoch_identity,
+        candidate_id=subj.candidate_id, requirements=(SemanticRequirement(SemanticRequirementId("r1"), RAW),),
+        material_assignments=(RequirementMaterialAssignment(SemanticRequirementId("r1"), (MaterialIdentity("m1"),), (TrustedContextId("c1"),), (RepresentationIdentity("rep-rule"),)),),
+        required_context_ids=(TrustedContextId("c1"),), composition_rule=rule,
+        partition_rule=ReviewPartitionRule.SINGLE_REVIEW_PACKAGE,
+    )
+    evidence_subject = EvidenceSubject(
+        repository_id=subj.repository_id, task_id=subj.task_id,
+        candidate_id=subj.candidate_id, contract_id=subj.contract_id, contract_raw_sha256=subj.contract_raw_sha256,
+        authorization_id=subj.authorization_id, task_admission_event_id=subj.task_admission_event_id,
+        target_registration_id=subj.target_registration_id, policy_epoch_identity=subj.policy_epoch_identity,
+        base=subj.base, target_context_id=subj.target_context_id, pr_id=subj.pr_id, requirement_ids=subj.requirement_ids,
+        required_material_ids=subj.required_material_ids, required_context_ids=subj.required_context_ids,
+        invocation_id=ReviewInvocationId("inv"),
+        slot_id=slot.slot_id, profile_id=prof.profile_id, profile_config_id=prof.config_id,
+        verdict_schema_id=prof.verdict_schema_id,
+    )
+    changed = MaterialBinding(MaterialIdentity("m1"), subj.repository_id, MaterialKind.CHANGED_CONTENT, "a.py", "sha", subj.candidate_id, subj.base, classification_id=MaterialClassificationId("source"))
+    context = MaterialBinding(MaterialIdentity("context-material"), subj.repository_id, MaterialKind.TRUSTED_CONTEXT, "policy", "sha", None, subj.base, trusted_context_id=TrustedContextId("c1"), classification_id=MaterialClassificationId("policy"))
+    built = build_trusted_review_envelope(
+        assignment=assignment, subject=subj, slot=slot, changed_inventory=(changed,), trusted_context_inventory=(context,),
+        invocation_id=ReviewInvocationId("inv"), envelope_id=ReviewEnvelopeId("env"),
+        manifest_id=ReviewInputManifestId("manifest"), canonical_request_id=CanonicalRequestId("request"),
+        evidence_subject=evidence_subject,
+    )
+    assert built.reason is EnvelopeReason.BUILT
+    assert built.envelope.input_manifest.trusted_context_ids == (TrustedContextId("c1"),)
+    assert built.envelope.input_manifest.evidence_subject is evidence_subject
+
+    transformed = MaterialBinding(MaterialIdentity("rendered"), subj.repository_id, MaterialKind.TRANSFORMED_REPRESENTATION, "render", "sha", subj.candidate_id, subj.base, RepresentationIdentity("not-permitted"), represented_material_id=MaterialIdentity("m1"))
+    denied = build_trusted_review_envelope(
+        assignment=assignment, subject=subj, slot=slot, changed_inventory=(changed,), trusted_context_inventory=(context,),
+        representation_inventory=(transformed,), invocation_id=ReviewInvocationId("inv"), envelope_id=ReviewEnvelopeId("env"),
+        manifest_id=ReviewInputManifestId("manifest"), canonical_request_id=CanonicalRequestId("request"), evidence_subject=evidence_subject,
+    )
+    assert denied.reason is EnvelopeReason.MATERIAL_COVERAGE_MISMATCH
