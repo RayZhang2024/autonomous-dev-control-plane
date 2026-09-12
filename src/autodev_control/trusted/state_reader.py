@@ -325,6 +325,8 @@ class GitHubStateNormalizer:
             return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
         base_repository = GitHubRepositoryId(response["base_repository_id"])
         head_repository = GitHubRepositoryId(response["head_repository_id"])
+        if base_repository != request.repository_id:
+            return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
         base_ref, head_ref = GitRef(response["base_ref"]), GitRef(response["head_ref"])
         base, head = GitSha(response["base_sha"]), GitSha(response["head_sha"])
         merge_sha = response["merge_sha"]
@@ -612,6 +614,8 @@ class GitHubStateReader:
             after_raw = self._transport.read(context_request)
             after = self._normalizer.normalize(context_request, after_raw)
             if after.failure is not None:
+                if after.failure is StateReadFailure.MISMATCH:
+                    return GitHubNormalizationResult(failure=StateReadFailure.STATE_MOVED)
                 return after
             if before.observation != after.observation:
                 return GitHubNormalizationResult(failure=StateReadFailure.STATE_MOVED)

@@ -153,6 +153,19 @@ def test_ref_commit_pr_and_merge_bind_exact_repository_and_sha_context():
     assert not hasattr(observation, "authorization_id")
 
 
+def test_pull_request_requires_requested_base_repository_and_allows_fork_head():
+    request = ReadPullRequest(REPOSITORY, GitHubPullRequestNumber(2))
+    normalizer = GitHubStateNormalizer()
+    assert normalizer.normalize(
+        request, response_for(request, base_repository_id=OTHER_REPOSITORY.value)
+    ).failure is StateReadFailure.MISMATCH
+    fork = normalizer.normalize(
+        request, response_for(request, head_repository_id=OTHER_REPOSITORY.value)
+    )
+    assert fork.observation is not None
+    assert OTHER_REPOSITORY.value in fork.observation.fact_value
+
+
 def test_commit_ancestry_is_closed_and_unknown_is_failure():
     normalizer = GitHubStateNormalizer()
     request = ReadCommitAncestry(REPOSITORY, SHA_A, SHA_B)
@@ -303,6 +316,7 @@ def test_changed_file_inventory_requires_complete_pagination_and_stable_pr_conte
 
 
 @pytest.mark.parametrize("change", [
+    {"base_repository_id": OTHER_REPOSITORY.value},
     {"head_repository_id": OTHER_REPOSITORY.value},
     {"head_ref": "refs/heads/retargeted"},
 ])

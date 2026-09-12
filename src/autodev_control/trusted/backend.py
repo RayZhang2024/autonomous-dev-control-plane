@@ -9,26 +9,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+from functools import lru_cache
 import hashlib
 import json
 from threading import RLock
-from types import MappingProxyType
-from typing import TypeAlias
+from types import MappingProxyType, UnionType
+from typing import TypeAlias, Union, get_args, get_origin, get_type_hints
 
 from .authorization import AdmittedAuthorization
-from .evidence import EvidenceRecord, EvidenceSupersessionRecord
+from .evidence import EvidenceRecord, EvidenceSubject, EvidenceSupersessionRecord, SemanticEvidencePayload
 from .identity import GitSha, ImmutableConfigId, RawSha256
 from .manifest import PolicyEpochIdentity
-from .operation import CandidateId, IntegrationBound, OperationId, OperationMembershipBindingId, OperationRecord, OperationState
+from .operation import CandidateId, EvidenceId, IntegrationBound, OperationId, OperationMembershipBindingId, OperationRecord, OperationState
 from .review import (
     AdmittedSemanticEvidenceBinding,
     CanonicalRequestId,
     EvidenceHistoryMembershipBindingId,
     ReviewInvocationId,
+    MaterialIdentity,
+    RequirementResult,
     ReviewSlotAttempt,
     ReviewSlotId,
     SemanticReviewEffectiveSubject,
     SemanticReviewEffectiveSubjectId,
+    TrustedContextId,
     TrustedEffectiveSubjectEvidenceSnapshot,
     TrustedReviewSlotAttemptSnapshot,
 )
@@ -123,10 +127,9 @@ class EvidenceHistoryMembershipRecord:
     effective_subject: SemanticReviewEffectiveSubject
     membership_revision: int
     membership_binding_id: EvidenceHistoryMembershipBindingId
-    evidence_ids: tuple
+    evidence_ids: tuple[EvidenceId, ...]
 
     def __post_init__(self) -> None:
-        from .operation import EvidenceId
         if type(self.effective_subject) is not SemanticReviewEffectiveSubject or type(self.membership_binding_id) is not EvidenceHistoryMembershipBindingId:
             raise TypeError("evidence history identity has wrong exact type")
         _positive(self.membership_revision, "evidence membership revision")
@@ -218,6 +221,11 @@ class CanonicalWriteStatus(Enum):
     INDETERMINATE = "INDETERMINATE"
 
 
+class _ClosedBackendInput:
+    def __post_init__(self) -> None:
+        _validate_closed_backend_input(self)
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalWriteResult:
     status: CanonicalWriteStatus
@@ -225,72 +233,72 @@ class CanonicalWriteResult:
 
 
 @dataclass(frozen=True, slots=True)
-class RecordAbsent:
+class RecordAbsent(_ClosedBackendInput):
     namespace: CanonicalNamespace
     identity: object
 
 
 @dataclass(frozen=True, slots=True)
-class RecordPresent:
+class RecordPresent(_ClosedBackendInput):
     namespace: CanonicalNamespace
     identity: object
 
 
 @dataclass(frozen=True, slots=True)
-class ExactRecordEquals:
+class ExactRecordEquals(_ClosedBackendInput):
     namespace: CanonicalNamespace
     identity: object
     record: object
 
 
 @dataclass(frozen=True, slots=True)
-class AuthorizationExistsAndMatches:
+class AuthorizationExistsAndMatches(_ClosedBackendInput):
     authorization: AdmittedAuthorization
 
 
 @dataclass(frozen=True, slots=True)
-class TaskRevisionEquals:
+class TaskRevisionEquals(_ClosedBackendInput):
     task_id: TaskId
     revision: int
 
 
 @dataclass(frozen=True, slots=True)
-class OperationRevisionEquals:
+class OperationRevisionEquals(_ClosedBackendInput):
     operation_id: OperationId
     revision: int
 
 
 @dataclass(frozen=True, slots=True)
-class TaskOperationMembershipEquals:
+class TaskOperationMembershipEquals(_ClosedBackendInput):
     task_id: TaskId
     membership_binding_id: OperationMembershipBindingId
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceHistoryMembershipEquals:
+class EvidenceHistoryMembershipEquals(_ClosedBackendInput):
     subject_id: SemanticReviewEffectiveSubjectId
     membership_binding_id: EvidenceHistoryMembershipBindingId
 
 
 @dataclass(frozen=True, slots=True)
-class BackendGenerationEquals:
+class BackendGenerationEquals(_ClosedBackendInput):
     generation: BackendGeneration
 
 
 @dataclass(frozen=True, slots=True)
-class TaskCurrentCandidateEquals:
+class TaskCurrentCandidateEquals(_ClosedBackendInput):
     task_id: TaskId
     candidate_id: CandidateId | None
 
 
 @dataclass(frozen=True, slots=True)
-class TaskCancellationStatusEquals:
+class TaskCancellationStatusEquals(_ClosedBackendInput):
     task_id: TaskId
     cancellation_status: CancellationStatus
 
 
 @dataclass(frozen=True, slots=True)
-class CanonicalStateRootEquals:
+class CanonicalStateRootEquals(_ClosedBackendInput):
     state_root: GitSha
 
 
@@ -303,35 +311,35 @@ CanonicalCondition: TypeAlias = (
 
 
 @dataclass(frozen=True, slots=True)
-class CreateAuthorization:
+class CreateAuthorization(_ClosedBackendInput):
     authorization: AdmittedAuthorization
 
 
 @dataclass(frozen=True, slots=True)
-class CreateTaskAndInitialOperationMembership:
+class CreateTaskAndInitialOperationMembership(_ClosedBackendInput):
     task: TaskRecord
 
 
 @dataclass(frozen=True, slots=True)
-class ReplaceTask:
+class ReplaceTask(_ClosedBackendInput):
     expected_revision: int
     task: TaskRecord
 
 
 @dataclass(frozen=True, slots=True)
-class CreateCandidate:
+class CreateCandidate(_ClosedBackendInput):
     candidate: CandidateRecord
 
 
 @dataclass(frozen=True, slots=True)
-class CreateOperationAndAdvanceMembership:
+class CreateOperationAndAdvanceMembership(_ClosedBackendInput):
     operation: OperationRecord
     expected_task_revision: int
     expected_membership_binding_id: OperationMembershipBindingId
 
 
 @dataclass(frozen=True, slots=True)
-class CreateSemanticReviewOperationAndBinding:
+class CreateSemanticReviewOperationAndBinding(_ClosedBackendInput):
     operation: OperationRecord
     binding: ReviewAttemptBindingRecord
     expected_task_revision: int
@@ -339,35 +347,35 @@ class CreateSemanticReviewOperationAndBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class ReplaceOperation:
+class ReplaceOperation(_ClosedBackendInput):
     expected_revision: int
     operation: OperationRecord
 
 
 @dataclass(frozen=True, slots=True)
-class ReplaceTaskOperationMembership:
+class ReplaceTaskOperationMembership(_ClosedBackendInput):
     task_id: TaskId
     expected_membership_binding_id: OperationMembershipBindingId
     operation_ids: tuple[OperationId, ...]
 
     def __post_init__(self) -> None:
-        _exact_tuple(self.operation_ids, OperationId, "operation_ids")
+        _validate_closed_backend_input(self)
 
 
 @dataclass(frozen=True, slots=True)
-class CreateEvidenceHistory:
+class CreateEvidenceHistory(_ClosedBackendInput):
     effective_subject: SemanticReviewEffectiveSubject
 
 
 @dataclass(frozen=True, slots=True)
-class CreateEvidenceAndAdvanceHistory:
+class CreateEvidenceAndAdvanceHistory(_ClosedBackendInput):
     effective_subject: SemanticReviewEffectiveSubject
     expected_membership_binding_id: EvidenceHistoryMembershipBindingId
     evidence: EvidenceRecord
 
 
 @dataclass(frozen=True, slots=True)
-class CreateSupersession:
+class CreateSupersession(_ClosedBackendInput):
     supersession: EvidenceSupersessionRecord
 
 
@@ -387,12 +395,7 @@ class CanonicalTransaction:
     mutations: tuple[CanonicalMutation, ...]
 
     def __post_init__(self) -> None:
-        if type(self.expected_state_occurrence) is not CanonicalStateOccurrenceBinding:
-            raise TypeError("expected_state_occurrence has wrong exact type")
-        if type(self.conditions) is not tuple or any(type(item) not in _CONDITION_TYPES for item in self.conditions):
-            raise TypeError("conditions must contain only closed typed conditions")
-        if type(self.mutations) is not tuple or any(type(item) not in _MUTATION_TYPES for item in self.mutations):
-            raise TypeError("mutations must contain only closed typed mutations")
+        _validate_closed_transaction(self)
 
 
 _CONDITION_TYPES = (
@@ -408,6 +411,84 @@ _MUTATION_TYPES = (
     ReplaceTaskOperationMembership, CreateEvidenceHistory,
     CreateEvidenceAndAdvanceHistory, CreateSupersession,
 )
+
+
+_NAMESPACE_TYPES = {
+    CanonicalNamespace.AUTHORIZATION: (AuthorizationId, AdmittedAuthorization),
+    CanonicalNamespace.TASK: (TaskId, TaskRecord),
+    CanonicalNamespace.CANDIDATE: (CandidateId, CandidateRecord),
+    CanonicalNamespace.OPERATION: (OperationId, OperationRecord),
+    CanonicalNamespace.TASK_OPERATION_MEMBERSHIP: (TaskId, TaskOperationMembershipRecord),
+    CanonicalNamespace.REVIEW_ATTEMPT_BINDING: (OperationId, ReviewAttemptBindingRecord),
+    CanonicalNamespace.EVIDENCE: (EvidenceId, EvidenceRecord),
+    CanonicalNamespace.EVIDENCE_HISTORY: (SemanticReviewEffectiveSubjectId, EvidenceHistoryMembershipRecord),
+    CanonicalNamespace.SUPERSESSION: (tuple[EvidenceId, EvidenceId], EvidenceSupersessionRecord),
+}
+
+
+def _runtime_exact(value: object, expected: object) -> None:
+    decoded = _decode_canonical_value(_canonical_value(value), expected)
+    if decoded != value:
+        raise ValueError("runtime value does not equal its exact validated representation")
+
+
+def _record_identity(namespace: CanonicalNamespace, record: object) -> object:
+    if namespace is CanonicalNamespace.AUTHORIZATION:
+        return record.authorization_id
+    if namespace in (CanonicalNamespace.TASK, CanonicalNamespace.TASK_OPERATION_MEMBERSHIP):
+        return record.task_id
+    if namespace is CanonicalNamespace.CANDIDATE:
+        return record.candidate_id
+    if namespace is CanonicalNamespace.OPERATION:
+        return record.intent.operation_id
+    if namespace is CanonicalNamespace.REVIEW_ATTEMPT_BINDING:
+        return record.operation_id
+    if namespace is CanonicalNamespace.EVIDENCE:
+        return record.evidence_id
+    if namespace is CanonicalNamespace.EVIDENCE_HISTORY:
+        return record.effective_subject.subject_id
+    if namespace is CanonicalNamespace.SUPERSESSION:
+        return record.earlier_evidence_id, record.later_evidence_id
+    raise ValueError("unsupported canonical namespace")
+
+
+def _validate_closed_backend_input(value: object) -> None:
+    value_type = type(value)
+    if value_type in (RecordAbsent, RecordPresent, ExactRecordEquals):
+        if type(value.namespace) is not CanonicalNamespace:
+            raise TypeError("namespace must be exactly CanonicalNamespace")
+        identity_type, record_type = _NAMESPACE_TYPES[value.namespace]
+        _runtime_exact(value.identity, identity_type)
+        if value_type is ExactRecordEquals:
+            _runtime_exact(value.record, record_type)
+            if _record_identity(value.namespace, value.record) != value.identity:
+                raise ValueError("record identity does not match condition identity")
+        return
+    if value_type not in (*_CONDITION_TYPES, *_MUTATION_TYPES):
+        raise TypeError("value is outside the closed backend input domain")
+    for name, annotation in _resolved_fields(value_type):
+        _runtime_exact(getattr(value, name), annotation)
+    for name in {
+        TaskRevisionEquals: ("revision",),
+        OperationRevisionEquals: ("revision",),
+        ReplaceTask: ("expected_revision",),
+        ReplaceOperation: ("expected_revision",),
+        CreateOperationAndAdvanceMembership: ("expected_task_revision",),
+        CreateSemanticReviewOperationAndBinding: ("expected_task_revision",),
+    }.get(value_type, ()):
+        _positive(getattr(value, name), name)
+
+
+def _validate_closed_transaction(transaction: CanonicalTransaction) -> None:
+    if type(transaction.expected_state_occurrence) is not CanonicalStateOccurrenceBinding:
+        raise TypeError("expected_state_occurrence has wrong exact type")
+    _runtime_exact(transaction.expected_state_occurrence, CanonicalStateOccurrenceBinding)
+    if type(transaction.conditions) is not tuple or any(type(item) not in _CONDITION_TYPES for item in transaction.conditions):
+        raise TypeError("conditions must contain only closed typed conditions")
+    if type(transaction.mutations) is not tuple or any(type(item) not in _MUTATION_TYPES for item in transaction.mutations):
+        raise TypeError("mutations must contain only closed typed mutations")
+    for item in (*transaction.conditions, *transaction.mutations):
+        _validate_closed_backend_input(item)
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +597,10 @@ class InMemoryCanonicalStateBackend:
             raise TypeError("exact CanonicalTransaction required")
         with self._lock:
             occurrence = CanonicalStateOccurrenceBinding(BackendGeneration(self._generation))
+            try:
+                _validate_closed_transaction(transaction)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return CanonicalWriteResult(CanonicalWriteStatus.INVALID_TRANSACTION, occurrence)
             if transaction.expected_state_occurrence != occurrence:
                 return CanonicalWriteResult(CanonicalWriteStatus.CAS_CONFLICT, occurrence)
             failed = self._check_conditions(transaction.conditions)
@@ -1071,17 +1156,7 @@ def canonical_record_bytes(
 ) -> bytes:
     if type(record_kind) is not CanonicalRecordKind or schema_version != "1":
         raise ValueError("unsupported canonical record kind or schema")
-    expected_type = {
-        CanonicalRecordKind.AUTHORIZATION: AdmittedAuthorization,
-        CanonicalRecordKind.TASK: TaskRecord,
-        CanonicalRecordKind.CANDIDATE: CandidateRecord,
-        CanonicalRecordKind.OPERATION: OperationRecord,
-        CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: TaskOperationMembershipRecord,
-        CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: ReviewAttemptBindingRecord,
-        CanonicalRecordKind.EVIDENCE: EvidenceRecord,
-        CanonicalRecordKind.EVIDENCE_HISTORY: EvidenceHistoryMembershipRecord,
-        CanonicalRecordKind.SUPERSESSION: EvidenceSupersessionRecord,
-    }[record_kind]
+    expected_type = _CANONICAL_RECORD_TYPES[record_kind]
     if type(value) is not expected_type:
         raise TypeError(f"{record_kind.value} requires exact {expected_type.__name__}")
     payload = {
@@ -1093,34 +1168,119 @@ def canonical_record_bytes(
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _identity_parts(record_kind: CanonicalRecordKind, record: dict) -> tuple[str, ...]:
-    def field(*path: str) -> str:
-        value: object = record
-        for key in path:
-            if type(value) is not dict or key not in value:
-                raise ValueError("canonical record is missing its logical identity")
-            value = value[key]
-        if type(value) is not str or not value:
-            raise ValueError("canonical logical identity component is invalid")
+_CANONICAL_RECORD_TYPES = {
+    CanonicalRecordKind.AUTHORIZATION: AdmittedAuthorization,
+    CanonicalRecordKind.TASK: TaskRecord,
+    CanonicalRecordKind.CANDIDATE: CandidateRecord,
+    CanonicalRecordKind.OPERATION: OperationRecord,
+    CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: TaskOperationMembershipRecord,
+    CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: ReviewAttemptBindingRecord,
+    CanonicalRecordKind.EVIDENCE: EvidenceRecord,
+    CanonicalRecordKind.EVIDENCE_HISTORY: EvidenceHistoryMembershipRecord,
+    CanonicalRecordKind.SUPERSESSION: EvidenceSupersessionRecord,
+}
+
+
+@lru_cache(maxsize=None)
+def _resolved_fields(record_type: type) -> tuple[tuple[str, object], ...]:
+    hints = get_type_hints(record_type)
+    return tuple((field.name, hints[field.name]) for field in fields(record_type))
+
+
+def _bare_tuple_item_type(owner: type, field_name: str) -> type | None:
+    return {
+        (EvidenceSubject, "required_material_ids"): MaterialIdentity,
+        (EvidenceSubject, "required_context_ids"): TrustedContextId,
+        (SemanticEvidencePayload, "requirement_results"): RequirementResult,
+    }.get((owner, field_name))
+
+
+def _decode_canonical_value(value: object, expected: object, *, owner: type | None = None, field_name: str = "") -> object:
+    if expected is type(None):
+        if value is not None:
+            raise TypeError("expected null")
+        return None
+    origin = get_origin(expected)
+    if origin in (UnionType, Union):
+        alternatives = get_args(expected)
+        for alternative in alternatives:
+            try:
+                return _decode_canonical_value(value, alternative, owner=owner, field_name=field_name)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+        raise TypeError("value does not match closed union")
+    if origin is tuple or expected is tuple:
+        if type(value) is not list:
+            raise TypeError("canonical tuple must be encoded as an array")
+        arguments = get_args(expected)
+        if not arguments:
+            item_type = _bare_tuple_item_type(owner, field_name)
+            if item_type is None:
+                raise TypeError("untyped tuple is not in the closed canonical schema")
+            arguments = (item_type, Ellipsis)
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            return tuple(_decode_canonical_value(item, arguments[0]) for item in value)
+        if len(value) != len(arguments):
+            raise TypeError("canonical fixed tuple has wrong length")
+        return tuple(_decode_canonical_value(item, item_type) for item, item_type in zip(value, arguments))
+    if expected in (str, int, bool):
+        if type(value) is not expected:
+            raise TypeError("canonical scalar has wrong exact type")
         return value
+    if expected is bytes:
+        if type(value) is not dict or set(value) != {"bytes_hex"} or type(value["bytes_hex"]) is not str:
+            raise TypeError("canonical bytes have wrong shape")
+        decoded = bytes.fromhex(value["bytes_hex"])
+        if decoded.hex() != value["bytes_hex"]:
+            raise ValueError("canonical bytes are not normalized")
+        return decoded
+    if isinstance(expected, type) and issubclass(expected, Enum):
+        if not any(type(value) is type(member.value) and value == member.value for member in expected):
+            raise ValueError("canonical enum value is outside the closed domain")
+        return expected(value)
+    if isinstance(expected, type) and is_dataclass(expected):
+        if type(value) is not dict:
+            raise TypeError("canonical nominal record must be an object")
+        expected_fields = _resolved_fields(expected)
+        if set(value) != {name for name, _ in expected_fields}:
+            raise ValueError("canonical nominal record field set mismatch")
+        decoded_fields = {
+            name: _decode_canonical_value(value[name], annotation, owner=expected, field_name=name)
+            for name, annotation in expected_fields
+        }
+        decoded = object.__new__(expected)
+        for name, item in decoded_fields.items():
+            object.__setattr__(decoded, name, item)
+        post_init = expected.__dict__.get("__post_init__")
+        if post_init is not None:
+            post_init(decoded)
+        return decoded
+    raise TypeError("type is not part of the closed canonical schema")
 
-    paths = {
-        CanonicalRecordKind.AUTHORIZATION: (("authorization_id", "raw_sha256", "value"),),
-        CanonicalRecordKind.TASK: (("task_id", "value"),),
-        CanonicalRecordKind.CANDIDATE: (("candidate_id", "value"),),
-        CanonicalRecordKind.OPERATION: (("intent", "operation_id", "value"),),
-        CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: (("task_id", "value"),),
-        CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: (("operation_id", "value"),),
-        CanonicalRecordKind.EVIDENCE: (("evidence_id", "value"),),
-        CanonicalRecordKind.EVIDENCE_HISTORY: (("effective_subject", "subject_id", "value"),),
-        CanonicalRecordKind.SUPERSESSION: (
-            ("earlier_evidence_id", "value"), ("later_evidence_id", "value"),
-        ),
-    }[record_kind]
-    return tuple(field(*path) for path in paths)
+
+def _identity_parts(record_kind: CanonicalRecordKind, record: object) -> tuple[str, ...]:
+    if record_kind is CanonicalRecordKind.AUTHORIZATION:
+        return (record.authorization_id.raw_sha256.value,)
+    if record_kind is CanonicalRecordKind.TASK:
+        return (record.task_id.value,)
+    if record_kind is CanonicalRecordKind.CANDIDATE:
+        return (record.candidate_id.value,)
+    if record_kind is CanonicalRecordKind.OPERATION:
+        return (record.intent.operation_id.value,)
+    if record_kind is CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP:
+        return (record.task_id.value,)
+    if record_kind is CanonicalRecordKind.REVIEW_ATTEMPT_BINDING:
+        return (record.operation_id.value,)
+    if record_kind is CanonicalRecordKind.EVIDENCE:
+        return (record.evidence_id.value,)
+    if record_kind is CanonicalRecordKind.EVIDENCE_HISTORY:
+        return (record.effective_subject.subject_id.value,)
+    if record_kind is CanonicalRecordKind.SUPERSESSION:
+        return (record.earlier_evidence_id.value, record.later_evidence_id.value)
+    raise ValueError("unsupported canonical record kind")
 
 
-def _logical_identity(record_kind: CanonicalRecordKind, record: dict, schema_version: str) -> str:
+def _logical_identity(record_kind: CanonicalRecordKind, record: object, schema_version: str) -> str:
     if schema_version != "1":
         raise ValueError("unsupported canonical record schema")
     payload = ("autodev.canonical-identity/v1", record_kind.value, *_identity_parts(record_kind, record))
@@ -1133,10 +1293,7 @@ def canonical_logical_identity(
     if type(record_kind) is not CanonicalRecordKind:
         raise TypeError("exact CanonicalRecordKind required")
     canonical_record_bytes(record_kind, value, schema_version)
-    canonical = _canonical_value(value)
-    if type(canonical) is not dict:
-        raise ValueError("canonical record must be a typed record")
-    return _logical_identity(record_kind, canonical, schema_version)
+    return _logical_identity(record_kind, value, schema_version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1266,7 +1423,7 @@ def validate_canonical_root(
     return True
 
 
-def _decode_canonical_record(raw: bytes) -> tuple[CanonicalRecordKind, str, dict] | None:
+def _decode_canonical_record(raw: bytes) -> tuple[CanonicalRecordKind, str, object] | None:
     try:
         text = raw.decode("utf-8", errors="strict")
 
@@ -1289,8 +1446,12 @@ def _decode_canonical_record(raw: bytes) -> tuple[CanonicalRecordKind, str, dict
             return None
         if json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") != raw:
             return None
-        return CanonicalRecordKind(value["record_kind"]), value["schema_version"], value["record"]
-    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        record_kind = CanonicalRecordKind(value["record_kind"])
+        record = _decode_canonical_value(value["record"], _CANONICAL_RECORD_TYPES[record_kind])
+        if canonical_record_bytes(record_kind, record, value["schema_version"]) != raw:
+            return None
+        return record_kind, value["schema_version"], record
+    except (AttributeError, KeyError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 

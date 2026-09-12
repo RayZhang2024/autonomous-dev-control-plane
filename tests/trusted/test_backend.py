@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 import hashlib
+import json
 
 import pytest
 
@@ -498,6 +499,135 @@ def test_root_digest_indexes_and_unrelated_staging_objects():
         "1", None, (), (CanonicalIndexEntry("task", arbitrary_ref),), (), (), (), (), (), (), ()
     )
     assert not validate_canonical_root(arbitrary_manifest, (CanonicalStoredObject(arbitrary_ref, arbitrary),))
+
+
+def test_root_rejects_incomplete_or_structurally_forged_typed_records():
+    valid = task()
+    valid_record = json.loads(canonical_record_bytes(CanonicalRecordKind.TASK, valid))["record"]
+    logical_identity = canonical_logical_identity(CanonicalRecordKind.TASK, valid)
+
+    def rejected(record, *, wrapper_kind="task", ref_kind=CanonicalRecordKind.TASK, schema="1"):
+        wrapper = {
+            "format": "autodev.canonical-record/v1", "record": record,
+            "record_kind": wrapper_kind, "schema_version": schema,
+        }
+        raw = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        reference = CanonicalObjectRef(ref_kind, schema, RawSha256(hashlib.sha256(raw).hexdigest()))
+        entry = CanonicalIndexEntry(logical_identity, reference)
+        indexes = [(), (), (), (), (), (), (), (), ()]
+        indexes[1 if ref_kind is CanonicalRecordKind.TASK else 2] = (entry,)
+        manifest = CanonicalStateRootManifest("1", None, *indexes)
+        assert not validate_canonical_root(manifest, (CanonicalStoredObject(reference, raw),))
+
+    rejected({"task_id": valid_record["task_id"]})
+    missing = dict(valid_record)
+    missing.pop("contract_id")
+    rejected(missing)
+    extra = dict(valid_record, caller_label="task")
+    rejected(extra)
+    wrong_identity_shape = dict(valid_record, task_id=TASK.value)
+    rejected(wrong_identity_shape)
+    wrong_scalar = dict(valid_record, revision=True)
+    rejected(wrong_scalar)
+    rejected(valid_record, wrapper_kind="candidate", ref_kind=CanonicalRecordKind.CANDIDATE)
+    rejected(valid_record, schema="2")
+
+
+def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind():
+    subject = effective_subject()
+    op = operation(candidate_id=subject.candidate_id)
+    admitted_evidence = evidence(subject)
+    earlier, later = EvidenceId("earlier"), EvidenceId("later")
+    supersession_authorization = mint(
+        TrustedSupersessionAuthorization,
+        decision_id=SupersessionDecisionId("decision"), subject_id=subject.subject_id,
+        policy_epoch_identity=EPOCH, earlier_evidence_id=earlier,
+        later_evidence_id=later,
+        authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
+    )
+    records = (
+        admitted_authorization(),
+        task(),
+        CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ()),
+        op,
+        TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), (op.intent.operation_id,)),
+        ReviewAttemptBindingRecord(
+            subject, ReviewInvocationId("invocation"), ReviewSlotId("slot"),
+            op.intent.operation_id, CanonicalRequestId("request"),
+        ),
+        admitted_evidence,
+        EvidenceHistoryMembershipRecord(
+            subject, 1, EvidenceHistoryMembershipBindingId("history"), (admitted_evidence.evidence_id,),
+        ),
+        mint(
+            EvidenceSupersessionRecord, earlier_evidence_id=earlier, later_evidence_id=later,
+            subject_id=subject.subject_id, policy_epoch_identity=EPOCH,
+            authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
+            decision_id=SupersessionDecisionId("decision"), authorization=supersession_authorization,
+        ),
+    )
+    indexes, stored = [], []
+    for kind, record in zip(CanonicalRecordKind, records):
+        reference = canonical_object_ref(kind, record)
+        indexes.append((CanonicalIndexEntry(canonical_logical_identity(kind, record), reference),))
+        stored.append(CanonicalStoredObject(reference, canonical_record_bytes(kind, record)))
+    assert validate_canonical_root(CanonicalStateRootManifest("1", None, *indexes), tuple(stored))
+
+
+@pytest.mark.parametrize("revision", [True, False, 1.0, "1", 0, -1])
+def test_all_revision_inputs_require_exact_positive_integers(revision):
+    op = operation()
+    subject = effective_subject()
+    binding = ReviewAttemptBindingRecord(
+        subject, ReviewInvocationId("invocation"), ReviewSlotId("slot"),
+        op.intent.operation_id, CanonicalRequestId("request"),
+    )
+    membership = OperationMembershipBindingId("membership")
+    constructors = (
+        lambda: TaskRevisionEquals(TASK, revision),
+        lambda: OperationRevisionEquals(op.intent.operation_id, revision),
+        lambda: ReplaceTask(revision, task()),
+        lambda: ReplaceOperation(revision, op),
+        lambda: CreateOperationAndAdvanceMembership(op, revision, membership),
+        lambda: CreateSemanticReviewOperationAndBinding(op, binding, revision, membership),
+    )
+    for constructor in constructors:
+        with pytest.raises((TypeError, ValueError)):
+            constructor()
+
+
+def test_generic_record_conditions_use_closed_namespace_identity_and_record_types():
+    with pytest.raises((TypeError, ValueError)):
+        RecordAbsent(CanonicalNamespace.TASK, OperationId("task"))
+    with pytest.raises((TypeError, ValueError)):
+        RecordPresent(CanonicalNamespace.OPERATION, TASK)
+    with pytest.raises((TypeError, ValueError)):
+        ExactRecordEquals(CanonicalNamespace.TASK, TASK, operation())
+    with pytest.raises(ValueError):
+        ExactRecordEquals(CanonicalNamespace.TASK, TaskId("other"), task())
+    assert ExactRecordEquals(CanonicalNamespace.TASK, TASK, task()).record == task()
+
+
+def test_apply_rejects_forged_malformed_inputs_without_publishing_partial_state():
+    store = initialized_backend()
+    before_occurrence = store.occurrence
+    before_working = store.read_task_working_set(TASK)
+    forged_values = (
+        mint(ReplaceTask, expected_revision=True, task=replace(task(), revision=2)),
+        mint(CreateCandidate, candidate=task()),
+        mint(RecordAbsent, namespace=CanonicalNamespace.TASK, identity=OperationId("task")),
+    )
+    for forged in forged_values:
+        conditions = (forged,) if type(forged) is RecordAbsent else ()
+        mutations = () if conditions else (forged,)
+        transaction = mint(
+            CanonicalTransaction, expected_state_occurrence=store.occurrence,
+            conditions=conditions, mutations=mutations,
+        )
+        result = store.apply(transaction)
+        assert result.status is CanonicalWriteStatus.INVALID_TRANSACTION
+        assert store.occurrence == before_occurrence
+        assert store.read_task_working_set(TASK) == before_working
 
 
 def test_single_predecessor_commit_and_platform_cas_contract():
