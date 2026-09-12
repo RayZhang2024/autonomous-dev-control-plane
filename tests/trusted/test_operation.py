@@ -23,12 +23,11 @@ from autodev_control.trusted.operation import (
     OperationSubjectId,
     ReconciliationFinding,
     TrustedOperationClassification,
+    TrustedReconciliationFinding,
     construct_trusted_operation_intent,
     reconcile_operation,
     reserve_operation,
     transition_operation,
-    trusted_operation_classification_for_test,
-    trusted_reconciliation_finding_for_test,
 )
 from autodev_control.trusted.scope import AuthorizationId, ContractId, TargetRegistrationId, TaskId
 from autodev_control.trusted.identity import GitRef
@@ -40,13 +39,32 @@ TARGET = TargetRegistrationId(RAW)
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
 
 
+def _mint(cls, **fields):
+    value = object.__new__(cls)
+    for name, field_value in fields.items():
+        object.__setattr__(value, name, field_value)
+    return value
+
+
+def classification(effect_class, purpose):
+    return _mint(
+        TrustedOperationClassification,
+        effect_class=effect_class,
+        purpose=purpose,
+    )
+
+
+def reconciliation_finding(finding):
+    return _mint(TrustedReconciliationFinding, finding=finding)
+
+
 def intent(
     operation="op-1", key="key-1", *, task="task", effect=OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT,
     purpose=OperationPurpose.NORMAL, candidate="candidate", integration=False, repair=False,
 ):
-    classification = trusted_operation_classification_for_test(effect, purpose)
+    trusted_classification = classification(effect, purpose)
     return construct_trusted_operation_intent(
-        classification=classification,
+        classification=trusted_classification,
         operation_id=OperationId(operation),
         idempotency_key=OperationIdempotencyKey(key),
         task_id=TaskId(task),
@@ -87,11 +105,11 @@ def test_direct_classification_and_intent_construction_are_closed():
 
 
 def test_intent_requires_duplicate_free_evidence_ids():
-    classification = trusted_operation_classification_for_test(
+    trusted_classification = classification(
         OperationEffectClass.NON_PROTECTED_EFFECT, OperationPurpose.NORMAL
     )
     kwargs = dict(
-        classification=classification, operation_id=OperationId("op"),
+        classification=trusted_classification, operation_id=OperationId("op"),
         idempotency_key=OperationIdempotencyKey("key"), task_id=TaskId("task"),
         action_id=OperationActionId("action"), subject_id=OperationSubjectId("subject"),
         candidate_id=None, contract_id=ContractId("contract"), contract_raw_sha256=RAW,
@@ -190,13 +208,13 @@ def test_operation_update_proposal_binds_exact_prior_revision():
 )
 @pytest.mark.parametrize("source", [OperationState.PERFORMING, OperationState.INDETERMINATE])
 def test_reconciliation_maps_exact_findings(source, finding, target):
-    trusted = trusted_reconciliation_finding_for_test(finding)
+    trusted = reconciliation_finding(finding)
     result = reconcile_operation(OperationRecord(intent(), 1, source), 1, trusted)
     assert result.operation.state is target
 
 
 def test_reconciliation_of_reserved_operation_is_rejected():
-    finding = trusted_reconciliation_finding_for_test(ReconciliationFinding.UNRESOLVED)
+    finding = reconciliation_finding(ReconciliationFinding.UNRESOLVED)
     result = reconcile_operation(OperationRecord(intent(), 1, OperationState.RESERVED), 1, finding)
     assert result.failure.code is G4FailureCode.RECONCILIATION_REQUIRED
 

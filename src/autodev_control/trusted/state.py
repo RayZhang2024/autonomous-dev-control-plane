@@ -254,19 +254,6 @@ class OperationRevisionBinding:
         _revision(self.revision, "bound operation revision")
 
 
-_COMPLETION_KEY = object()
-_APPLICABILITY_KEY = object()
-
-
-def _private_new(cls: type, key: object, expected: object, **fields: object):
-    if key is not expected:
-        raise TypeError("internal trusted construction only")
-    result = object.__new__(cls)
-    for name, value in fields.items():
-        object.__setattr__(result, name, value)
-    return result
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class CompletionAggregate:
     completion_rule_set_id: CompletionRuleSetId
@@ -287,45 +274,6 @@ class CompletionAggregate:
         raise TypeError("completion aggregate must come from a trusted composition boundary")
 
 
-def trusted_completion_aggregate_for_test(
-    *, completion_rule_set_id: CompletionRuleSetId, task_id: TaskId,
-    contract_id: ContractId, contract_raw_sha256: RawSha256,
-    authorization_id: AuthorizationId, admission_event_id: AdmissionEventId,
-    target_registration_id: TargetRegistrationId, policy_epoch_identity: PolicyEpochIdentity,
-    candidate_id: CandidateId | None, contract_acceptance_status: ConditionStatus,
-    additional_trusted_completion_conditions_status: ConditionStatus,
-    required_protected_operation_ids: tuple[OperationId, ...],
-    current_applicability_and_authority_status: ConditionStatus,
-) -> CompletionAggregate:
-    exact = (
-        (completion_rule_set_id, CompletionRuleSetId), (task_id, TaskId),
-        (contract_id, ContractId), (contract_raw_sha256, RawSha256),
-        (authorization_id, AuthorizationId), (admission_event_id, AdmissionEventId),
-        (target_registration_id, TargetRegistrationId),
-        (policy_epoch_identity, PolicyEpochIdentity),
-        (contract_acceptance_status, ConditionStatus),
-        (additional_trusted_completion_conditions_status, ConditionStatus),
-        (current_applicability_and_authority_status, ConditionStatus),
-    )
-    if any(type(value) is not expected for value, expected in exact):
-        raise TypeError("completion field has wrong exact type")
-    if candidate_id is not None and type(candidate_id) is not CandidateId:
-        raise TypeError("candidate_id has wrong exact type")
-    _unique_exact(required_protected_operation_ids, OperationId, "required operation ids")
-    return _private_new(
-        CompletionAggregate, _COMPLETION_KEY, _COMPLETION_KEY,
-        completion_rule_set_id=completion_rule_set_id, task_id=task_id,
-        contract_id=contract_id, contract_raw_sha256=contract_raw_sha256,
-        authorization_id=authorization_id, admission_event_id=admission_event_id,
-        target_registration_id=target_registration_id,
-        policy_epoch_identity=policy_epoch_identity, candidate_id=candidate_id,
-        contract_acceptance_status=contract_acceptance_status,
-        additional_trusted_completion_conditions_status=additional_trusted_completion_conditions_status,
-        required_protected_operation_ids=required_protected_operation_ids,
-        current_applicability_and_authority_status=current_applicability_and_authority_status,
-    )
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class CandidateApplicabilityDetermination:
     decision_event_id: DecisionEventId
@@ -341,24 +289,6 @@ class CandidateApplicabilityDetermination:
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("candidate applicability must come from a trusted boundary")
-
-
-def trusted_candidate_applicability_for_test(
-    *, decision_event_id: DecisionEventId, candidate: CandidateRecord,
-    expected_task_revision: TaskRevision,
-) -> CandidateApplicabilityDetermination:
-    if type(decision_event_id) is not DecisionEventId or type(candidate) is not CandidateRecord:
-        raise TypeError("applicability fixture values have wrong exact type")
-    _revision(expected_task_revision, "expected task revision")
-    return _private_new(
-        CandidateApplicabilityDetermination, _APPLICABILITY_KEY, _APPLICABILITY_KEY,
-        decision_event_id=decision_event_id, candidate_id=candidate.candidate_id,
-        task_id=candidate.task_id, expected_task_revision=expected_task_revision,
-        contract_id=candidate.contract_id, contract_raw_sha256=candidate.contract_raw_sha256,
-        authorization_id=candidate.authorization_id, admission_event_id=candidate.admission_event_id,
-        target_registration_id=candidate.target_registration_id,
-        policy_epoch_identity=candidate.policy_epoch_identity,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,7 +620,10 @@ def evaluate_task(task: TaskRecord, evaluation: TaskEvaluationInput) -> TaskResu
     required_succeeded = all(item.state is OperationState.SUCCEEDED for item in required)
     unresolved = any(item.state in (OperationState.PERFORMING, OperationState.INDETERMINATE) for item in protected)
     completion_claim = statuses_satisfied and required_succeeded and not unresolved
-    if completion_claim and (
+    completion_satisfied = (
+        completion_claim and task.cancellation_status is CancellationStatus.NONE
+    )
+    if completion_satisfied and (
         evaluation.blocking_condition_ids or evaluation.awaiting_input_requirement_ids or next_id is not None
     ):
         return _failure(G4FailureCode.INCONSISTENT_TASK_EVALUATION)
@@ -707,13 +640,10 @@ def evaluate_task(task: TaskRecord, evaluation: TaskEvaluationInput) -> TaskResu
         else:
             target = TaskState.CANCELLED
         next_id = None
-    elif task.cancellation_status is CancellationStatus.REQUESTED:
-        target = TaskState.BLOCKED
-        next_id = None
     elif evaluation.blocking_condition_ids:
         target = TaskState.BLOCKED
         next_id = None
-    elif completion_claim:
+    elif completion_satisfied:
         target = TaskState.COMPLETED
         next_id = None
     elif evaluation.awaiting_input_requirement_ids:
@@ -782,51 +712,73 @@ def set_cancellation(
         else:
             target = TaskState.CANCELLED
         membership, bindings = expected_membership_binding_id, expected_operation_revisions
-    elif status is CancellationStatus.REQUESTED:
-        target = TaskState.BLOCKED
+    next_operation = (
+        None if status is CancellationStatus.AUTHORITATIVE
+        else task.next_integration_operation_id
+    )
     proposed = replace(
         task, revision=task.revision + 1, state=target,
         cancellation_status=status, cancellation_request_id=request_id,
-        next_integration_operation_id=None,
+        next_integration_operation_id=next_operation,
     )
     return _proposal(task, proposed, membership=membership, bindings=bindings)
 
 
 def reserve_repair_attempt(
     task: TaskRecord, operation_id: OperationId, *, expected_task_revision: TaskRevision,
+    snapshot: TaskOperationSnapshot,
+    expected_membership_binding_id: OperationMembershipBindingId,
 ) -> TaskResult:
     problem = _base_check(task, expected_task_revision)
     if problem:
         return _failure(problem)
+    if snapshot.task_id != task.task_id:
+        return _failure(G4FailureCode.IDENTITY_MISMATCH)
+    if expected_membership_binding_id != snapshot.membership_binding_id:
+        return _failure(G4FailureCode.OPERATION_MEMBERSHIP_CONFLICT)
     if task.cancellation_status is CancellationStatus.AUTHORITATIVE:
         return _failure(G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START)
     budget = task.repair_budget
     historical = (*budget.reserved_operation_ids, *budget.consumed_operation_ids, *budget.released_operation_ids)
     if operation_id in historical:
         return TaskResult(task=task, replayed=True)
+    if any(operation.intent.operation_id == operation_id for operation in snapshot.operations):
+        return _failure(G4FailureCode.REPAIR_ATTEMPT_REUSE_MISMATCH)
     if len(budget.reserved_operation_ids) + len(budget.consumed_operation_ids) >= budget.maximum_attempts:
         return _failure(G4FailureCode.REPAIR_BUDGET_EXHAUSTED)
     updated = replace(budget, reserved_operation_ids=(*budget.reserved_operation_ids, operation_id))
     proposed = replace(task, revision=task.revision + 1, repair_budget=updated)
-    return _proposal(task, proposed)
+    return _proposal(task, proposed, membership=expected_membership_binding_id)
 
 
 def release_repair_attempt(
     task: TaskRecord, operation_id: OperationId, *, expected_task_revision: TaskRevision,
-    operation: OperationRecord | None = None, expected_operation_revision: OperationRevision | None = None,
+    snapshot: TaskOperationSnapshot,
+    expected_membership_binding_id: OperationMembershipBindingId,
+    expected_operation_revision: OperationRevision | None = None,
 ) -> TaskResult:
     problem = _base_check(task, expected_task_revision)
     if problem:
         return _failure(problem)
+    if snapshot.task_id != task.task_id:
+        return _failure(G4FailureCode.IDENTITY_MISMATCH)
+    if expected_membership_binding_id != snapshot.membership_binding_id:
+        return _failure(G4FailureCode.OPERATION_MEMBERSHIP_CONFLICT)
     if operation_id not in task.repair_budget.reserved_operation_ids:
         return _failure(G4FailureCode.REPAIR_ATTEMPT_NOT_RESERVED)
     bindings: tuple[OperationRevisionBinding, ...] = ()
+    operation = next(
+        (item for item in snapshot.operations if item.intent.operation_id == operation_id),
+        None,
+    )
     if operation is not None:
-        if operation.intent.operation_id != operation_id or operation.state is not OperationState.RESERVED:
+        if not operation.intent.is_repair_attempt or operation.state is not OperationState.RESERVED:
             return _failure(G4FailureCode.REPAIR_ATTEMPT_REUSE_MISMATCH)
         if expected_operation_revision != operation.revision:
             return _failure(G4FailureCode.REVISION_CONFLICT)
         bindings = (OperationRevisionBinding(operation_id, operation.revision),)
+    elif expected_operation_revision is not None:
+        return _failure(G4FailureCode.REPAIR_ATTEMPT_REUSE_MISMATCH)
     budget = task.repair_budget
     updated = replace(
         budget,
@@ -834,7 +786,9 @@ def release_repair_attempt(
         released_operation_ids=(*budget.released_operation_ids, operation_id),
     )
     proposed = replace(task, revision=task.revision + 1, repair_budget=updated)
-    return _proposal(task, proposed, bindings=bindings)
+    return _proposal(
+        task, proposed, membership=expected_membership_binding_id, bindings=bindings
+    )
 
 
 def reserve_task_operation(

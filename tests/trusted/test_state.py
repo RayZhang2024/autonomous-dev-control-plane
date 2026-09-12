@@ -26,8 +26,8 @@ from autodev_control.trusted.operation import (
     OperationRecord,
     OperationState,
     OperationSubjectId,
+    TrustedOperationClassification,
     construct_trusted_operation_intent,
-    trusted_operation_classification_for_test,
 )
 from autodev_control.trusted.scope import AuthorizationId, ContractId, TargetRegistrationId, TaskId
 from autodev_control.trusted.identity import GitRef
@@ -48,14 +48,12 @@ from autodev_control.trusted.state import (
     adopt_candidate,
     evaluate_task,
     initial_task_proposal,
-    release_repair_attempt,
-    reserve_repair_attempt,
+    release_repair_attempt as release_repair_attempt_model,
+    reserve_repair_attempt as reserve_repair_attempt_model,
     reserve_task_operation,
     revise_supporting_evidence,
     set_cancellation,
     start_operation,
-    trusted_candidate_applicability_for_test,
-    trusted_completion_aggregate_for_test,
 )
 
 
@@ -67,6 +65,21 @@ TASK_ID = TaskId("task")
 CONTRACT = ContractId("contract")
 ADMISSION = AdmissionEventId("admission")
 MEMBERSHIP = OperationMembershipBindingId("membership")
+
+
+def _mint(cls, **fields):
+    value = object.__new__(cls)
+    for name, field_value in fields.items():
+        object.__setattr__(value, name, field_value)
+    return value
+
+
+def classification(effect_class, purpose):
+    return _mint(
+        TrustedOperationClassification,
+        effect_class=effect_class,
+        purpose=purpose,
+    )
 
 
 def admitted(maximum=2):
@@ -95,9 +108,9 @@ def operation(
     purpose=OperationPurpose.NORMAL, candidate_id=CandidateId("candidate"), repair=False,
     integration=False,
 ):
-    classification = trusted_operation_classification_for_test(effect, purpose)
+    trusted_classification = classification(effect, purpose)
     intent = construct_trusted_operation_intent(
-        classification=classification, operation_id=OperationId(name),
+        classification=trusted_classification, operation_id=OperationId(name),
         idempotency_key=OperationIdempotencyKey(f"key-{name}"), task_id=TASK_ID,
         action_id=OperationActionId("action"), subject_id=OperationSubjectId("subject"),
         candidate_id=candidate_id, contract_id=CONTRACT, contract_raw_sha256=RAW,
@@ -118,7 +131,8 @@ def snapshot(*operations, membership=MEMBERSHIP):
 def aggregate(task, *, contract=ConditionStatus.UNSATISFIED,
               additional=ConditionStatus.SATISFIED,
               applicability=ConditionStatus.SATISFIED, required=()):
-    return trusted_completion_aggregate_for_test(
+    return _mint(
+        CompletionAggregate,
         completion_rule_set_id=CompletionRuleSetId("rules"), task_id=task.task_id,
         contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
         authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
@@ -152,9 +166,42 @@ def evaluation(task, operations=(), *, blockers=(), waiting=(), next_id=None,
 
 
 def applicability(task, value):
-    return trusted_candidate_applicability_for_test(
-        decision_event_id=DecisionEventId("decision"), candidate=value,
+    return _mint(
+        CandidateApplicabilityDetermination,
+        decision_event_id=DecisionEventId("decision"), candidate_id=value.candidate_id,
+        task_id=value.task_id,
         expected_task_revision=task.revision,
+        contract_id=value.contract_id,
+        contract_raw_sha256=value.contract_raw_sha256,
+        authorization_id=value.authorization_id,
+        admission_event_id=value.admission_event_id,
+        target_registration_id=value.target_registration_id,
+        policy_epoch_identity=value.policy_epoch_identity,
+    )
+
+
+def reserve_repair_attempt(
+    task, operation_id, *, expected_task_revision, operations=(),
+    membership=MEMBERSHIP, expected_membership=MEMBERSHIP,
+):
+    return reserve_repair_attempt_model(
+        task, operation_id, expected_task_revision=expected_task_revision,
+        snapshot=TaskOperationSnapshot(task.task_id, membership, tuple(operations)),
+        expected_membership_binding_id=expected_membership,
+    )
+
+
+def release_repair_attempt(
+    task, operation_id, *, expected_task_revision, operation=None,
+    expected_operation_revision=None, membership=MEMBERSHIP,
+    expected_membership=MEMBERSHIP,
+):
+    operations = () if operation is None else (operation,)
+    return release_repair_attempt_model(
+        task, operation_id, expected_task_revision=expected_task_revision,
+        snapshot=TaskOperationSnapshot(task.task_id, membership, operations),
+        expected_membership_binding_id=expected_membership,
+        expected_operation_revision=expected_operation_revision,
     )
 
 
@@ -314,17 +361,41 @@ def test_operation_success_alone_does_not_imply_completion():
     assert result.proposal.proposed.state is TaskState.EVALUATING
 
 
-def test_requested_cancellation_prevents_completion_and_can_resolve():
+def test_requested_cancellation_withholds_completion_without_forcing_blocked():
     task = evaluating()
     requested = set_cancellation(
         task, CancellationStatus.REQUESTED, CancellationRequestId("cancel"), expected_task_revision=1
     ).proposal.proposed
+    assert requested.state is TaskState.EVALUATING
     result = evaluate_task(requested, evaluation(requested, contract=ConditionStatus.SATISFIED))
-    assert result.proposal.proposed.state is TaskState.BLOCKED
+    assert result.proposal.proposed.state is TaskState.EVALUATING
+    assert result.proposal.proposed.cancellation_status is CancellationStatus.REQUESTED
     cleared = set_cancellation(
         result.proposal.proposed, CancellationStatus.NONE, None, expected_task_revision=3
     )
     assert cleared.proposal.proposed.cancellation_status is CancellationStatus.NONE
+
+
+def test_requested_cancellation_preserves_integration_ready_posture_and_next_operation():
+    item = operation(integration=True)
+    task = replace(
+        evaluating(), state=TaskState.INTEGRATION_READY,
+        next_integration_operation_id=item.intent.operation_id,
+    )
+    requested = set_cancellation(
+        task, CancellationStatus.REQUESTED, CancellationRequestId("cancel"),
+        expected_task_revision=1,
+    ).proposal.proposed
+    assert requested.state is TaskState.INTEGRATION_READY
+    assert requested.next_integration_operation_id == item.intent.operation_id
+    evaluated = evaluate_task(
+        requested, evaluation(
+            requested, (item,), next_id=item.intent.operation_id,
+            contract=ConditionStatus.SATISFIED,
+        )
+    ).proposal.proposed
+    assert evaluated.state is TaskState.INTEGRATION_READY
+    assert evaluated.next_integration_operation_id == item.intent.operation_id
 
 
 def test_authoritative_cancellation_is_terminal_when_no_unresolved_effect():
@@ -448,6 +519,31 @@ def test_repair_reservation_is_bounded_and_idempotent():
     assert exhausted.failure.code is G4FailureCode.REPAIR_BUDGET_EXHAUSTED
 
 
+def test_repair_reservation_rejects_operation_id_already_used_outside_budget():
+    existing = operation(name="repair", repair=False)
+    result = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+        operations=(existing,),
+    )
+    assert result.failure.code is G4FailureCode.REPAIR_ATTEMPT_REUSE_MISMATCH
+
+
+def test_repair_reservation_binds_exact_operation_membership():
+    result = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+        membership=OperationMembershipBindingId("current"),
+        expected_membership=OperationMembershipBindingId("stale"),
+    )
+    assert result.failure.code is G4FailureCode.OPERATION_MEMBERSHIP_CONFLICT
+
+
+def test_successful_repair_reservation_carries_membership_precondition():
+    result = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+    )
+    assert result.proposal.expected_membership_binding_id == MEMBERSHIP
+
+
 def test_released_repair_id_is_historical_and_cannot_create_operation():
     task = reserve_repair_attempt(admitted(), OperationId("repair"), expected_task_revision=1).proposal.proposed
     released = release_repair_attempt(task, OperationId("repair"), expected_task_revision=2).proposal.proposed
@@ -459,6 +555,44 @@ def test_released_repair_id_is_historical_and_cannot_create_operation():
         expected_membership_binding_id=MEMBERSHIP,
     )
     assert create.failure.code is G4FailureCode.REPAIR_ATTEMPT_NOT_RESERVED
+
+
+def test_absent_operation_release_is_membership_bound():
+    task = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+    ).proposal.proposed
+    result = release_repair_attempt(
+        task, OperationId("repair"), expected_task_revision=2,
+    )
+    assert result.proposal.expected_membership_binding_id == MEMBERSHIP
+    assert result.proposal.expected_operation_revisions == ()
+
+
+def test_absent_operation_release_rejects_stale_membership():
+    task = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+    ).proposal.proposed
+    result = release_repair_attempt(
+        task, OperationId("repair"), expected_task_revision=2,
+        membership=OperationMembershipBindingId("current"),
+        expected_membership=OperationMembershipBindingId("stale"),
+    )
+    assert result.failure.code is G4FailureCode.OPERATION_MEMBERSHIP_CONFLICT
+
+
+def test_existing_reserved_operation_release_binds_membership_and_revision():
+    task = reserve_repair_attempt(
+        admitted(), OperationId("repair"), expected_task_revision=1,
+    ).proposal.proposed
+    item = operation(name="repair", repair=True)
+    result = release_repair_attempt(
+        task, OperationId("repair"), expected_task_revision=2,
+        operation=item, expected_operation_revision=1,
+    )
+    assert result.proposal.expected_membership_binding_id == MEMBERSHIP
+    assert result.proposal.expected_operation_revisions == (
+        OperationRevisionBinding(OperationId("repair"), 1),
+    )
 
 
 def test_repair_operation_creation_requires_current_reservation():
@@ -612,7 +746,7 @@ def test_nonterminal_authoritative_cancellation_blocks_repair_start():
 
 def test_task_snapshot_rejects_wrong_task_and_duplicate_operation_ids():
     wrong = replace(operation(), intent=construct_trusted_operation_intent(
-        classification=trusted_operation_classification_for_test(OperationEffectClass.NON_PROTECTED_EFFECT, OperationPurpose.NORMAL),
+        classification=classification(OperationEffectClass.NON_PROTECTED_EFFECT, OperationPurpose.NORMAL),
         operation_id=OperationId("wrong"), idempotency_key=OperationIdempotencyKey("wrong"),
         task_id=TaskId("other"), action_id=OperationActionId("a"), subject_id=OperationSubjectId("s"),
         candidate_id=None, contract_id=CONTRACT, contract_raw_sha256=RAW, authorization_id=AUTH,

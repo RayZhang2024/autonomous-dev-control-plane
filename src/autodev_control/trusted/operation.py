@@ -178,9 +178,6 @@ class ReconciliationFinding(Enum):
     UNRESOLVED = "UNRESOLVED"
 
 
-_RECONCILIATION_KEY = object()
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedReconciliationFinding:
     finding: ReconciliationFinding
@@ -206,10 +203,6 @@ class NotIntegrationBound:
 IntegrationBinding = IntegrationBound | NotIntegrationBound
 
 
-_CLASSIFICATION_KEY = object()
-_INTENT_KEY = object()
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedOperationClassification:
     effect_class: OperationEffectClass
@@ -217,45 +210,6 @@ class TrustedOperationClassification:
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("classification must come from a trusted boundary")
-
-
-def _private_new(cls: type, key: object, expected: object, **fields: object):
-    if key is not expected:
-        raise TypeError("internal trusted construction only")
-    result = object.__new__(cls)
-    for name, value in fields.items():
-        object.__setattr__(result, name, value)
-    return result
-
-
-def trusted_operation_classification_for_test(
-    effect_class: OperationEffectClass,
-    purpose: OperationPurpose,
-) -> TrustedOperationClassification:
-    """Fixture-only stand-in for the later trusted profile/policy boundary."""
-    if type(effect_class) is not OperationEffectClass or type(purpose) is not OperationPurpose:
-        raise TypeError("classification values have wrong exact type")
-    return _private_new(
-        TrustedOperationClassification,
-        _CLASSIFICATION_KEY,
-        _CLASSIFICATION_KEY,
-        effect_class=effect_class,
-        purpose=purpose,
-    )
-
-
-def trusted_reconciliation_finding_for_test(
-    finding: ReconciliationFinding,
-) -> TrustedReconciliationFinding:
-    """Fixture-only stand-in for the later reconciliation/State Reader boundary."""
-    if type(finding) is not ReconciliationFinding:
-        raise TypeError("finding must be exactly ReconciliationFinding")
-    return _private_new(
-        TrustedReconciliationFinding,
-        _RECONCILIATION_KEY,
-        _RECONCILIATION_KEY,
-        finding=finding,
-    )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -328,29 +282,30 @@ def construct_trusted_operation_intent(
         raise TypeError("integration binding has wrong exact variant")
     if type(is_repair_attempt) is not bool:
         raise TypeError("is_repair_attempt must be exactly bool")
-    return _private_new(
-        OperationIntent,
-        _INTENT_KEY,
-        _INTENT_KEY,
-        operation_id=operation_id,
-        idempotency_key=idempotency_key,
-        task_id=task_id,
-        action_id=action_id,
-        subject_id=subject_id,
-        effect_class=classification.effect_class,
-        purpose=classification.purpose,
-        candidate_id=candidate_id,
-        contract_id=contract_id,
-        contract_raw_sha256=contract_raw_sha256,
-        authorization_id=authorization_id,
-        admission_event_id=admission_event_id,
-        target_registration_id=target_registration_id,
-        policy_epoch_identity=policy_epoch_identity,
-        authoritative_state_binding_id=authoritative_state_binding_id,
-        required_evidence_ids=required_evidence_ids,
-        integration_binding=integration_binding,
-        is_repair_attempt=is_repair_attempt,
-    )
+    result = object.__new__(OperationIntent)
+    fields = {
+        "operation_id": operation_id,
+        "idempotency_key": idempotency_key,
+        "task_id": task_id,
+        "action_id": action_id,
+        "subject_id": subject_id,
+        "effect_class": classification.effect_class,
+        "purpose": classification.purpose,
+        "candidate_id": candidate_id,
+        "contract_id": contract_id,
+        "contract_raw_sha256": contract_raw_sha256,
+        "authorization_id": authorization_id,
+        "admission_event_id": admission_event_id,
+        "target_registration_id": target_registration_id,
+        "policy_epoch_identity": policy_epoch_identity,
+        "authoritative_state_binding_id": authoritative_state_binding_id,
+        "required_evidence_ids": required_evidence_ids,
+        "integration_binding": integration_binding,
+        "is_repair_attempt": is_repair_attempt,
+    }
+    for name, value in fields.items():
+        object.__setattr__(result, name, value)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
