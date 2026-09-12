@@ -12,7 +12,7 @@ from .manifest import PolicyEpochIdentity
 from .operation import AdmissionEventId, CandidateId, EvidenceId, OperationId, OperationRecord, OperationState
 from .parsing import ParseLimits
 from .review import (
-    CanonicalRequestId, CompositionMode, DisclosureApplicability,
+    CanonicalRequestId, CompositionMode, DisclosedResourceBinding, DisclosureApplicability,
     EvidenceAdmissionEventId, EvidenceHistoryMembershipBindingId,
     EvidenceProducerEventId, FindingKind, RawReviewResponseId,
     RawSemanticVerdict, ReReviewReason, ReviewEnvelopeId, ReviewFinding, ReviewInputManifestId,
@@ -316,6 +316,28 @@ def _echo_matches(echo, subject: EvidenceSubject) -> bool:
     return all(checks) and all(value is None or value == expected for value, expected in optional)
 
 
+def _effective_subject_matches_evidence_subject(
+    effective: SemanticReviewEffectiveSubject, subject: EvidenceSubject,
+) -> bool:
+    return (
+        effective.repository_id == subject.repository_id
+        and effective.task_id == subject.task_id
+        and effective.candidate_id == subject.candidate_id
+        and effective.contract_id == subject.contract_id
+        and effective.contract_raw_sha256 == subject.contract_raw_sha256
+        and effective.authorization_id == subject.authorization_id
+        and effective.task_admission_event_id == subject.task_admission_event_id
+        and effective.target_registration_id == subject.target_registration_id
+        and effective.policy_epoch_identity == subject.policy_epoch_identity
+        and effective.base == subject.base
+        and effective.target_context_id == subject.target_context_id
+        and effective.pr_id == subject.pr_id
+        and effective.requirement_ids == subject.requirement_ids
+        and effective.required_material_ids == subject.required_material_ids
+        and effective.required_context_ids == subject.required_context_ids
+    )
+
+
 def _verdict_semantics(verdict: RawSemanticVerdict, subject: EvidenceSubject, tool_mode) -> EvidenceAdmissionReasonCode | None:
     ids = tuple(item.requirement_id for item in verdict.requirement_results)
     if len(set(ids)) != len(ids):
@@ -352,6 +374,16 @@ def _verdict_semantics(verdict: RawSemanticVerdict, subject: EvidenceSubject, to
     return None
 
 
+def _disclosed_resource(material) -> DisclosedResourceBinding | None:
+    if material.classification_id is None:
+        return None
+    return DisclosedResourceBinding(
+        material.material_id, material.repository_id, material.kind, material.classification_id,
+        material.trusted_context_id, material.representation_id,
+        material.represented_material_id,
+    )
+
+
 def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> EvidenceAdmissionResult:
     # The order below is the frozen Issue #14 stages 1 through 29.
     if request is None:
@@ -383,6 +415,8 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
         return _result(EvidenceAdmissionReasonCode.PROVENANCE_CONTEXT_UNAVAILABLE)
     if invocation.subject != request.effective_subject:
         return _result(EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH)
+    if not _effective_subject_matches_evidence_subject(request.effective_subject, request.subject):
+        return _result(EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH)
     if not _echo_matches(verdict.subject_echo, request.subject):
         return _result(EvidenceAdmissionReasonCode.SUBJECT_ECHO_MISMATCH)
     profile_context = request.profile_admission_context
@@ -406,6 +440,18 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
     if assignment.partition_rule is not ReviewPartitionRule.SINGLE_REVIEW_PACKAGE:
         return _result(EvidenceAdmissionReasonCode.UNSUPPORTED_REVIEW_PARTITIONING)
     assignment_requirements = tuple(item.requirement_id for item in assignment.requirements)
+    material_assignments = assignment.material_assignments
+    assigned_requirement_ids = tuple(item.requirement_id for item in material_assignments)
+    assigned_material_ids = tuple(material_id for item in material_assignments for material_id in item.required_material_ids)
+    assigned_context_ids = tuple(context_id for item in material_assignments for context_id in item.required_context_ids)
+    permitted_representations = {
+        material_id: frozenset(item.permitted_representation_ids)
+        for item in material_assignments for material_id in item.required_material_ids
+    }
+    representation_bindings = tuple(
+        item for item in request.envelope.materials
+        if item.kind.value == "TRANSFORMED_REPRESENTATION"
+    )
     request_package = (
         request.envelope.invocation_id == invocation.invocation_id,
         request.envelope.envelope_id == invocation.envelope_id,
@@ -455,6 +501,10 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
             item.trusted_context_id for item in request.envelope.materials
             if item.kind.value == "TRUSTED_CONTEXT"
         ),
+        all(
+            item.repository_id == request.subject.repository_id
+            for item in (*request.envelope.materials, *request.envelope.supplemental_context)
+        ),
         assignment.repository_id == request.subject.repository_id,
         assignment.task_id == request.subject.task_id,
         assignment.candidate_id == request.subject.candidate_id,
@@ -463,6 +513,14 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
         assignment.target_registration_id == request.subject.target_registration_id,
         assignment.policy_epoch_identity == request.subject.policy_epoch_identity,
         assignment_requirements == request.subject.requirement_ids,
+        len(set(assigned_requirement_ids)) == len(assigned_requirement_ids),
+        set(assigned_requirement_ids) == set(assignment_requirements),
+        set(assigned_material_ids).issubset(request.subject.required_material_ids),
+        set((*assignment.required_context_ids, *assigned_context_ids)).issubset(request.subject.required_context_ids),
+        all(
+            item.representation_id in permitted_representations.get(item.represented_material_id, frozenset())
+            for item in representation_bindings
+        ),
         assignment.composition_rule == request.composition_rule,
         assignment.composition_rule.composition_rule_id == request.effective_subject.composition_rule_id,
         any(item == request.slot for item in request.composition_rule.required_slots),
@@ -515,18 +573,20 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
     )
     if (disclosure.invocation_id, disclosure.slot_id, disclosure.profile_id, disclosure.service_id, disclosure.canonical_request_id) != expected_disclosure:
         return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
-    material_classifications = tuple(
-        item.classification_id for item in request.envelope.materials if item.classification_id is not None
-    )
-    if disclosure.disclosed_classifications != material_classifications:
-        return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
     if disclosure.applicability is DisclosureApplicability.REQUIRED:
         if request.disclosure_authorization is None:
             return _result(EvidenceAdmissionReasonCode.DISCLOSURE_CONTEXT_UNAVAILABLE)
-        auth = request.disclosure_authorization
-        if (auth.target_registration_id, auth.repository_id, auth.authorization_id, auth.policy_epoch_identity, auth.profile_id, auth.service_id, auth.canonical_request_id, auth.permitted_classifications) != (request.subject.target_registration_id, request.subject.repository_id, request.subject.authorization_id, request.subject.policy_epoch_identity, request.subject.profile_id, request.slot.profile.service_id, invocation.canonical_request_id, disclosure.disclosed_classifications):
+        disclosed_materials = (*request.envelope.materials, *request.envelope.supplemental_context)
+        resources = tuple(_disclosed_resource(item) for item in disclosed_materials)
+        if any(item is None for item in resources):
             return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
-    elif request.disclosure_authorization is not None:
+        exact_resources = tuple(item for item in resources if item is not None)
+        if disclosure.disclosed_resources != exact_resources:
+            return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
+        auth = request.disclosure_authorization
+        if (auth.target_registration_id, auth.repository_id, auth.authorization_id, auth.policy_epoch_identity, auth.profile_id, auth.service_id, auth.canonical_request_id, auth.permitted_resources) != (request.subject.target_registration_id, request.subject.repository_id, request.subject.authorization_id, request.subject.policy_epoch_identity, request.subject.profile_id, request.slot.profile.service_id, invocation.canonical_request_id, exact_resources):
+            return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
+    elif request.disclosure_authorization is not None or disclosure.disclosed_resources:
         return _result(EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH)
     semantic_problem = _verdict_semantics(verdict, request.subject, request.slot.profile.tool_mode)
     if semantic_problem is not None:
@@ -767,22 +827,45 @@ class SemanticRequirementStatus:
             raise TypeError("semantic requirement status has wrong exact type")
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class TrustedCanonicalSemanticEvidenceSnapshot:
+    effective_subject: SemanticReviewEffectiveSubject
+    membership_binding: EvidenceHistoryMembershipBindingId
+    complete_admitted_records: tuple[EvidenceRecord, ...]
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("canonical evidence snapshot must come from canonical state boundary")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class TrustedSemanticCompositionContext:
+    effective_subject: SemanticReviewEffectiveSubject
+    composition_rule: SemanticReviewCompositionRule
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("composition context must come from trusted policy/state boundary")
+
+
 class SemanticCompositionReason(Enum):
     COMPOSED = "COMPOSED"
     REQUIRED_SLOT_MISSING = "REQUIRED_SLOT_MISSING"
     CONFLICTING_APPLICABLE_EVIDENCE = "CONFLICTING_APPLICABLE_EVIDENCE"
+    CANONICAL_SNAPSHOT_MISMATCH = "CANONICAL_SNAPSHOT_MISMATCH"
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticCompositionResult:
     reason: SemanticCompositionReason
     requirement_statuses: tuple[SemanticRequirementStatus, ...]
+    evidence_history_membership_binding: EvidenceHistoryMembershipBindingId
 
     def __post_init__(self) -> None:
         if type(self.reason) is not SemanticCompositionReason:
             raise TypeError("composition reason has wrong exact type")
         if type(self.requirement_statuses) is not tuple or any(type(item) is not SemanticRequirementStatus for item in self.requirement_statuses):
             raise TypeError("requirement_statuses must be an exact immutable tuple")
+        if type(self.evidence_history_membership_binding) is not EvidenceHistoryMembershipBindingId:
+            raise TypeError("composition result must bind exact canonical evidence membership")
 
 
 def semantic_status_for_verdict(verdict: SemanticVerdict) -> ConditionStatus:
@@ -796,30 +879,84 @@ def semantic_status_for_verdict(verdict: SemanticVerdict) -> ConditionStatus:
 
 
 def compose_semantic_evidence(
-    records: tuple[EvidenceRecord, ...], current: EvidenceSubject,
-    composition_rule: SemanticReviewCompositionRule,
+    snapshot: TrustedCanonicalSemanticEvidenceSnapshot,
+    context: TrustedSemanticCompositionContext,
     supersessions: tuple[EvidenceSupersessionRecord, ...] = (),
 ) -> SemanticCompositionResult:
-    if type(records) is not tuple or any(type(item) is not EvidenceRecord for item in records):
-        raise TypeError("records must be an exact immutable tuple")
+    if type(snapshot) is not TrustedCanonicalSemanticEvidenceSnapshot:
+        raise TypeError("trusted canonical evidence snapshot required")
+    if type(context) is not TrustedSemanticCompositionContext:
+        raise TypeError("trusted semantic composition context required")
     if type(supersessions) is not tuple or any(type(item) is not EvidenceSupersessionRecord for item in supersessions):
         raise TypeError("supersessions must be an exact immutable tuple")
-    superseded = frozenset(item.earlier_evidence_id for item in supersessions)
-    applicable = tuple(
-        item for item in records
-        if item.evidence_id not in superseded
-        and item.evidence_class is EvidenceClass.SEMANTIC_REVIEW
-        and evaluate_evidence_applicability(item, current).decision is EvidenceApplicabilityDecision.APPLICABLE
-    )
+    binding = snapshot.membership_binding
+    records = snapshot.complete_admitted_records
+    effective = context.effective_subject
+    composition_rule = context.composition_rule
+    if (
+        type(binding) is not EvidenceHistoryMembershipBindingId
+        or snapshot.effective_subject != effective
+        or composition_rule.composition_rule_id != effective.composition_rule_id
+        or type(records) is not tuple
+        or any(type(item) is not EvidenceRecord for item in records)
+        or len({item.evidence_id for item in records}) != len(records)
+    ):
+        return SemanticCompositionResult(SemanticCompositionReason.CANONICAL_SNAPSHOT_MISMATCH, (), binding)
+    required_by_id = {slot.slot_id: slot for slot in composition_rule.required_slots}
+    applicable_records: list[EvidenceRecord] = []
+    for record in records:
+        if record.evidence_class is not EvidenceClass.SEMANTIC_REVIEW:
+            return SemanticCompositionResult(SemanticCompositionReason.CANONICAL_SNAPSHOT_MISMATCH, (), binding)
+        if not _effective_subject_matches_evidence_subject(effective, record.subject):
+            return SemanticCompositionResult(SemanticCompositionReason.CANONICAL_SNAPSHOT_MISMATCH, (), binding)
+        if record.payload.effective_subject_id != effective.subject_id:
+            return SemanticCompositionResult(SemanticCompositionReason.CANONICAL_SNAPSHOT_MISMATCH, (), binding)
+        required_slot = required_by_id.get(record.payload.slot_id)
+        if required_slot is None:
+            continue
+        if (
+            record.subject.slot_id != required_slot.slot_id
+            or record.subject.profile_id != required_slot.profile.profile_id
+            or record.subject.profile_config_id != required_slot.profile.config_id
+            or record.subject.verdict_schema_id != required_slot.profile.verdict_schema_id
+            or record.payload.slot_id != required_slot.slot_id
+            or record.payload.profile_id != required_slot.profile.profile_id
+            or record.payload.profile_config_id != required_slot.profile.config_id
+            or record.payload.verdict_schema_id != required_slot.profile.verdict_schema_id
+        ):
+            continue
+        applicable_records.append(record)
+    record_by_id = {item.evidence_id: item for item in records}
+    applicable_ids = frozenset(item.evidence_id for item in applicable_records)
+    superseded: set[EvidenceId] = set()
+    for relation in supersessions:
+        earlier = record_by_id.get(relation.earlier_evidence_id)
+        later = record_by_id.get(relation.later_evidence_id)
+        if (
+            earlier is None or later is None
+            or earlier.evidence_id not in applicable_ids or later.evidence_id not in applicable_ids
+            or relation.subject_id != effective.subject_id
+            or relation.policy_epoch_identity != effective.policy_epoch_identity
+            or relation.authorization.earlier_evidence_id != earlier.evidence_id
+            or relation.authorization.later_evidence_id != later.evidence_id
+            or relation.authorization.subject_id != effective.subject_id
+            or relation.authorization.policy_epoch_identity != effective.policy_epoch_identity
+            or relation.decision_id != relation.authorization.decision_id
+            or relation.authorized_reason != relation.authorization.authorized_reason
+            or relation.earlier_evidence_id in superseded
+        ):
+            return SemanticCompositionResult(SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE, (), binding)
+        superseded.add(earlier.evidence_id)
+    applicable = tuple(item for item in applicable_records if item.evidence_id not in superseded)
     required_slots = tuple(slot.slot_id for slot in composition_rule.required_slots)
     grouped = {slot_id: tuple(item for item in applicable if item.payload.slot_id == slot_id) for slot_id in required_slots}
     if any(len(items) > 1 for items in grouped.values()):
-        return SemanticCompositionResult(SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE, ())
+        return SemanticCompositionResult(SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE, (), binding)
     if any(len(items) != 1 for items in grouped.values()):
-        return SemanticCompositionResult(SemanticCompositionReason.REQUIRED_SLOT_MISSING, ())
+        return SemanticCompositionResult(SemanticCompositionReason.REQUIRED_SLOT_MISSING, (), binding)
     vectors = tuple(grouped[slot_id][0].payload.requirement_results for slot_id in required_slots)
     statuses: list[SemanticRequirementStatus] = []
-    for requirement_id in current.requirement_ids:
+    for requirement_id in effective.requirement_ids:
         verdicts = tuple(next(item.verdict for item in vector if item.requirement_id == requirement_id) for vector in vectors)
         if any(item is SemanticVerdict.UNABLE_TO_DETERMINE for item in verdicts):
             status = ConditionStatus.INDETERMINATE
@@ -828,4 +965,4 @@ def compose_semantic_evidence(
         else:
             status = ConditionStatus.SATISFIED
         statuses.append(SemanticRequirementStatus(requirement_id, status))
-    return SemanticCompositionResult(SemanticCompositionReason.COMPOSED, tuple(statuses))
+    return SemanticCompositionResult(SemanticCompositionReason.COMPOSED, tuple(statuses), binding)

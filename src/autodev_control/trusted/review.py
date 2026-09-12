@@ -519,6 +519,39 @@ class MaterialBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class DisclosedResourceBinding:
+    material_id: MaterialIdentity
+    repository_id: GitHubRepositoryId
+    kind: MaterialKind
+    classification_id: MaterialClassificationId
+    trusted_context_id: TrustedContextId | None = None
+    representation_id: RepresentationIdentity | None = None
+    represented_material_id: MaterialIdentity | None = None
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.material_id, MaterialIdentity), (self.repository_id, GitHubRepositoryId),
+            (self.kind, MaterialKind),
+            (self.classification_id, MaterialClassificationId),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("disclosed resource field has wrong exact type")
+        optional = (
+            (self.trusted_context_id, TrustedContextId),
+            (self.representation_id, RepresentationIdentity),
+            (self.represented_material_id, MaterialIdentity),
+        )
+        if any(value is not None and type(value) is not expected for value, expected in optional):
+            raise TypeError("disclosed resource optional identity has wrong exact type")
+        if self.kind is MaterialKind.TRUSTED_CONTEXT and self.trusted_context_id is None:
+            raise ValueError("trusted context disclosure requires its exact context identity")
+        if self.kind is MaterialKind.TRANSFORMED_REPRESENTATION and (
+            self.representation_id is None or self.represented_material_id is None
+        ):
+            raise ValueError("representation disclosure requires exact representation binding")
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewSlot:
     slot_id: ReviewSlotId
     profile: ReviewerProfileBinding
@@ -985,7 +1018,7 @@ class TrustedDisclosureRequirement:
     profile_id: ReviewerProfileId
     service_id: ReviewerServiceId
     canonical_request_id: CanonicalRequestId
-    disclosed_classifications: tuple[MaterialClassificationId, ...]
+    disclosed_resources: tuple[DisclosedResourceBinding, ...]
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("disclosure requirement must come from trusted boundary")
 
@@ -1000,6 +1033,6 @@ class TrustedDisclosureAuthorizationBinding:
     service_id: ReviewerServiceId
     canonical_request_id: CanonicalRequestId
     decision_id: DisclosureDecisionId
-    permitted_classifications: tuple[MaterialClassificationId, ...]
+    permitted_resources: tuple[DisclosedResourceBinding, ...]
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("disclosure authorization must come from trusted boundary")

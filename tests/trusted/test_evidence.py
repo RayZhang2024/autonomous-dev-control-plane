@@ -129,7 +129,7 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
     disclosure_requirement = mint(
         TrustedDisclosureRequirement, applicability=disclosure, invocation_id=subject.invocation_id,
         slot_id=slot.slot_id, profile_id=profile.profile_id, service_id=profile.service_id,
-        canonical_request_id=CanonicalRequestId("request"), disclosed_classifications=(),
+        canonical_request_id=CanonicalRequestId("request"), disclosed_resources=(),
     )
     history = mint(TrustedEffectiveSubjectEvidenceSnapshot, subject=effective, membership_binding=EvidenceHistoryMembershipBindingId("H0"), admitted_bindings=())
     attempt = ReviewSlotAttempt(subject.invocation_id, slot.slot_id, intent.operation_id, operation_state, CanonicalRequestId("request"))
@@ -145,6 +145,44 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         invocation.raw_response_id, None, None, assignment,
     )
     return request
+
+
+def disclosed_resource(material):
+    return DisclosedResourceBinding(
+        material.material_id, material.repository_id, material.kind, material.classification_id,
+        material.trusted_context_id, material.representation_id, material.represented_material_id,
+    )
+
+
+def with_disclosure_package(request, materials, supplemental=()):
+    changed_ids = tuple(item.material_id for item in materials if item.kind in (MaterialKind.CHANGED_CONTENT, MaterialKind.DELETION))
+    representations = tuple(item for item in materials if item.kind is MaterialKind.TRANSFORMED_REPRESENTATION)
+    context_ids = tuple(item.trusted_context_id for item in materials if item.kind is MaterialKind.TRUSTED_CONTEXT)
+    manifest = replace(
+        request.envelope.input_manifest, changed_material_ids=changed_ids,
+        representation_ids=tuple(item.representation_id for item in representations),
+        represented_material_ids=tuple(item.represented_material_id for item in representations),
+        trusted_context_ids=context_ids, supplemental_context_ids=tuple(item.material_id for item in supplemental),
+    )
+    envelope = replace(request.envelope, materials=tuple(materials), supplemental_context=tuple(supplemental), input_manifest=manifest)
+    invocation = minted_copy(
+        request.invocation, required_material_ids=changed_ids,
+        representation_ids=manifest.representation_ids, required_context_ids=context_ids,
+        supplemental_context_ids=manifest.supplemental_context_ids,
+    )
+    resources = tuple(disclosed_resource(item) for item in (*materials, *supplemental))
+    requirement = minted_copy(request.disclosure_requirement, disclosed_resources=resources)
+    authorization = mint(
+        TrustedDisclosureAuthorizationBinding, target_registration_id=request.subject.target_registration_id,
+        repository_id=request.subject.repository_id, authorization_id=request.subject.authorization_id,
+        policy_epoch_identity=request.subject.policy_epoch_identity, profile_id=request.subject.profile_id,
+        service_id=request.slot.profile.service_id, canonical_request_id=request.invocation.canonical_request_id,
+        decision_id=DisclosureDecisionId("decision"), permitted_resources=resources,
+    )
+    return replace(
+        request, envelope=envelope, invocation=invocation,
+        disclosure_requirement=requirement, disclosure_authorization=authorization,
+    )
 
 
 def test_admits_approved_and_carries_exact_history_cas_binding():
@@ -235,6 +273,20 @@ def test_effective_subject_mismatch_is_denied_before_request_package(field, valu
     assert admit_semantic_review(replace(request, effective_subject=effective)).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("repository_id", GitHubRepositoryId("2")),
+    ("base", GitSha("b" * 40)),
+    ("target_context_id", TargetContextId("other-target")),
+    ("pr_id", PullRequestIdentity("other-pr")),
+    ("required_material_ids", (MaterialIdentity("other-material"),)),
+    ("required_context_ids", (TrustedContextId("other-context"),)),
+])
+def test_effective_and_evidence_subject_common_context_must_match(field, value):
+    request = fixture()
+    changed_subject = replace(request.subject, **{field: value})
+    assert admit_semantic_review(replace(request, subject=changed_subject)).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
+
+
 def test_schema_identity_is_cross_checked_across_complete_package():
     request = fixture()
     bad_manifest = replace(request.envelope.input_manifest, verdict_schema_id=ImmutableConfigId("other"))
@@ -258,18 +310,55 @@ def test_disclosure_requirement_and_authorization_bind_every_identity():
         ("profile_id", ReviewerProfileId("other")), ("canonical_request_id", CanonicalRequestId("other")),
     ):
         assert admit_semantic_review(replace(request, disclosure_requirement=minted_copy(requirement, **{field: value}))).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
-    auth = mint(
+    classified = tuple(replace(item, classification_id=MaterialClassificationId(f"class-{index}")) for index, item in enumerate(request.envelope.materials))
+    exact = with_disclosure_package(request, classified)
+    assert admit_semantic_review(exact).decision is EvidenceAdmissionDecision.ADMIT
+    wrong_repo = minted_copy(exact.disclosure_authorization, repository_id=GitHubRepositoryId("2"))
+    assert admit_semantic_review(replace(exact, disclosure_authorization=wrong_repo)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+    first = exact.disclosure_authorization.permitted_resources[0]
+    wrong_resource = replace(first, material_id=MaterialIdentity("package-b-material"))
+    wrong_package = minted_copy(exact.disclosure_authorization, permitted_resources=(wrong_resource, *exact.disclosure_authorization.permitted_resources[1:]))
+    assert admit_semantic_review(replace(exact, disclosure_authorization=wrong_package)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+def test_required_disclosure_covers_supplemental_and_transformed_resources():
+    request = fixture(disclosure=DisclosureApplicability.REQUIRED)
+    classified = tuple(replace(item, classification_id=MaterialClassificationId(f"class-{index}")) for index, item in enumerate(request.envelope.materials))
+    supplemental = MaterialBinding(
+        MaterialIdentity("supplemental"), request.subject.repository_id,
+        MaterialKind.SUPPLEMENTAL_UNTRUSTED_CONTEXT, "notes", "notes-content", None,
+        request.subject.base, classification_id=MaterialClassificationId("supplemental-class"),
+    )
+    transformed = MaterialBinding(
+        MaterialIdentity("rendered"), request.subject.repository_id,
+        MaterialKind.TRANSFORMED_REPRESENTATION, "render", "render-content",
+        request.subject.candidate_id, request.subject.base, RepresentationIdentity("render-rule"),
+        represented_material_id=request.subject.required_material_ids[0],
+        classification_id=MaterialClassificationId("render-class"),
+    )
+    material_assignment = replace(
+        request.assignment.material_assignments[0],
+        permitted_representation_ids=(RepresentationIdentity("render-rule"),),
+    )
+    request = replace(request, assignment=minted_copy(request.assignment, material_assignments=(material_assignment,)))
+    exact = with_disclosure_package(request, (*classified, transformed), (supplemental,))
+    assert admit_semantic_review(exact).decision is EvidenceAdmissionDecision.ADMIT
+    omitted_supplemental = minted_copy(exact.disclosure_authorization, permitted_resources=exact.disclosure_authorization.permitted_resources[:-1])
+    assert admit_semantic_review(replace(exact, disclosure_authorization=omitted_supplemental)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+    omitted_transformed = minted_copy(exact.disclosure_authorization, permitted_resources=tuple(item for item in exact.disclosure_authorization.permitted_resources if item.kind is not MaterialKind.TRANSFORMED_REPRESENTATION))
+    assert admit_semantic_review(replace(exact, disclosure_authorization=omitted_transformed)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+def test_required_disclosure_rejects_any_unclassified_resource():
+    request = fixture(disclosure=DisclosureApplicability.REQUIRED)
+    authorization = mint(
         TrustedDisclosureAuthorizationBinding, target_registration_id=request.subject.target_registration_id,
         repository_id=request.subject.repository_id, authorization_id=request.subject.authorization_id,
         policy_epoch_identity=request.subject.policy_epoch_identity, profile_id=request.subject.profile_id,
         service_id=request.slot.profile.service_id, canonical_request_id=request.invocation.canonical_request_id,
-        decision_id=DisclosureDecisionId("decision"), permitted_classifications=(),
+        decision_id=DisclosureDecisionId("decision"), permitted_resources=(),
     )
-    assert admit_semantic_review(replace(request, disclosure_authorization=auth)).decision is EvidenceAdmissionDecision.ADMIT
-    wrong_repo = minted_copy(auth, repository_id=GitHubRepositoryId("2"))
-    assert admit_semantic_review(replace(request, disclosure_authorization=wrong_repo)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
-    wrong_classes = minted_copy(auth, permitted_classifications=(MaterialClassificationId("source"),))
-    assert admit_semantic_review(replace(request, disclosure_authorization=wrong_classes)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+    assert admit_semantic_review(replace(request, disclosure_authorization=authorization)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
 
 
 def test_subject_echo_pr_identity_is_exact():
@@ -352,8 +441,21 @@ def test_semantic_status_composition_conflict_and_structured_supersession():
     assert semantic_status_for_verdict(SemanticVerdict.APPROVED) is __import__('autodev_control.trusted.state', fromlist=['ConditionStatus']).ConditionStatus.SATISFIED
     changed_request = fixture(raw=verdict("changes_required", overall="changes_required"))
     changed = replace(admit_semantic_review(changed_request).proposed_evidence_record, evidence_id=EvidenceId("later"))
-    conflict = compose_semantic_evidence((approved, changed), approved.subject, request.composition_rule)
+    context = mint(TrustedSemanticCompositionContext, effective_subject=request.effective_subject, composition_rule=request.composition_rule)
+    snapshot = mint(
+        TrustedCanonicalSemanticEvidenceSnapshot, effective_subject=request.effective_subject,
+        membership_binding=EvidenceHistoryMembershipBindingId("canonical-H"),
+        complete_admitted_records=(approved, changed),
+    )
+    with pytest.raises(TypeError):
+        compose_semantic_evidence((approved,), context)
+    with pytest.raises(TypeError):
+        TrustedCanonicalSemanticEvidenceSnapshot(request.effective_subject, EvidenceHistoryMembershipBindingId("H"), (approved,))
+    with pytest.raises(TypeError):
+        replace(snapshot, complete_admitted_records=(approved,))
+    conflict = compose_semantic_evidence(snapshot, context)
     assert conflict.reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE
+    assert conflict.evidence_history_membership_binding == EvidenceHistoryMembershipBindingId("canonical-H")
 
     early = mint(TrustedAdmittedEvidenceRecord, record=approved, membership_binding=EvidenceHistoryMembershipBindingId("H1"))
     late = mint(TrustedAdmittedEvidenceRecord, record=changed, membership_binding=EvidenceHistoryMembershipBindingId("H2"))
@@ -364,10 +466,69 @@ def test_semantic_status_composition_conflict_and_structured_supersession():
         authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
     )
     relation = build_evidence_supersession_record(early, late, authorization)
-    composed = compose_semantic_evidence((approved, changed), approved.subject, request.composition_rule, (relation,))
+    composed = compose_semantic_evidence(snapshot, context, (relation,))
     assert composed.reason is SemanticCompositionReason.COMPOSED
     assert composed.requirement_statuses[0].status.name == "UNSATISFIED"
     assert approved.payload.aggregate is SemanticVerdict.APPROVED
+
+    omitted_later = mint(
+        TrustedCanonicalSemanticEvidenceSnapshot, effective_subject=request.effective_subject,
+        membership_binding=EvidenceHistoryMembershipBindingId("canonical-H2"),
+        complete_admitted_records=(approved,),
+    )
+    assert compose_semantic_evidence(omitted_later, context, (relation,)).reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE
+
+
+def second_slot_record(record, slot, verdict_value):
+    unable = UnableReasonCode.OTHER if verdict_value is SemanticVerdict.UNABLE_TO_DETERMINE else None
+    result = replace(record.payload.requirement_results[0], verdict=verdict_value, unable_reason_code=unable)
+    subject = replace(
+        record.subject, invocation_id=ReviewInvocationId(f"inv-{slot.slot_id.value}"), slot_id=slot.slot_id,
+        profile_id=slot.profile.profile_id, profile_config_id=slot.profile.config_id,
+        verdict_schema_id=slot.profile.verdict_schema_id,
+    )
+    payload = replace(
+        record.payload, slot_id=slot.slot_id, invocation_id=subject.invocation_id,
+        profile_id=slot.profile.profile_id, profile_config_id=slot.profile.config_id,
+        service_id=slot.profile.service_id, verdict_schema_id=slot.profile.verdict_schema_id,
+        requirement_results=(result,), aggregate=verdict_value,
+    )
+    return replace(record, evidence_id=EvidenceId(f"evidence-{slot.slot_id.value}-{verdict_value.value}"), subject=subject, payload=payload)
+
+
+@pytest.mark.parametrize(("slot_b_verdict", "expected"), [
+    (SemanticVerdict.APPROVED, "SATISFIED"),
+    (SemanticVerdict.CHANGES_REQUIRED, "UNSATISFIED"),
+    (SemanticVerdict.UNABLE_TO_DETERMINE, "INDETERMINATE"),
+])
+def test_two_slot_composition_uses_common_subject_and_exact_per_slot_profile(slot_b_verdict, expected):
+    request = fixture()
+    slot_a = request.slot
+    profile_b = replace(
+        slot_a.profile, profile_id=ReviewerProfileId("profile-b"),
+        config_id=ImmutableConfigId("profile-b-config"), service_id=ReviewerServiceId("service-b"),
+    )
+    slot_b = ReviewSlot(ReviewSlotId("slot-b"), profile_b, RawSha256("4" * 64))
+    rule = SemanticReviewCompositionRule(
+        request.composition_rule.composition_rule_id, CompositionMode.ALL_REQUIRED_INVOCATIONS,
+        (slot_a, slot_b),
+    )
+    approved_a = admit_semantic_review(request).proposed_evidence_record
+    record_b = second_slot_record(approved_a, slot_b, slot_b_verdict)
+    context = mint(TrustedSemanticCompositionContext, effective_subject=request.effective_subject, composition_rule=rule)
+    snapshot = mint(
+        TrustedCanonicalSemanticEvidenceSnapshot, effective_subject=request.effective_subject,
+        membership_binding=EvidenceHistoryMembershipBindingId("two-slot-H"),
+        complete_admitted_records=(approved_a, record_b),
+    )
+    result = compose_semantic_evidence(snapshot, context)
+    assert result.reason is SemanticCompositionReason.COMPOSED
+    assert result.requirement_statuses[0].status.name == expected
+
+    changed_profile_b = replace(profile_b, config_id=ImmutableConfigId("profile-b-new-config"))
+    changed_rule = SemanticReviewCompositionRule(rule.composition_rule_id, rule.mode, (slot_a, replace(slot_b, profile=changed_profile_b)))
+    changed_context = mint(TrustedSemanticCompositionContext, effective_subject=request.effective_subject, composition_rule=changed_rule)
+    assert compose_semantic_evidence(snapshot, changed_context).reason is SemanticCompositionReason.REQUIRED_SLOT_MISSING
 
 
 @pytest.mark.parametrize(("verdict_value", "status"), [
