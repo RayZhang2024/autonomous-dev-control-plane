@@ -1,5 +1,5 @@
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -174,6 +174,16 @@ def test_ordinary_g5_values_reject_mutable_nested_containers():
         RequirementMaterialAssignment(SemanticRequirementId("r"), [], (), ())
 
 
+@pytest.mark.parametrize("mode", [
+    CompositionMode.SINGLE_REQUIRED_INVOCATION,
+    CompositionMode.ALL_REQUIRED_INVOCATIONS,
+    CompositionMode.EXACT_REQUIRED_INVOCATION_SET,
+])
+def test_every_supported_semantic_composition_requires_a_nonempty_exact_slot_tuple(mode):
+    with pytest.raises(ValueError):
+        SemanticReviewCompositionRule(CompositionRuleId("composition"), mode, ())
+
+
 def test_envelope_binds_exact_assignment_context_and_representation_rules():
     subj, prof = subject(), profile()
     slot = ReviewSlot(ReviewSlotId("a"), prof, RAW)
@@ -209,6 +219,54 @@ def test_envelope_binds_exact_assignment_context_and_representation_rules():
     assert built.reason is EnvelopeReason.BUILT
     assert built.envelope.input_manifest.trusted_context_ids == (TrustedContextId("c1"),)
     assert built.envelope.input_manifest.evidence_subject is evidence_subject
+
+    for changed_binding in (
+        replace(changed, candidate_id=CandidateId("other-candidate")),
+        replace(changed, base=GitSha("b" * 40)),
+    ):
+        identity_denied = build_trusted_review_envelope(
+            assignment=assignment, subject=subj, slot=slot,
+            changed_inventory=(changed_binding,), trusted_context_inventory=(context,),
+            invocation_id=ReviewInvocationId("inv"), envelope_id=ReviewEnvelopeId("env"),
+            manifest_id=ReviewInputManifestId("manifest"),
+            canonical_request_id=CanonicalRequestId("request"),
+            evidence_subject=evidence_subject,
+        )
+        assert identity_denied.reason is EnvelopeReason.IDENTITY_MISMATCH
+
+    for context_binding in (
+        replace(context, candidate_id=CandidateId("candidate-context-is-not-applicable")),
+        replace(context, base=GitSha("b" * 40)),
+    ):
+        context_denied = build_trusted_review_envelope(
+            assignment=assignment, subject=subj, slot=slot,
+            changed_inventory=(changed,), trusted_context_inventory=(context_binding,),
+            invocation_id=ReviewInvocationId("inv"), envelope_id=ReviewEnvelopeId("env"),
+            manifest_id=ReviewInputManifestId("manifest"),
+            canonical_request_id=CanonicalRequestId("request"),
+            evidence_subject=evidence_subject,
+        )
+        assert context_denied.reason is EnvelopeReason.IDENTITY_MISMATCH
+
+    supplemental = MaterialBinding(
+        MaterialIdentity("supplemental"), subj.repository_id,
+        MaterialKind.SUPPLEMENTAL_UNTRUSTED_CONTEXT, "notes", "notes-sha",
+        None, subj.base,
+    )
+    for supplemental_binding in (
+        replace(supplemental, candidate_id=CandidateId("candidate-context-is-not-applicable")),
+        replace(supplemental, base=GitSha("b" * 40)),
+    ):
+        supplemental_denied = build_trusted_review_envelope(
+            assignment=assignment, subject=subj, slot=slot,
+            changed_inventory=(changed,), trusted_context_inventory=(context,),
+            supplemental_context_inventory=(supplemental_binding,),
+            invocation_id=ReviewInvocationId("inv"), envelope_id=ReviewEnvelopeId("env"),
+            manifest_id=ReviewInputManifestId("manifest"),
+            canonical_request_id=CanonicalRequestId("request"),
+            evidence_subject=evidence_subject,
+        )
+        assert supplemental_denied.reason is EnvelopeReason.IDENTITY_MISMATCH
 
     transformed = MaterialBinding(MaterialIdentity("rendered"), subj.repository_id, MaterialKind.TRANSFORMED_REPRESENTATION, "render", "sha", subj.candidate_id, subj.base, RepresentationIdentity("not-permitted"), represented_material_id=MaterialIdentity("m1"))
     denied = build_trusted_review_envelope(

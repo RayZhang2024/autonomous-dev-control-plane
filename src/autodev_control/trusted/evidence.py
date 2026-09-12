@@ -29,6 +29,7 @@ from .review import (
     TrustedReviewProfileAdmissionContext, TrustedReviewSlotAttemptSnapshot,
     UnableReasonCode, VerdictValidationReason, effective_review_parse_limits,
     evaluate_review_invocation_eligibility, validate_review_verdict_v1,
+    _material_matches_subject,
 )
 from .scope import AuthorizationId, ContractId, GitHubRepositoryId, TargetRegistrationId, TaskId
 from .state import ConditionStatus
@@ -379,6 +380,8 @@ def _disclosed_resource(material) -> DisclosedResourceBinding | None:
         return None
     return DisclosedResourceBinding(
         material.material_id, material.repository_id, material.kind, material.classification_id,
+        material.path_or_resource, material.content_or_deletion_identity,
+        material.candidate_id, material.base,
         material.trusted_context_id, material.representation_id,
         material.represented_material_id,
     )
@@ -502,7 +505,7 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
             if item.kind.value == "TRUSTED_CONTEXT"
         ),
         all(
-            item.repository_id == request.subject.repository_id
+            _material_matches_subject(item, request.effective_subject)
             for item in (*request.envelope.materials, *request.envelope.supplemental_context)
         ),
         assignment.repository_id == request.subject.repository_id,
@@ -851,6 +854,7 @@ class SemanticCompositionReason(Enum):
     REQUIRED_SLOT_MISSING = "REQUIRED_SLOT_MISSING"
     CONFLICTING_APPLICABLE_EVIDENCE = "CONFLICTING_APPLICABLE_EVIDENCE"
     CANONICAL_SNAPSHOT_MISMATCH = "CANONICAL_SNAPSHOT_MISMATCH"
+    INVALID_COMPOSITION_RULE = "INVALID_COMPOSITION_RULE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,6 +906,8 @@ def compose_semantic_evidence(
         or len({item.evidence_id for item in records}) != len(records)
     ):
         return SemanticCompositionResult(SemanticCompositionReason.CANONICAL_SNAPSHOT_MISMATCH, (), binding)
+    if not composition_rule.required_slots:
+        return SemanticCompositionResult(SemanticCompositionReason.INVALID_COMPOSITION_RULE, (), binding)
     required_by_id = {slot.slot_id: slot for slot in composition_rule.required_slots}
     applicable_records: list[EvidenceRecord] = []
     for record in records:

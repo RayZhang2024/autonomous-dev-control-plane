@@ -524,6 +524,10 @@ class DisclosedResourceBinding:
     repository_id: GitHubRepositoryId
     kind: MaterialKind
     classification_id: MaterialClassificationId
+    path_or_resource: str
+    content_or_deletion_identity: str
+    candidate_id: CandidateId | None
+    base: GitSha | None
     trusted_context_id: TrustedContextId | None = None
     representation_id: RepresentationIdentity | None = None
     represented_material_id: MaterialIdentity | None = None
@@ -536,7 +540,16 @@ class DisclosedResourceBinding:
         )
         if any(type(value) is not expected for value, expected in exact):
             raise TypeError("disclosed resource field has wrong exact type")
+        if (
+            type(self.path_or_resource) is not str
+            or not self.path_or_resource
+            or type(self.content_or_deletion_identity) is not str
+            or not self.content_or_deletion_identity
+        ):
+            raise ValueError("disclosed resource strings must be non-empty")
         optional = (
+            (self.candidate_id, CandidateId),
+            (self.base, GitSha),
             (self.trusted_context_id, TrustedContextId),
             (self.representation_id, RepresentationIdentity),
             (self.represented_material_id, MaterialIdentity),
@@ -572,6 +585,8 @@ class SemanticReviewCompositionRule:
         if type(self.composition_rule_id) is not CompositionRuleId or type(self.mode) is not CompositionMode:
             raise TypeError("composition rule field has wrong exact type")
         _tuple(self.required_slots, ReviewSlot, "required_slots")
+        if not self.required_slots:
+            raise ValueError("composition requires at least one exact review slot")
         if len({slot.slot_id for slot in self.required_slots}) != len(self.required_slots):
             raise ValueError("duplicate required slot")
         if self.mode is CompositionMode.SINGLE_REQUIRED_INVOCATION and len(self.required_slots) != 1:
@@ -706,6 +721,27 @@ class TrustedReviewEnvelope:
         _tuple(self.supplemental_context, MaterialBinding, "supplemental_context", unique=False)
 
 
+def _material_matches_subject(
+    material: MaterialBinding,
+    subject: SemanticReviewEffectiveSubject,
+) -> bool:
+    """Validate the exact structured repository/candidate/base binding by kind."""
+    if material.repository_id != subject.repository_id or material.base != subject.base:
+        return False
+    if material.kind in (
+        MaterialKind.CHANGED_CONTENT,
+        MaterialKind.DELETION,
+        MaterialKind.TRANSFORMED_REPRESENTATION,
+    ):
+        return material.candidate_id == subject.candidate_id
+    if material.kind in (
+        MaterialKind.TRUSTED_CONTEXT,
+        MaterialKind.SUPPLEMENTAL_UNTRUSTED_CONTEXT,
+    ):
+        return material.candidate_id is None
+    return False
+
+
 class EnvelopeReason(Enum):
     BUILT = "BUILT"
     IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
@@ -794,7 +830,10 @@ def build_trusted_review_envelope(
         return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
     if any(item.kind is not MaterialKind.SUPPLEMENTAL_UNTRUSTED_CONTEXT for item in supplemental_context_inventory):
         return EnvelopeBuildResult(EnvelopeReason.MATERIAL_COVERAGE_MISMATCH)
-    if any(item.repository_id != subject.repository_id for item in (*changed_inventory, *trusted_context_inventory, *representation_inventory, *supplemental_context_inventory)):
+    if any(
+        not _material_matches_subject(item, subject)
+        for item in (*changed_inventory, *trusted_context_inventory, *representation_inventory, *supplemental_context_inventory)
+    ):
         return EnvelopeBuildResult(EnvelopeReason.IDENTITY_MISMATCH)
     assigned_material = tuple(mid for item in assignment.material_assignments for mid in item.required_material_ids)
     assigned_context = tuple(cid for item in assignment.material_assignments for cid in item.required_context_ids)

@@ -150,6 +150,8 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
 def disclosed_resource(material):
     return DisclosedResourceBinding(
         material.material_id, material.repository_id, material.kind, material.classification_id,
+        material.path_or_resource, material.content_or_deletion_identity,
+        material.candidate_id, material.base,
         material.trusted_context_id, material.representation_id, material.represented_material_id,
     )
 
@@ -260,6 +262,21 @@ def test_envelope_manifest_and_assignment_bindings_are_exact():
         assert admit_semantic_review(replace(request, assignment=bad_assignment)).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
 
 
+@pytest.mark.parametrize("change", [
+    {"candidate_id": CandidateId("other-candidate")},
+    {"base": GitSha("b" * 40)},
+])
+def test_admission_rejects_material_candidate_or_base_drift_with_stable_material_identity(change):
+    request = fixture()
+    original = request.envelope.materials[0]
+    changed = replace(original, **change)
+    envelope = replace(request.envelope, materials=(changed, *request.envelope.materials[1:]))
+    classified = replace(original, classification_id=MaterialClassificationId("source"))
+    assert changed.material_id == original.material_id
+    assert disclosed_resource(replace(classified, **change)) != disclosed_resource(classified)
+    assert admit_semantic_review(replace(request, envelope=envelope)).reason_code is EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH
+
+
 @pytest.mark.parametrize(("field", "value"), [
     ("contract_id", ContractId("other")),
     ("contract_raw_sha256", RawSha256("8" * 64)),
@@ -319,6 +336,33 @@ def test_disclosure_requirement_and_authorization_bind_every_identity():
     wrong_resource = replace(first, material_id=MaterialIdentity("package-b-material"))
     wrong_package = minted_copy(exact.disclosure_authorization, permitted_resources=(wrong_resource, *exact.disclosure_authorization.permitted_resources[1:]))
     assert admit_semantic_review(replace(exact, disclosure_authorization=wrong_package)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize("change", [
+    {"path_or_resource": "renamed.py"},
+    {"content_or_deletion_identity": "different-content"},
+])
+def test_disclosure_authorization_cannot_be_reused_after_exact_resource_drift(change):
+    request = fixture(disclosure=DisclosureApplicability.REQUIRED)
+    classified = tuple(
+        replace(item, classification_id=MaterialClassificationId(f"class-{index}"))
+        for index, item in enumerate(request.envelope.materials)
+    )
+    exact = with_disclosure_package(request, classified)
+    changed = replace(exact.envelope.materials[0], **change)
+    assert changed.material_id == exact.envelope.materials[0].material_id
+    changed_envelope = replace(exact.envelope, materials=(changed, *exact.envelope.materials[1:]))
+    assert admit_semantic_review(replace(exact, envelope=changed_envelope)).reason_code is EvidenceAdmissionReasonCode.DISCLOSURE_BINDING_MISMATCH
+
+
+def test_exact_unchanged_disclosed_resource_package_remains_permitted():
+    request = fixture(disclosure=DisclosureApplicability.REQUIRED)
+    classified = tuple(
+        replace(item, classification_id=MaterialClassificationId(f"class-{index}"))
+        for index, item in enumerate(request.envelope.materials)
+    )
+    exact = with_disclosure_package(request, classified)
+    assert admit_semantic_review(exact).decision is EvidenceAdmissionDecision.ADMIT
 
 
 def test_required_disclosure_covers_supplemental_and_transformed_resources():
@@ -477,6 +521,35 @@ def test_semantic_status_composition_conflict_and_structured_supersession():
         complete_admitted_records=(approved,),
     )
     assert compose_semantic_evidence(omitted_later, context, (relation,)).reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE
+
+
+@pytest.mark.parametrize("mode", [
+    CompositionMode.ALL_REQUIRED_INVOCATIONS,
+    CompositionMode.EXACT_REQUIRED_INVOCATION_SET,
+])
+def test_malformed_zero_slot_composition_fails_closed_for_nonempty_requirements(mode):
+    request = fixture()
+    malformed_rule = mint(
+        SemanticReviewCompositionRule,
+        composition_rule_id=request.effective_subject.composition_rule_id,
+        mode=mode,
+        required_slots=(),
+    )
+    context = mint(
+        TrustedSemanticCompositionContext,
+        effective_subject=request.effective_subject,
+        composition_rule=malformed_rule,
+    )
+    snapshot = mint(
+        TrustedCanonicalSemanticEvidenceSnapshot,
+        effective_subject=request.effective_subject,
+        membership_binding=EvidenceHistoryMembershipBindingId("zero-slot-H"),
+        complete_admitted_records=(),
+    )
+    result = compose_semantic_evidence(snapshot, context)
+    assert request.effective_subject.requirement_ids
+    assert result.reason is SemanticCompositionReason.INVALID_COMPOSITION_RULE
+    assert result.requirement_statuses == ()
 
 
 def second_slot_record(record, slot, verdict_value):
