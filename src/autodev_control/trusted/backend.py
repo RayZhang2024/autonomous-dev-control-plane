@@ -718,11 +718,9 @@ class InMemoryCanonicalStateBackend:
                 return CanonicalWriteStatus.CAS_CONFLICT, False
             if current.operation_ids == mutation.operation_ids:
                 return None, False
-            revision = current.membership_revision + 1
-            state.memberships[mutation.task_id] = TaskOperationMembershipRecord(
-                mutation.task_id, revision, _membership_binding(mutation.task_id, revision), mutation.operation_ids
-            )
-            return None, True
+            # The closed G6 mutation set has no operation deletion.  Membership
+            # therefore advances only atomically with operation creation.
+            return CanonicalWriteStatus.INVALID_TRANSACTION, False
         if type(mutation) is CreateEvidenceHistory:
             subject = mutation.effective_subject
             current = state.histories.get(subject.subject_id)
@@ -780,11 +778,12 @@ class InMemoryCanonicalStateBackend:
                 or membership.task_id != task.task_id
             ):
                 return False
-            if any(
-                operation_id not in state.operations
-                or state.operations[operation_id].intent.task_id != task_id
-                for operation_id in membership.operation_ids
-            ):
+            same_task_operation_ids = {
+                operation_id
+                for operation_id, operation in state.operations.items()
+                if operation.intent.task_id == task_id
+            }
+            if set(membership.operation_ids) != same_task_operation_ids:
                 return False
             if task.current_candidate_id is not None:
                 candidate = state.candidates.get(task.current_candidate_id)
@@ -1067,6 +1066,79 @@ def canonical_json_bytes(value: object) -> bytes:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_record_bytes(
+    record_kind: CanonicalRecordKind, value: object, schema_version: str = "1"
+) -> bytes:
+    if type(record_kind) is not CanonicalRecordKind or schema_version != "1":
+        raise ValueError("unsupported canonical record kind or schema")
+    expected_type = {
+        CanonicalRecordKind.AUTHORIZATION: AdmittedAuthorization,
+        CanonicalRecordKind.TASK: TaskRecord,
+        CanonicalRecordKind.CANDIDATE: CandidateRecord,
+        CanonicalRecordKind.OPERATION: OperationRecord,
+        CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: TaskOperationMembershipRecord,
+        CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: ReviewAttemptBindingRecord,
+        CanonicalRecordKind.EVIDENCE: EvidenceRecord,
+        CanonicalRecordKind.EVIDENCE_HISTORY: EvidenceHistoryMembershipRecord,
+        CanonicalRecordKind.SUPERSESSION: EvidenceSupersessionRecord,
+    }[record_kind]
+    if type(value) is not expected_type:
+        raise TypeError(f"{record_kind.value} requires exact {expected_type.__name__}")
+    payload = {
+        "format": "autodev.canonical-record/v1",
+        "record": _canonical_value(value),
+        "record_kind": record_kind.value,
+        "schema_version": schema_version,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _identity_parts(record_kind: CanonicalRecordKind, record: dict) -> tuple[str, ...]:
+    def field(*path: str) -> str:
+        value: object = record
+        for key in path:
+            if type(value) is not dict or key not in value:
+                raise ValueError("canonical record is missing its logical identity")
+            value = value[key]
+        if type(value) is not str or not value:
+            raise ValueError("canonical logical identity component is invalid")
+        return value
+
+    paths = {
+        CanonicalRecordKind.AUTHORIZATION: (("authorization_id", "raw_sha256", "value"),),
+        CanonicalRecordKind.TASK: (("task_id", "value"),),
+        CanonicalRecordKind.CANDIDATE: (("candidate_id", "value"),),
+        CanonicalRecordKind.OPERATION: (("intent", "operation_id", "value"),),
+        CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: (("task_id", "value"),),
+        CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: (("operation_id", "value"),),
+        CanonicalRecordKind.EVIDENCE: (("evidence_id", "value"),),
+        CanonicalRecordKind.EVIDENCE_HISTORY: (("effective_subject", "subject_id", "value"),),
+        CanonicalRecordKind.SUPERSESSION: (
+            ("earlier_evidence_id", "value"), ("later_evidence_id", "value"),
+        ),
+    }[record_kind]
+    return tuple(field(*path) for path in paths)
+
+
+def _logical_identity(record_kind: CanonicalRecordKind, record: dict, schema_version: str) -> str:
+    if schema_version != "1":
+        raise ValueError("unsupported canonical record schema")
+    payload = ("autodev.canonical-identity/v1", record_kind.value, *_identity_parts(record_kind, record))
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def canonical_logical_identity(
+    record_kind: CanonicalRecordKind, value: object, schema_version: str = "1"
+) -> str:
+    if type(record_kind) is not CanonicalRecordKind:
+        raise TypeError("exact CanonicalRecordKind required")
+    canonical_record_bytes(record_kind, value, schema_version)
+    canonical = _canonical_value(value)
+    if type(canonical) is not dict:
+        raise ValueError("canonical record must be a typed record")
+    return _logical_identity(record_kind, canonical, schema_version)
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalObjectRef:
     record_kind: CanonicalRecordKind
@@ -1084,7 +1156,7 @@ def canonical_object_ref(record_kind: CanonicalRecordKind, value: object, schema
     return CanonicalObjectRef(
         record_kind,
         schema_version,
-        RawSha256(hashlib.sha256(canonical_json_bytes(value)).hexdigest()),
+        RawSha256(hashlib.sha256(canonical_record_bytes(record_kind, value, schema_version)).hexdigest()),
     )
 
 
@@ -1172,11 +1244,21 @@ def validate_canonical_root(
     claimed = tuple(entry.object_ref for index in manifest.indexes for entry in index)
     if len(set(claimed)) != len(claimed):
         return False
-    for reference in claimed:
+    for entry in (entry for index in manifest.indexes for entry in index):
+        reference = entry.object_ref
         stored = by_ref.get(reference)
         if stored is None:
             return False
-        if not _is_canonical_json_bytes(stored.canonical_bytes):
+        decoded = _decode_canonical_record(stored.canonical_bytes)
+        if decoded is None:
+            return False
+        record_kind, schema_version, record = decoded
+        if record_kind is not reference.record_kind or schema_version != reference.schema_version:
+            return False
+        try:
+            if entry.logical_identity != _logical_identity(record_kind, record, schema_version):
+                return False
+        except (KeyError, TypeError, ValueError):
             return False
         digest = RawSha256(hashlib.sha256(stored.canonical_bytes).hexdigest())
         if digest != reference.object_digest:
@@ -1184,7 +1266,7 @@ def validate_canonical_root(
     return True
 
 
-def _is_canonical_json_bytes(raw: bytes) -> bool:
+def _decode_canonical_record(raw: bytes) -> tuple[CanonicalRecordKind, str, dict] | None:
     try:
         text = raw.decode("utf-8", errors="strict")
 
@@ -1197,11 +1279,19 @@ def _is_canonical_json_bytes(raw: bytes) -> bool:
             return result
 
         value = json.loads(text, object_pairs_hook=pairs)
-        if type(value) is not dict or set(value) != {"format", "value"} or value["format"] != "autodev.canonical-json/v1":
-            return False
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") == raw
+        if (
+            type(value) is not dict
+            or set(value) != {"format", "record", "record_kind", "schema_version"}
+            or value["format"] != "autodev.canonical-record/v1"
+            or type(value["record"]) is not dict
+            or value["schema_version"] != "1"
+        ):
+            return None
+        if json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") != raw:
+            return None
+        return CanonicalRecordKind(value["record_kind"]), value["schema_version"], value["record"]
     except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
-        return False
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1268,4 +1358,7 @@ def reconcile_ambiguous_canonical_write(
         cursor = commit.parents[0]
     if cursor != expected_prior:
         return CanonicalWriteStatus.INDETERMINATE
-    return CanonicalWriteStatus.CAS_CONFLICT
+    # Ordinary commit ancestry cannot prove that an attempted root was never
+    # canonical before a ref rewrite.  Without a trusted complete transition
+    # proof the only safe result is indeterminate.
+    return CanonicalWriteStatus.INDETERMINATE

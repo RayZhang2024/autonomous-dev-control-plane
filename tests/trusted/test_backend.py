@@ -261,17 +261,17 @@ def test_operation_create_advances_membership_once_and_content_update_does_not()
     assert after_update.task_operation_snapshot().operations == (updated,)
 
 
-def test_membership_binding_never_reuses_when_member_set_returns_to_earlier_value():
+def test_membership_cannot_omit_any_existing_same_task_operation():
     store = initialized_backend()
     initial = store.read_task_working_set(TASK).task_operation_membership
     op = operation()
     assert apply(store, CreateOperationAndAdvanceMembership(op, 1, initial.membership_binding_id)).status is CanonicalWriteStatus.APPLIED
     with_op = store.read_task_working_set(TASK).task_operation_membership
-    assert apply(store, ReplaceTaskOperationMembership(TASK, with_op.membership_binding_id, ())).status is CanonicalWriteStatus.APPLIED
-    returned = store.read_task_working_set(TASK).task_operation_membership
-    assert returned.operation_ids == initial.operation_ids
-    assert returned.membership_revision == 3
-    assert returned.membership_binding_id != initial.membership_binding_id
+    assert apply(store, ReplaceTaskOperationMembership(TASK, with_op.membership_binding_id, ())).status is CanonicalWriteStatus.INVALID_TRANSACTION
+    returned = store.read_task_working_set(TASK)
+    assert returned.task_operation_membership == with_op
+    assert returned.task_operation_membership.operation_ids == (op.intent.operation_id,)
+    assert returned.operations == (op,)
 
 
 def test_candidate_and_current_candidate_closure_and_same_transaction_reference():
@@ -472,18 +472,27 @@ def test_coherent_working_set_is_immutable_and_contains_complete_membership():
 
 
 def test_root_digest_indexes_and_unrelated_staging_objects():
-    payload = ("task", 1)
+    payload = task()
+    with pytest.raises(TypeError):
+        canonical_object_ref(CanonicalRecordKind.TASK, ("caller-label",))
+    with pytest.raises(ValueError):
+        canonical_object_ref(CanonicalRecordKind.TASK, payload, "2")
     reference = canonical_object_ref(CanonicalRecordKind.TASK, payload)
-    entry = CanonicalIndexEntry("task", reference)
+    entry = CanonicalIndexEntry(canonical_logical_identity(CanonicalRecordKind.TASK, payload), reference)
     manifest = CanonicalStateRootManifest("1", None, (), (entry,), (), (), (), (), (), (), ())
-    stored = CanonicalStoredObject(reference, canonical_json_bytes(payload))
-    extra_ref = canonical_object_ref(CanonicalRecordKind.EVIDENCE, ("extra",))
-    extra = CanonicalStoredObject(extra_ref, canonical_json_bytes(("extra",)))
+    stored = CanonicalStoredObject(reference, canonical_record_bytes(CanonicalRecordKind.TASK, payload))
+    extra_payload = replace(payload, task_id=TaskId("staging"))
+    extra_ref = canonical_object_ref(CanonicalRecordKind.TASK, extra_payload)
+    extra = CanonicalStoredObject(extra_ref, canonical_record_bytes(CanonicalRecordKind.TASK, extra_payload))
     assert validate_canonical_root(manifest, (stored, extra))
     assert not validate_canonical_root(manifest, ())
     corrupt = CanonicalStoredObject(reference, b"different")
     assert not validate_canonical_root(manifest, (corrupt,))
-    arbitrary = b'{"format":"autodev.canonical-json/v1", "value":["task",1]}'
+    wrong_identity = CanonicalStateRootManifest(
+        "1", None, (), (CanonicalIndexEntry("wrong-task", reference),), (), (), (), (), (), (), ()
+    )
+    assert not validate_canonical_root(wrong_identity, (stored,))
+    arbitrary = b'{"format":"autodev.canonical-record/v1", "record":{},"record_kind":"task","schema_version":"1"}'
     arbitrary_ref = CanonicalObjectRef(CanonicalRecordKind.TASK, "1", RawSha256(hashlib.sha256(arbitrary).hexdigest()))
     arbitrary_manifest = CanonicalStateRootManifest(
         "1", None, (), (CanonicalIndexEntry("task", arbitrary_ref),), (), (), (), (), (), (), ()
@@ -511,5 +520,5 @@ def test_ambiguous_write_reconciliation_current_historical_competing_and_unknown
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=s2, canonical_history=(attempted, later)) is CanonicalWriteStatus.APPLIED
     competing_manifest = CanonicalStateRootManifest("1", s0, (), (), (), (), (), (), (), (), ())
     competing = CanonicalStateCommit(other, competing_manifest, (s0,))
-    assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=other, canonical_history=(competing,)) is CanonicalWriteStatus.CAS_CONFLICT
+    assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=other, canonical_history=(competing,)) is CanonicalWriteStatus.INDETERMINATE
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=other, canonical_history=None) is CanonicalWriteStatus.INDETERMINATE

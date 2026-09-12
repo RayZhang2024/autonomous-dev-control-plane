@@ -14,7 +14,7 @@ import json
 
 from .identity import GitRef, GitSha, ImmutableConfigId, LogicalIdentifier
 from .operation import AuthoritativeStateBindingId
-from .scope import GitHubRepositoryId, ServicePrincipalId
+from .scope import CanonicalGitPath, GitHubRepositoryId, ServicePrincipalId
 
 G6_MAX_CHANGED_FILE_PAGES = 1024
 G6_MAX_CHANGED_FILES = 100_000
@@ -208,6 +208,8 @@ class GitHubStateNormalizer:
         if response.get("repository_id") != request.repository_id.value:
             return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
         try:
+            if response.get("absent") is True:
+                return self._absence(request, response)
             if type(request) is ReadRepositoryIdentity:
                 return self._repository(request, response)
             if type(request) is ReadGitRef:
@@ -229,6 +231,37 @@ class GitHubStateNormalizer:
         except (TypeError, ValueError, KeyError):
             return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
         return GitHubNormalizationResult(failure=StateReadFailure.UNSUPPORTED)
+
+    @staticmethod
+    def _absence(request, response):
+        if type(request) is ReadGitRef:
+            if set(response) != {"repository_id", "ref", "absent"}:
+                return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
+            if response["ref"] != request.ref.value:
+                return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
+            return _ok(
+                f"ref:{request.ref.value}",
+                (request.repository_id.value, request.ref.value, "ABSENT"),
+            )
+        if type(request) is ReadIssueIdentity:
+            if set(response) != {"repository_id", "number", "absent"}:
+                return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
+            if response["number"] != request.issue_number.value:
+                return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
+            return _ok(
+                f"issue:{request.issue_number.value}",
+                (request.repository_id.value, request.issue_number.value, "ABSENT"),
+            )
+        if type(request) is ReadPullRequest:
+            if set(response) != {"repository_id", "number", "absent"}:
+                return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
+            if response["number"] != request.pull_request_number.value:
+                return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
+            return _ok(
+                f"pull-request:{request.pull_request_number.value}",
+                (request.repository_id.value, request.pull_request_number.value, "ABSENT"),
+            )
+        return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
 
     @staticmethod
     def _repository(request, response):
@@ -281,15 +314,34 @@ class GitHubStateNormalizer:
 
     @staticmethod
     def _pull_request(request, response):
-        required = {"repository_id", "number", "state", "base_sha", "head_sha", "merged", "title", "body"}
+        required = {
+            "repository_id", "number", "state", "merged", "base_repository_id",
+            "base_ref", "base_sha", "head_repository_id", "head_ref", "head_sha",
+            "merge_sha", "title", "body",
+        }
         if set(response) != required or response["number"] != request.pull_request_number.value:
             return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
         if response["state"] not in ("open", "closed") or type(response["merged"]) is not bool or type(response["title"]) is not str or type(response["body"]) is not str:
             return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
+        base_repository = GitHubRepositoryId(response["base_repository_id"])
+        head_repository = GitHubRepositoryId(response["head_repository_id"])
+        base_ref, head_ref = GitRef(response["base_ref"]), GitRef(response["head_ref"])
         base, head = GitSha(response["base_sha"]), GitSha(response["head_sha"])
+        merge_sha = response["merge_sha"]
+        if response["merged"]:
+            if response["state"] != "closed":
+                return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
+            merge_sha = GitSha(merge_sha).value
+        elif merge_sha is not None:
+            return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
         return _ok(
             f"pull-request:{request.pull_request_number.value}",
-            (request.repository_id.value, request.pull_request_number.value, response["state"], base.value, head.value, response["merged"]),
+            (
+                request.repository_id.value, request.pull_request_number.value,
+                response["state"], response["merged"],
+                base_repository.value, base_ref.value, base.value,
+                head_repository.value, head_ref.value, head.value, merge_sha,
+            ),
         )
 
     @staticmethod
@@ -525,18 +577,25 @@ class GitHubStateReader:
                 if type(page["items"]) is not list or type(page["complete"]) is not bool:
                     return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
                 for item in page["items"]:
-                    if type(item) is not dict or set(item) != {"path", "status", "blob_sha"}:
+                    if type(item) is not dict or set(item) != {"path", "status", "previous_path", "blob_sha"}:
                         return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
-                    path, status, blob = item["path"], item["status"], item["blob_sha"]
-                    if type(path) is not str or not path or path in seen_paths or status not in ("added", "modified", "removed", "renamed"):
+                    path, status = CanonicalGitPath(item["path"]).value, item["status"]
+                    previous_path, blob = item["previous_path"], item["blob_sha"]
+                    if path in seen_paths or status not in ("added", "modified", "removed", "renamed"):
                         return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
+                    if status == "renamed":
+                        previous_path = CanonicalGitPath(previous_path).value
+                        if previous_path == path:
+                            return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
+                    elif previous_path is not None:
+                        return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
                     if status == "removed":
                         if blob is not None:
                             return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
                     else:
                         blob = GitSha(blob).value
                     seen_paths.add(path)
-                    files.append((path, status, blob))
+                    files.append((path, status, previous_path, blob))
                     if len(files) > G6_MAX_CHANGED_FILES:
                         return GitHubNormalizationResult(failure=StateReadFailure.INCOMPLETE)
                 next_cursor = page["next_cursor"]

@@ -66,7 +66,13 @@ def response_for(request, **changes):
     elif type(request) is ReadIssueIdentity:
         value = {"repository_id": request.repository_id.value, "number": request.issue_number.value, "state": "open", "title": "prose", "body": "prose", "labels": ["blocked"], "comments": ["completed"]}
     elif type(request) is ReadPullRequest:
-        value = {"repository_id": request.repository_id.value, "number": request.pull_request_number.value, "state": "open", "base_sha": SHA_A.value, "head_sha": SHA_B.value, "merged": False, "title": "prose", "body": "prose"}
+        value = {
+            "repository_id": request.repository_id.value, "number": request.pull_request_number.value,
+            "state": "open", "merged": False,
+            "base_repository_id": request.repository_id.value, "base_ref": "refs/heads/main", "base_sha": SHA_A.value,
+            "head_repository_id": request.repository_id.value, "head_ref": "refs/heads/feature", "head_sha": SHA_B.value,
+            "merge_sha": None, "title": "prose", "body": "prose",
+        }
     elif type(request) is ReadMergeState:
         value = {"repository_id": request.repository_id.value, "number": request.pull_request_number.value, "merged": False, "merge_sha": None}
     elif type(request) is ReadRegisteredEventSensitiveState:
@@ -241,6 +247,31 @@ def test_positive_registered_absence_can_be_authoritative():
     assert result.snapshot.observations[0].fact_value[-2:] == ("ABSENT", None)
 
 
+def test_positive_ref_and_numbered_resource_absence_are_authoritative():
+    ref = ReadGitRef(REPOSITORY, GitRef("refs/heads/missing"))
+    issue = ReadIssueIdentity(REPOSITORY, GitHubIssueNumber(404))
+    for request, absent in (
+        (ref, {"repository_id": REPOSITORY.value, "ref": ref.ref.value, "absent": True}),
+        (issue, {"repository_id": REPOSITORY.value, "number": issue.issue_number.value, "absent": True}),
+    ):
+        result = reader_for({request: [absent]}).read_authoritative(
+            REPOSITORY, profile(descriptor("absent", request))
+        )
+        assert result.status is AuthoritativeStateReadStatus.SUCCESS
+        assert result.snapshot.observations[0].fact_value[-1] == "ABSENT"
+
+
+def test_transport_unavailable_and_malformed_are_distinct_from_positive_absence():
+    request = ReadGitRef(REPOSITORY, GitRef("refs/heads/missing"))
+    unavailable = GitHubStateReader(binding(), transport(binding(), lambda request, cursor: (_ for _ in ()).throw(OSError())))
+    result = unavailable.read_authoritative(REPOSITORY, profile(descriptor("ref", request)))
+    assert result.failure is StateReadFailure.UNAVAILABLE
+    malformed = reader_for({request: [{"repository_id": REPOSITORY.value, "absent": True}]}).read_authoritative(
+        REPOSITORY, profile(descriptor("ref", request))
+    )
+    assert malformed.failure is StateReadFailure.MALFORMED_RESPONSE
+
+
 def changed_page(number, items, next_cursor=None, complete=True):
     return {"repository_id": REPOSITORY.value, "number": number, "items": items, "next_cursor": next_cursor, "complete": complete}
 
@@ -249,8 +280,8 @@ def test_changed_file_inventory_requires_complete_pagination_and_stable_pr_conte
     number = GitHubPullRequestNumber(7)
     request = ReadChangedFileInventory(REPOSITORY, number)
     context = ReadPullRequest(REPOSITORY, number)
-    page1 = changed_page(7, [{"path": "a.py", "status": "modified", "blob_sha": SHA_A.value}], "page-2", False)
-    page2 = changed_page(7, [{"path": "b.py", "status": "removed", "blob_sha": None}])
+    page1 = changed_page(7, [{"path": "a.py", "status": "modified", "previous_path": None, "blob_sha": SHA_A.value}], "page-2", False)
+    page2 = changed_page(7, [{"path": "b.py", "status": "removed", "previous_path": None, "blob_sha": None}])
     stable = reader_for({
         context: [response_for(context), response_for(context)],
         (request, None): [page1], (request, "page-2"): [page2],
@@ -269,6 +300,40 @@ def test_changed_file_inventory_requires_complete_pagination_and_stable_pr_conte
         (request, None): [changed_page(7, [])],
     }).read_authoritative(REPOSITORY, profile(descriptor("files", request)))
     assert moved.failure is StateReadFailure.STATE_MOVED
+
+
+@pytest.mark.parametrize("change", [
+    {"head_repository_id": OTHER_REPOSITORY.value},
+    {"head_ref": "refs/heads/retargeted"},
+])
+def test_changed_file_inventory_rejects_fork_or_ref_context_movement(change):
+    number = GitHubPullRequestNumber(8)
+    request = ReadChangedFileInventory(REPOSITORY, number)
+    context = ReadPullRequest(REPOSITORY, number)
+    result = reader_for({
+        context: [response_for(context), response_for(context, **change)],
+        (request, None): [changed_page(8, [])],
+    }).read_authoritative(REPOSITORY, profile(descriptor("files", request)))
+    assert result.failure is StateReadFailure.STATE_MOVED
+
+
+def test_changed_file_rename_preserves_previous_path_and_rejects_invalid_shapes():
+    number = GitHubPullRequestNumber(9)
+    request = ReadChangedFileInventory(REPOSITORY, number)
+    context = ReadPullRequest(REPOSITORY, number)
+
+    def read(item):
+        return reader_for({
+            context: [response_for(context), response_for(context)],
+            (request, None): [changed_page(9, [item])],
+        }).read_authoritative(REPOSITORY, profile(descriptor("files", request)))
+
+    valid = read({"path": "new/name.py", "status": "renamed", "previous_path": "old/name.py", "blob_sha": SHA_A.value})
+    assert valid.status is AuthoritativeStateReadStatus.SUCCESS
+    assert valid.snapshot.observations[0].fact_value[-1] == (("new/name.py", "renamed", "old/name.py", SHA_A.value),)
+    assert read({"path": "new.py", "status": "renamed", "blob_sha": SHA_A.value}).failure is StateReadFailure.MALFORMED_RESPONSE
+    assert read({"path": "new.py", "status": "renamed", "previous_path": None, "blob_sha": SHA_A.value}).failure is StateReadFailure.MALFORMED_RESPONSE
+    assert read({"path": "same.py", "status": "modified", "previous_path": "old.py", "blob_sha": SHA_A.value}).failure is StateReadFailure.MISMATCH
 
 
 def test_reader_has_no_mutation_or_credential_surface():
