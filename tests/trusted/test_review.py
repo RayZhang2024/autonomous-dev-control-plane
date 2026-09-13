@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from autodev_control.trusted.backend import BackendGeneration, CanonicalStateOccurrenceBinding
 from autodev_control.trusted.evidence import EvidenceSubject
 from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
@@ -13,6 +14,7 @@ from autodev_control.trusted.scope import AuthorizationId, ContractId, GitHubRep
 
 RAW = RawSha256("3" * 64)
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
+OCCURRENCE = CanonicalStateOccurrenceBinding(BackendGeneration(1))
 
 
 def mint(cls, **fields):
@@ -59,8 +61,8 @@ def composition(*slots):
 
 
 def histories(subj, evidence=(), attempts=(), membership="operations"):
-    history = mint(TrustedEffectiveSubjectEvidenceSnapshot, subject=subj, membership_binding=EvidenceHistoryMembershipBindingId("history"), admitted_bindings=tuple(evidence))
-    attempt = mint(TrustedReviewSlotAttemptSnapshot, subject=subj, operation_membership_binding_id=OperationMembershipBindingId(membership), attempts=tuple(attempts))
+    history = mint(TrustedEffectiveSubjectEvidenceSnapshot, canonical_state_occurrence_binding=OCCURRENCE, subject=subj, membership_binding=EvidenceHistoryMembershipBindingId("history"), admitted_bindings=tuple(evidence))
+    attempt = mint(TrustedReviewSlotAttemptSnapshot, canonical_state_occurrence_binding=OCCURRENCE, subject=subj, operation_membership_binding_id=OperationMembershipBindingId(membership), attempts=tuple(attempts))
     return history, attempt
 
 
@@ -160,6 +162,21 @@ def test_profile_cycling_cannot_manufacture_slot_and_history_unavailable_is_inde
     history, attempts = histories(subj)
     assert evaluate_review_invocation_eligibility(subj, changed, composition(required), history, attempts).reason is EligibilityReason.SLOT_PROFILE_MISMATCH
     assert evaluate_review_invocation_eligibility(subj, required, composition(required), None, attempts).decision is EligibilityDecision.INDETERMINATE
+
+
+def test_mixed_canonical_occurrences_fail_preinvocation_eligibility_closed():
+    subj, required = subject(), ReviewSlot(ReviewSlotId("a"), profile("a"), RAW)
+    history, attempts = histories(subj)
+    moved_attempts = mint(
+        TrustedReviewSlotAttemptSnapshot,
+        canonical_state_occurrence_binding=CanonicalStateOccurrenceBinding(BackendGeneration(2)),
+        subject=attempts.subject,
+        operation_membership_binding_id=attempts.operation_membership_binding_id,
+        attempts=attempts.attempts,
+    )
+    result = evaluate_review_invocation_eligibility(subj, required, composition(required), history, moved_attempts)
+    assert result.decision is EligibilityDecision.NOT_ELIGIBLE
+    assert result.reason is EligibilityReason.COMPOSITION_MISMATCH
 
 
 def test_ordinary_g5_values_reject_mutable_nested_containers():

@@ -5,6 +5,15 @@ from .authorization import (
     admit_direct_authorization,
     load_candidate_authorization_proposal,
 )
+from .backend import (
+    CanonicalReviewEligibilitySnapshot,
+    CanonicalStateOccurrenceBinding,
+    CanonicalStateRootManifest,
+    CanonicalTaskWorkingSet,
+    CanonicalTransaction,
+    CanonicalWriteResult,
+    InMemoryCanonicalStateBackend,
+)
 from .manifest import CandidateTrustedManifest, load_candidate_trusted_manifest
 from .evidence import (
     EvidenceAdmissionResult,
@@ -49,15 +58,29 @@ from .state import (
     reserve_repair_attempt,
     start_operation,
 )
+from .state_reader import (
+    AuthoritativeStateReadResult,
+    GitHubStateNormalizer,
+    GitHubStateReader,
+    authoritative_state_binding_from_result,
+)
 
 __all__ = [
     "CandidateTrustedManifest",
+    "CanonicalReviewEligibilitySnapshot",
+    "CanonicalStateOccurrenceBinding",
+    "CanonicalStateRootManifest",
+    "CanonicalTaskWorkingSet",
+    "CanonicalTransaction",
+    "CanonicalWriteResult",
     "EvidenceAdmissionResult",
     "EvidenceRecord",
+    "AuthoritativeStateReadResult",
     "CandidateRecord",
     "CompletionAggregate",
     "OperationRecord",
     "OperationState",
+    "InMemoryCanonicalStateBackend",
     "ParseLimits",
     "ParsedJsonDocument",
     "RawSemanticVerdict",
@@ -69,7 +92,10 @@ __all__ = [
     "TrustedReviewEnvelope",
     "TrustedCanonicalSemanticEvidenceSnapshot",
     "TrustedSemanticCompositionContext",
+    "GitHubStateNormalizer",
+    "GitHubStateReader",
     "adopt_candidate",
+    "authoritative_state_binding_from_result",
     "admit_semantic_review",
     "build_evidence_supersession_record",
     "admit_delegated_authorization",

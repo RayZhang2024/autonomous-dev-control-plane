@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from autodev_control.trusted.backend import BackendGeneration, CanonicalStateOccurrenceBinding
 from autodev_control.trusted.evidence import *
 from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
@@ -14,6 +15,7 @@ from autodev_control.trusted.scope import AuthorizationId, ContractId, GitHubRep
 
 RAW = RawSha256("5" * 64)
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
+OCCURRENCE = CanonicalStateOccurrenceBinding(BackendGeneration(1))
 
 
 def mint(cls, **fields):
@@ -131,9 +133,9 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         slot_id=slot.slot_id, profile_id=profile.profile_id, service_id=profile.service_id,
         canonical_request_id=CanonicalRequestId("request"), disclosed_resources=(),
     )
-    history = mint(TrustedEffectiveSubjectEvidenceSnapshot, subject=effective, membership_binding=EvidenceHistoryMembershipBindingId("H0"), admitted_bindings=())
+    history = mint(TrustedEffectiveSubjectEvidenceSnapshot, canonical_state_occurrence_binding=OCCURRENCE, subject=effective, membership_binding=EvidenceHistoryMembershipBindingId("H0"), admitted_bindings=())
     attempt = ReviewSlotAttempt(subject.invocation_id, slot.slot_id, intent.operation_id, operation_state, CanonicalRequestId("request"))
-    attempts = mint(TrustedReviewSlotAttemptSnapshot, subject=effective, operation_membership_binding_id=__import__('autodev_control.trusted.operation', fromlist=['OperationMembershipBindingId']).OperationMembershipBindingId("O0"), attempts=(attempt,))
+    attempts = mint(TrustedReviewSlotAttemptSnapshot, canonical_state_occurrence_binding=OCCURRENCE, subject=effective, operation_membership_binding_id=__import__('autodev_control.trusted.operation', fromlist=['OperationMembershipBindingId']).OperationMembershipBindingId("O0"), attempts=(attempt,))
     request = SemanticEvidenceAdmissionRequest(
         raw, ParseLimits(100000, 20), mint(TrustedVerdictSchemaContext, schema_id=profile.verdict_schema_id, version="1.0"),
         profile.verdict_schema_id, subject, effective, slot, composition, envelope, invocation, binding,
@@ -208,6 +210,16 @@ def test_operation_binding_includes_exact_revision_and_full_g4_context():
     request = fixture()
     bad = minted_copy(request.operation_binding, operation_revision=99)
     assert admit_semantic_review(replace(request, operation_binding=bad)).reason_code is EvidenceAdmissionReasonCode.OPERATION_BINDING_MISMATCH
+
+
+def test_mixed_canonical_occurrences_fail_evidence_admission_closed():
+    request = fixture()
+    attempts = minted_copy(
+        request.slot_attempt_history,
+        canonical_state_occurrence_binding=CanonicalStateOccurrenceBinding(BackendGeneration(2)),
+    )
+    result = admit_semantic_review(replace(request, slot_attempt_history=attempts))
+    assert result.reason_code is EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT
 
 
 def test_duplicate_requirement_result_precedes_set_equality():

@@ -618,6 +618,11 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
         return _result(EvidenceAdmissionReasonCode.REREVIEW_NOT_PERMITTED)
     if request.slot_attempt_history is None:
         return _result(EvidenceAdmissionReasonCode.SLOT_ATTEMPT_CONTEXT_UNAVAILABLE)
+    if (
+        request.evidence_history.canonical_state_occurrence_binding
+        != request.slot_attempt_history.canonical_state_occurrence_binding
+    ):
+        return _result(EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT)
     if request.slot_attempt_history.subject != request.effective_subject:
         return _result(EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT)
     current_key = (invocation.invocation_id, request.slot.slot_id, binding.operation_id, OperationState.SUCCEEDED, invocation.canonical_request_id)
@@ -649,6 +654,7 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
         ):
             return _result(EvidenceAdmissionReasonCode.REVIEW_SLOT_ATTEMPT_CONFLICT)
     derived_attempt_snapshot = object.__new__(TrustedReviewSlotAttemptSnapshot)
+    object.__setattr__(derived_attempt_snapshot, "canonical_state_occurrence_binding", request.slot_attempt_history.canonical_state_occurrence_binding)
     object.__setattr__(derived_attempt_snapshot, "subject", request.slot_attempt_history.subject)
     object.__setattr__(derived_attempt_snapshot, "operation_membership_binding_id", request.slot_attempt_history.operation_membership_binding_id)
     object.__setattr__(derived_attempt_snapshot, "attempts", prior_attempts)

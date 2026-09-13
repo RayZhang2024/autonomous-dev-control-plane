@@ -4,6 +4,8 @@ Objects produced here are non-bearer candidate values.  The module performs no
 review invocation, disclosure, persistence, provider access, or external effect.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -883,6 +885,7 @@ class AdmittedSemanticEvidenceBinding:
 
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedEffectiveSubjectEvidenceSnapshot:
+    canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding
     subject: SemanticReviewEffectiveSubject
     membership_binding: EvidenceHistoryMembershipBindingId
     admitted_bindings: tuple[AdmittedSemanticEvidenceBinding, ...]
@@ -908,6 +911,7 @@ class ReviewSlotAttempt:
 
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedReviewSlotAttemptSnapshot:
+    canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding
     subject: SemanticReviewEffectiveSubject
     operation_membership_binding_id: OperationMembershipBindingId
     attempts: tuple[ReviewSlotAttempt, ...]
@@ -971,6 +975,14 @@ def evaluate_review_invocation_eligibility(
 ) -> ReviewEligibilityResult:
     if evidence_history_snapshot is None or slot_attempt_snapshot is None:
         return ReviewEligibilityResult(EligibilityDecision.INDETERMINATE, EligibilityReason.HISTORY_UNAVAILABLE)
+    from .backend import CanonicalStateOccurrenceBinding
+    if (
+        type(evidence_history_snapshot.canonical_state_occurrence_binding) is not CanonicalStateOccurrenceBinding
+        or type(slot_attempt_snapshot.canonical_state_occurrence_binding) is not CanonicalStateOccurrenceBinding
+        or evidence_history_snapshot.canonical_state_occurrence_binding
+        != slot_attempt_snapshot.canonical_state_occurrence_binding
+    ):
+        return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, EligibilityReason.COMPOSITION_MISMATCH)
     if evidence_history_snapshot.subject != subject or slot_attempt_snapshot.subject != subject:
         return ReviewEligibilityResult(EligibilityDecision.NOT_ELIGIBLE, EligibilityReason.COMPOSITION_MISMATCH)
     required = {item.slot_id: item for item in composition_rule.required_slots}
