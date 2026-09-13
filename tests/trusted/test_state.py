@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from autodev_control.trusted.errors import G4FailureCode
-from autodev_control.trusted.identity import GitSha, RawSha256
+from autodev_control.trusted.identity import CandidateMaterializationId, GitSha, OperationStartBindingId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import (
     AdmissionEventId,
@@ -65,6 +65,8 @@ TASK_ID = TaskId("task")
 CONTRACT = ContractId("contract")
 ADMISSION = AdmissionEventId("admission")
 MEMBERSHIP = OperationMembershipBindingId("membership")
+START = OperationStartBindingId("8" * 64)
+MATERIALIZATION = CandidateMaterializationId("6" * 64)
 
 
 def _mint(cls, **fields):
@@ -94,7 +96,7 @@ def admitted(maximum=2):
 def candidate(name="candidate", task_id=TASK_ID):
     return CandidateRecord(
         CandidateId(name), task_id, GitSha("a" * 40), CONTRACT, RAW, AUTH,
-        ADMISSION, TARGET, EPOCH, (), None,
+        ADMISSION, TARGET, EPOCH, MATERIALIZATION, (), None,
     )
 
 
@@ -121,7 +123,8 @@ def operation(
         integration_binding=IntegrationBound(GitRef("refs/heads/main")) if integration else NotIntegrationBound(),
         is_repair_attempt=repair,
     )
-    return OperationRecord(intent, 1, state)
+    binding = None if state in (OperationState.RESERVED, OperationState.CONFLICT) else START
+    return OperationRecord(intent, 1, state, start_binding_id=binding)
 
 
 def snapshot(*operations, membership=MEMBERSHIP):
@@ -222,7 +225,7 @@ def test_closed_g4_failure_domain_is_exact():
         "REPAIR_ATTEMPT_NOT_RESERVED", "OPERATION_ID_REUSE_MISMATCH",
         "IDEMPOTENCY_COLLISION", "INVALID_OPERATION_TRANSITION",
         "OPERATION_NOT_STARTABLE", "CANCELLATION_BLOCKS_OPERATION_START",
-        "RECONCILIATION_REQUIRED",
+        "RECONCILIATION_REQUIRED", "ACTION_PRECONDITION_CONFLICT",
     ]
 
 
@@ -348,7 +351,7 @@ def test_reserved_operation_start_invalidates_stale_completion_revision():
     task = evaluating()
     item = operation()
     value = evaluation(task, (item,), contract=ConditionStatus.SATISFIED)
-    changed = replace(item, revision=2, state=OperationState.PERFORMING)
+    changed = replace(item, revision=2, state=OperationState.PERFORMING, start_binding_id=START)
     value = replace(value, operation_snapshot=snapshot(changed))
     result = evaluate_task(task, value)
     assert result.failure.code is G4FailureCode.REVISION_CONFLICT
@@ -484,7 +487,7 @@ def test_reserved_old_candidate_operation_does_not_block_but_is_revision_bound()
         expected_operation_revisions=(OperationRevisionBinding(item.intent.operation_id, 1),),
     )
     assert result.proposal.proposed.current_candidate_id == new.candidate_id
-    started = replace(item, revision=2, state=OperationState.PERFORMING)
+    started = replace(item, revision=2, state=OperationState.PERFORMING, start_binding_id=START)
     stale = adopt_candidate(
         task, new, applicability(task, new), expected_task_revision=1,
         snapshot=snapshot(started), expected_membership_binding_id=MEMBERSHIP,
@@ -632,7 +635,7 @@ def test_repair_start_atomically_consumes_budget_and_enters_performing():
     item = operation(name="repair", repair=True)
     result = start_operation(
         task, item, expected_task_revision=2, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     assert result.operation.state is OperationState.PERFORMING
     assert result.task.revision == 3
@@ -652,7 +655,7 @@ def test_release_start_race_is_revision_safe():
     ).proposal.proposed
     stale_start = start_operation(
         released, item, expected_task_revision=2, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     assert stale_start.failure.code is G4FailureCode.REVISION_CONFLICT
 
@@ -662,7 +665,7 @@ def test_start_release_race_leaves_attempt_consumed():
     item = operation(name="repair", repair=True)
     started = start_operation(
         task, item, expected_task_revision=2, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     late_release = release_repair_attempt(
         started.task, OperationId("repair"), expected_task_revision=3,
@@ -678,7 +681,7 @@ def test_authoritative_cancellation_blocks_normal_protected_start_and_repair():
     ).proposal.proposed
     normal = start_operation(
         task, operation(), expected_task_revision=2, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.AUTHORITATIVE,
+        expected_cancellation_status=CancellationStatus.AUTHORITATIVE, operation_start_binding_id=START,
     )
     assert normal.failure.code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
     repair = reserve_repair_attempt(task, OperationId("repair"), expected_task_revision=2)
@@ -694,7 +697,7 @@ def test_authoritative_nonterminal_cancellation_blocks_normal_but_not_self_autho
     ).proposal.proposed
     result = start_operation(
         task, operation(name="new"), expected_task_revision=2, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.AUTHORITATIVE,
+        expected_cancellation_status=CancellationStatus.AUTHORITATIVE, operation_start_binding_id=START,
     )
     assert result.failure.code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
 
@@ -703,7 +706,7 @@ def test_candidate_bound_start_fails_after_candidate_change():
     result = start_operation(
         replace(evaluating(), current_candidate_id=CandidateId("new")), operation(),
         expected_task_revision=1, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     assert result.failure.code is G4FailureCode.OPERATION_NOT_STARTABLE
 
@@ -712,7 +715,7 @@ def test_integration_bound_start_requires_exact_ready_next_operation():
     item = operation(integration=True)
     wrong = start_operation(
         evaluating(), item, expected_task_revision=1, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     assert wrong.failure.code is G4FailureCode.OPERATION_NOT_STARTABLE
     ready = replace(
@@ -721,7 +724,7 @@ def test_integration_bound_start_requires_exact_ready_next_operation():
     )
     allowed = start_operation(
         ready, item, expected_task_revision=1, expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.NONE,
+        expected_cancellation_status=CancellationStatus.NONE, operation_start_binding_id=START,
     )
     assert allowed.operation.state is OperationState.PERFORMING
     assert allowed.operation.revision == 2
@@ -739,7 +742,7 @@ def test_nonterminal_authoritative_cancellation_blocks_repair_start():
     result = start_operation(
         task, operation(name="repair", repair=True), expected_task_revision=3,
         expected_operation_revision=1,
-        expected_cancellation_status=CancellationStatus.AUTHORITATIVE,
+        expected_cancellation_status=CancellationStatus.AUTHORITATIVE, operation_start_binding_id=START,
     )
     assert result.failure.code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
 

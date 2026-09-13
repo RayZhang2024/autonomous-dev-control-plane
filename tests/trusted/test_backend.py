@@ -14,7 +14,7 @@ from autodev_control.trusted.evidence import (
     EvidenceSupersessionRecord, TrustedAdmittedEvidenceRecord,
     TrustedSupersessionAuthorization, build_evidence_supersession_record,
 )
-from autodev_control.trusted.identity import GitRef, GitSha, ImmutableConfigId, RawSha256
+from autodev_control.trusted.identity import CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import (
     AdmissionEventId, AuthoritativeStateBindingId, EvidenceId, IntegrationBound,
@@ -33,6 +33,8 @@ from autodev_control.trusted.state import (
     CandidateRecord, EvidenceBindingRef, RepairBudget, TaskRecord, TaskState,
     initial_task_proposal,
 )
+
+MAT = CandidateMaterializationId("6" * 64)
 from autodev_control.trusted.target_registration import AdmittedTargetRegistration
 
 
@@ -175,7 +177,7 @@ def initialized_backend(*, task_epoch=EPOCH):
 
 
 def adopt_canonical_candidate(store):
-    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
+    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
     evaluating = replace(task(), revision=2, state=TaskState.EVALUATING, current_candidate_id=candidate.candidate_id)
     assert apply(store, ReplaceTask(1, evaluating), CreateCandidate(candidate)).status is CanonicalWriteStatus.APPLIED
     return candidate
@@ -258,7 +260,8 @@ def test_operation_create_advances_membership_once_and_content_update_does_not()
     assert result.status is CanonicalWriteStatus.APPLIED
     after_create = store.read_task_working_set(TASK)
     assert after_create.task_operation_membership.membership_revision == 2
-    updated = replace(op, revision=2, state=OperationState.PERFORMING)
+    updated = replace(op, revision=2, state=OperationState.PERFORMING,
+                      start_binding_id=OperationStartBindingId("8" * 64))
     assert apply(store, ReplaceOperation(1, updated)).status is CanonicalWriteStatus.APPLIED
     after_update = store.read_task_working_set(TASK)
     assert after_update.task_operation_membership == after_create.task_operation_membership
@@ -280,18 +283,18 @@ def test_membership_cannot_omit_any_existing_same_task_operation():
 
 def test_candidate_and_current_candidate_closure_and_same_transaction_reference():
     store = initialized_backend()
-    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
+    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
     evaluating = replace(task(), revision=2, state=TaskState.EVALUATING, current_candidate_id=candidate.candidate_id)
     assert apply(store, ReplaceTask(1, evaluating), CreateCandidate(candidate)).status is CanonicalWriteStatus.APPLIED
     assert store.read_task_working_set(TASK).candidate == candidate
 
-    bad = CandidateRecord(CandidateId("bad"), TASK, BASE, ContractId("other"), RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
+    bad = CandidateRecord(CandidateId("bad"), TASK, BASE, ContractId("other"), RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
     assert apply(store, CreateCandidate(bad)).status is CanonicalWriteStatus.INVALID_TRANSACTION
 
 
 def test_candidate_parent_and_creation_operation_must_resolve():
     store = initialized_backend()
-    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, (CandidateId("missing"),), OperationId("missing"))
+    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, (CandidateId("missing"),), OperationId("missing"))
     assert apply(store, CreateCandidate(child)).status is CanonicalWriteStatus.INVALID_TRANSACTION
 
 
@@ -299,8 +302,8 @@ def test_candidate_parent_and_creation_operation_can_resolve_in_complete_same_tr
     store = initialized_backend()
     membership = store.read_task_working_set(TASK).task_operation_membership
     creation = operation("candidate-creation")
-    parent = CandidateRecord(CandidateId("parent"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
-    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, (parent.candidate_id,), creation.intent.operation_id)
+    parent = CandidateRecord(CandidateId("parent"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
+    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, (parent.candidate_id,), creation.intent.operation_id)
     assert apply(
         store,
         CreateCandidate(child),
@@ -563,7 +566,7 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind()
     records = (
         admitted_authorization(),
         task(),
-        CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ()),
+        CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ()),
         op,
         TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), (op.intent.operation_id,)),
         ReviewAttemptBindingRecord(
@@ -638,7 +641,7 @@ def test_root_rejects_dangling_task_candidate_and_operation_references():
     )
     parent_missing = CandidateRecord(
         CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
-        (CandidateId("missing-parent"),),
+        MAT, (CandidateId("missing-parent"),),
     )
     rejected(
         (CanonicalRecordKind.AUTHORIZATION, authorization),
@@ -648,7 +651,7 @@ def test_root_rejects_dangling_task_candidate_and_operation_references():
     )
     creation_missing = CandidateRecord(
         CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
-        (), OperationId("missing-creation"),
+        MAT, (), OperationId("missing-creation"),
     )
     rejected(
         (CanonicalRecordKind.AUTHORIZATION, authorization),
@@ -727,7 +730,7 @@ def test_root_rejects_incomplete_operation_membership_and_review_binding_closure
 def test_root_rejects_incomplete_evidence_history_and_supersession_closure():
     authorization, base_task = admitted_authorization(), task()
     subject = effective_subject()
-    candidate = CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
+    candidate = CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
     empty_membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("empty"), ())
     history_with_missing = EvidenceHistoryMembershipRecord(
         subject, 1, EvidenceHistoryMembershipBindingId("history"), (EvidenceId("missing"),),

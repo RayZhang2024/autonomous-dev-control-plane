@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from autodev_control.trusted.errors import G4FailureCode
-from autodev_control.trusted.identity import RawSha256
+from autodev_control.trusted.identity import OperationStartBindingId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import (
     AdmissionEventId,
@@ -37,6 +37,12 @@ RAW = RawSha256("1" * 64)
 AUTH = AuthorizationId(RAW)
 TARGET = TargetRegistrationId(RAW)
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
+START = OperationStartBindingId("9" * 64)
+
+
+def record(value, revision, state):
+    binding = None if state in (OperationState.RESERVED, OperationState.CONFLICT) else START
+    return OperationRecord(value, revision, state, start_binding_id=binding)
 
 
 def _mint(cls, **fields):
@@ -136,7 +142,7 @@ def test_reservation_is_reserved_at_revision_one_and_non_bearer():
 
 
 def test_exact_replay_returns_existing_record_without_duplicate():
-    existing = OperationRecord(intent(), 3, OperationState.FAILED)
+    existing = record(intent(), 3, OperationState.FAILED)
     result = reserve_operation(intent(), (existing,))
     assert result.operation is existing
     assert result.replayed is True
@@ -163,7 +169,6 @@ def test_same_key_on_another_task_is_not_a_collision():
 @pytest.mark.parametrize(
     ("source", "target"),
     [
-        (OperationState.RESERVED, OperationState.PERFORMING),
         (OperationState.RESERVED, OperationState.CONFLICT),
         (OperationState.PERFORMING, OperationState.SUCCEEDED),
         (OperationState.PERFORMING, OperationState.FAILED),
@@ -174,14 +179,14 @@ def test_same_key_on_another_task_is_not_a_collision():
     ],
 )
 def test_exact_allowed_operation_transitions(source, target):
-    result = transition_operation(OperationRecord(intent(), 4, source), 4, target)
+    result = transition_operation(record(intent(), 4, source), 4, target)
     assert result.operation.state is target
     assert result.operation.revision == 5
 
 
 @pytest.mark.parametrize("terminal", [OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CONFLICT])
 def test_operation_terminal_states_have_no_outgoing_transition(terminal):
-    result = transition_operation(OperationRecord(intent(), 2, terminal), 2, OperationState.PERFORMING)
+    result = transition_operation(record(intent(), 2, terminal), 2, OperationState.PERFORMING)
     assert result.failure.code is G4FailureCode.INVALID_OPERATION_TRANSITION
 
 
@@ -190,12 +195,11 @@ def test_stale_operation_revision_is_revision_conflict_not_operation_conflict():
     assert result.failure.code is G4FailureCode.REVISION_CONFLICT
 
 
-def test_operation_update_proposal_binds_exact_prior_revision():
+def test_generic_transition_cannot_start_reserved_operation():
     result = transition_operation(
         OperationRecord(intent(), 7, OperationState.RESERVED), 7, OperationState.PERFORMING
     )
-    assert result.proposal.expected_revision == 7
-    assert result.proposal.proposed.revision == 8
+    assert result.failure.code is G4FailureCode.INVALID_OPERATION_TRANSITION
 
 
 @pytest.mark.parametrize(
@@ -209,7 +213,7 @@ def test_operation_update_proposal_binds_exact_prior_revision():
 @pytest.mark.parametrize("source", [OperationState.PERFORMING, OperationState.INDETERMINATE])
 def test_reconciliation_maps_exact_findings(source, finding, target):
     trusted = reconciliation_finding(finding)
-    result = reconcile_operation(OperationRecord(intent(), 1, source), 1, trusted)
+    result = reconcile_operation(record(intent(), 1, source), 1, trusted)
     assert result.operation.state is target
 
 
@@ -233,7 +237,7 @@ def test_operation_values_are_deeply_immutable_and_copy_isolated():
 
 
 def test_new_attempt_after_failure_uses_new_operation_and_key():
-    failed = OperationRecord(intent(), 3, OperationState.FAILED)
+    failed = record(intent(), 3, OperationState.FAILED)
     fresh = reserve_operation(intent(operation="op-2", key="key-2"), (failed,))
     assert fresh.operation.state is OperationState.RESERVED
 

@@ -1,0 +1,215 @@
+"""Deterministic fixture candidate materialization from Git object truth."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+import hashlib
+import json
+
+from .identity import CandidateMaterializationId, GitSha, MutationInventoryId
+from .operation import AdmissionEventId, CandidateId, OperationId
+from .scope import (
+    AuthorizationId, CanonicalBranchRef, CanonicalGitPath, ChangeType, ContractId,
+    ExactPathSelector, MutationScope, MutationScopeRule, TargetRegistrationId, TaskId,
+    scope_contains, scopes_overlap,
+)
+from .identity import RawSha256
+from .manifest import PolicyEpochIdentity
+
+
+class GitObjectKind(Enum):
+    BLOB = "blob"
+    TREE = "tree"
+    SYMLINK = "symlink"
+    GITLINK = "gitlink"
+
+
+class GitBlobMode(Enum):
+    REGULAR = "100644"
+    EXECUTABLE = "100755"
+
+
+class MutationKind(Enum):
+    ADDED = "ADDED"
+    MODIFIED = "MODIFIED"
+    DELETED = "DELETED"
+
+
+@dataclass(frozen=True, slots=True)
+class GitTreeEntry:
+    path: CanonicalGitPath
+    object_kind: GitObjectKind
+    mode: str
+    object_id: GitSha
+
+    def __post_init__(self) -> None:
+        if type(self.path) is not CanonicalGitPath or type(self.object_kind) is not GitObjectKind:
+            raise TypeError("tree entry identity has wrong exact type")
+        if type(self.mode) is not str or type(self.object_id) is not GitSha:
+            raise TypeError("tree entry value has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
+class MutationFact:
+    path: CanonicalGitPath
+    kind: MutationKind
+    base_object_id: GitSha | None
+    candidate_object_id: GitSha | None
+    base_mode: GitBlobMode | None
+    candidate_mode: GitBlobMode | None
+
+    def __post_init__(self) -> None:
+        if type(self.path) is not CanonicalGitPath or type(self.kind) is not MutationKind:
+            raise TypeError("mutation identity has wrong exact type")
+        for value in (self.base_object_id, self.candidate_object_id):
+            if value is not None and type(value) is not GitSha:
+                raise TypeError("mutation object id has wrong exact type")
+        for value in (self.base_mode, self.candidate_mode):
+            if value is not None and type(value) is not GitBlobMode:
+                raise TypeError("mutation mode has wrong exact type")
+        if self.kind is MutationKind.ADDED and (self.base_object_id is not None or self.candidate_object_id is None):
+            raise ValueError("added mutation has inconsistent objects")
+        if self.kind is MutationKind.DELETED and (self.base_object_id is None or self.candidate_object_id is not None):
+            raise ValueError("deleted mutation has inconsistent objects")
+        if self.kind is MutationKind.MODIFIED and (self.base_object_id is None or self.candidate_object_id is None):
+            raise ValueError("modified mutation requires both objects")
+
+
+@dataclass(frozen=True, slots=True)
+class MutationInventory:
+    inventory_id: MutationInventoryId
+    mutations: tuple[MutationFact, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.inventory_id) is not MutationInventoryId or type(self.mutations) is not tuple:
+            raise TypeError("inventory has wrong exact type")
+        if any(type(item) is not MutationFact for item in self.mutations):
+            raise TypeError("inventory item has wrong exact type")
+        paths = tuple(item.path.value for item in self.mutations)
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("inventory paths must be unique and canonical-order sorted")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMaterialization:
+    materialization_id: CandidateMaterializationId
+    candidate_id: CandidateId
+    base: GitSha
+    commit: GitSha
+    parent_commits: tuple[GitSha, ...]
+    inventory: MutationInventory
+    candidate_branch: CanonicalBranchRef
+
+    def __post_init__(self) -> None:
+        exact = ((self.materialization_id, CandidateMaterializationId), (self.candidate_id, CandidateId),
+                 (self.base, GitSha), (self.commit, GitSha), (self.inventory, MutationInventory),
+                 (self.candidate_branch, CanonicalBranchRef))
+        if any(type(v) is not t for v, t in exact) or type(self.parent_commits) is not tuple:
+            raise TypeError("materialization field has wrong exact type")
+        if self.parent_commits != (self.base,):
+            raise ValueError("initial candidate commit must have exactly the base parent")
+        expected = f"refs/heads/autodev/candidates/{self.materialization_id.value}"
+        if self.candidate_branch.value != expected:
+            raise ValueError("candidate branch is not derived from materialization identity")
+
+
+def _tree(entries: tuple[GitTreeEntry, ...]) -> dict[str, tuple[GitSha, GitBlobMode]]:
+    if type(entries) is not tuple:
+        raise TypeError("tree entries must be exactly tuple")
+    result: dict[str, tuple[GitSha, GitBlobMode]] = {}
+    for entry in entries:
+        if type(entry) is not GitTreeEntry:
+            raise TypeError("tree entry has wrong exact type")
+        if entry.object_kind is not GitObjectKind.BLOB or entry.mode not in ("100644", "100755"):
+            raise ValueError("unsupported tree entry kind or mode")
+        if entry.path.value in result:
+            raise ValueError("duplicate tree path")
+        result[entry.path.value] = (entry.object_id, GitBlobMode(entry.mode))
+    return result
+
+
+def derive_mutation_inventory(
+    base_tree: tuple[GitTreeEntry, ...], candidate_tree: tuple[GitTreeEntry, ...]
+) -> MutationInventory:
+    """Derive per-path facts; rename-like changes remain a deletion plus an addition."""
+    before, after = _tree(base_tree), _tree(candidate_tree)
+    facts: list[MutationFact] = []
+    for path in sorted(before.keys() | after.keys()):
+        old, new = before.get(path), after.get(path)
+        if old == new:
+            continue
+        if old is None:
+            facts.append(MutationFact(CanonicalGitPath(path), MutationKind.ADDED, None, new[0], None, new[1]))
+        elif new is None:
+            facts.append(MutationFact(CanonicalGitPath(path), MutationKind.DELETED, old[0], None, old[1], None))
+        else:
+            facts.append(MutationFact(CanonicalGitPath(path), MutationKind.MODIFIED, old[0], new[0], old[1], new[1]))
+    payload = [[f.path.value, f.kind.value,
+                None if f.base_object_id is None else f.base_object_id.value,
+                None if f.candidate_object_id is None else f.candidate_object_id.value,
+                None if f.base_mode is None else f.base_mode.value,
+                None if f.candidate_mode is None else f.candidate_mode.value] for f in facts]
+    digest = hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    return MutationInventory(MutationInventoryId(digest), tuple(facts))
+
+
+def build_candidate_materialization(
+    candidate_id: CandidateId, base: GitSha, commit: GitSha,
+    parent_commits: tuple[GitSha, ...], base_tree: tuple[GitTreeEntry, ...],
+    candidate_tree: tuple[GitTreeEntry, ...],
+) -> CandidateMaterialization:
+    inventory = derive_mutation_inventory(base_tree, candidate_tree)
+    payload = [candidate_id.value, base.value, commit.value, inventory.inventory_id.value]
+    identity = CandidateMaterializationId(
+        hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+    )
+    branch = CanonicalBranchRef(f"refs/heads/autodev/candidates/{identity.value}")
+    return CandidateMaterialization(identity, candidate_id, base, commit, parent_commits, inventory, branch)
+
+
+def mutation_inventory_scope(inventory: MutationInventory) -> MutationScope:
+    if type(inventory) is not MutationInventory:
+        raise TypeError("exact MutationInventory required")
+    rules: list[MutationScopeRule] = []
+    for fact in inventory.mutations:
+        if fact.kind is MutationKind.ADDED:
+            changes = (ChangeType.ADD,)
+        elif fact.kind is MutationKind.DELETED:
+            changes = (ChangeType.DELETE,)
+        else:
+            values: list[ChangeType] = []
+            if fact.base_object_id != fact.candidate_object_id:
+                values.append(ChangeType.MODIFY)
+            if fact.base_mode != fact.candidate_mode:
+                values.append(ChangeType.MODE_CHANGE)
+            changes = tuple(values)
+        rules.append(MutationScopeRule(ExactPathSelector(fact.path), changes))
+    return MutationScope(tuple(rules))
+
+
+def inventory_is_authorized(inventory: MutationInventory, authorized: MutationScope,
+                            forbidden_root: MutationScope) -> bool:
+    actual = mutation_inventory_scope(inventory)
+    return scope_contains(authorized, actual) and not scopes_overlap(actual, forbidden_root)
+
+
+def create_materialized_candidate_record(
+    *, materialization: CandidateMaterialization, task_id: TaskId,
+    contract_id: ContractId, contract_raw_sha256: RawSha256,
+    authorization_id: AuthorizationId, admission_event_id: AdmissionEventId,
+    target_registration_id: TargetRegistrationId,
+    policy_epoch_identity: PolicyEpochIdentity,
+    parent_candidate_ids: tuple[CandidateId, ...] = (),
+    creation_operation_id: OperationId | None = None,
+):
+    """Create the first CandidateRecord only after exact materialization exists."""
+    if type(materialization) is not CandidateMaterialization:
+        raise TypeError("exact verified CandidateMaterialization required")
+    from .state import CandidateRecord
+    return CandidateRecord(
+        materialization.candidate_id, task_id, materialization.base, contract_id,
+        contract_raw_sha256, authorization_id, admission_event_id,
+        target_registration_id, policy_epoch_identity, materialization.materialization_id,
+        parent_candidate_ids, creation_operation_id,
+    )

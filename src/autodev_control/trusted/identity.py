@@ -59,3 +59,35 @@ class RawSha256:
 
     def __post_init__(self) -> None:
         _lower_hex(self.value, (64,))
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMaterializationId:
+    value: str
+
+    def __post_init__(self) -> None:
+        _lower_hex(self.value, (64,))
+
+
+@dataclass(frozen=True, slots=True)
+class MutationInventoryId:
+    value: str
+
+    def __post_init__(self) -> None:
+        _lower_hex(self.value, (64,))
+
+
+@dataclass(frozen=True, slots=True)
+class OperationStartBindingId:
+    value: str
+
+    def __post_init__(self) -> None:
+        _lower_hex(self.value, (64,))
+
+
+@dataclass(frozen=True, slots=True)
+class RootContextId:
+    value: str
+
+    def __post_init__(self) -> None:
+        _unicode_string(self.value, 512)
