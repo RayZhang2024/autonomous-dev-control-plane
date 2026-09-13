@@ -1391,36 +1391,83 @@ class CanonicalStoredObject:
 def validate_canonical_root(
     manifest: CanonicalStateRootManifest,
     objects: tuple[CanonicalStoredObject, ...],
+    resolved_targets: tuple[ResolvedTargetRegistration, ...] = (),
 ) -> bool:
+    decoded = _decode_canonical_root_objects(manifest, objects)
+    if decoded is None:
+        return False
+    try:
+        validator = InMemoryCanonicalStateBackend(resolved_targets)
+        state = _State(
+            {record.authorization_id: record for record in decoded[CanonicalRecordKind.AUTHORIZATION]},
+            {record.task_id: record for record in decoded[CanonicalRecordKind.TASK]},
+            {record.candidate_id: record for record in decoded[CanonicalRecordKind.CANDIDATE]},
+            {record.intent.operation_id: record for record in decoded[CanonicalRecordKind.OPERATION]},
+            {record.task_id: record for record in decoded[CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP]},
+            {record.operation_id: record for record in decoded[CanonicalRecordKind.REVIEW_ATTEMPT_BINDING]},
+            {record.evidence_id: record for record in decoded[CanonicalRecordKind.EVIDENCE]},
+            {record.effective_subject.subject_id: record for record in decoded[CanonicalRecordKind.EVIDENCE_HISTORY]},
+            {_supersession_key(record): record for record in decoded[CanonicalRecordKind.SUPERSESSION]},
+        )
+        if any(len(namespace) != len(decoded[kind]) for namespace, kind in zip(
+            (
+                state.authorizations, state.tasks, state.candidates, state.operations,
+                state.memberships, state.attempts, state.evidence, state.histories,
+                state.supersessions,
+            ),
+            CanonicalRecordKind,
+        )):
+            return False
+        return validator._valid_graph(state)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def validate_canonical_root_object_integrity(
+    manifest: CanonicalStateRootManifest,
+    objects: tuple[CanonicalStoredObject, ...],
+) -> bool:
+    """Validate claimed object bytes only; this is not canonical-root proof."""
+    return _decode_canonical_root_objects(manifest, objects) is not None
+
+
+def _decode_canonical_root_objects(
+    manifest: CanonicalStateRootManifest,
+    objects: tuple[CanonicalStoredObject, ...],
+) -> dict[CanonicalRecordKind, tuple[object, ...]] | None:
     if type(manifest) is not CanonicalStateRootManifest:
         raise TypeError("exact CanonicalStateRootManifest required")
     _exact_tuple(objects, CanonicalStoredObject, "objects", unique=False)
     by_ref = {item.object_ref: item for item in objects}
     if len(by_ref) != len(objects):
-        return False
+        return None
     claimed = tuple(entry.object_ref for index in manifest.indexes for entry in index)
     if len(set(claimed)) != len(claimed):
-        return False
+        return None
+    decoded_by_kind: dict[CanonicalRecordKind, list[object]] = {
+        kind: [] for kind in CanonicalRecordKind
+    }
     for entry in (entry for index in manifest.indexes for entry in index):
         reference = entry.object_ref
         stored = by_ref.get(reference)
         if stored is None:
-            return False
+            return None
         decoded = _decode_canonical_record(stored.canonical_bytes)
         if decoded is None:
-            return False
+            return None
         record_kind, schema_version, record = decoded
         if record_kind is not reference.record_kind or schema_version != reference.schema_version:
-            return False
+            return None
         try:
             if entry.logical_identity != _logical_identity(record_kind, record, schema_version):
-                return False
+                return None
         except (KeyError, TypeError, ValueError):
-            return False
+            return None
         digest = RawSha256(hashlib.sha256(stored.canonical_bytes).hexdigest())
         if digest != reference.object_digest:
-            return False
-    return True
+            return None
+        decoded_by_kind[record_kind].append(record)
+    return {kind: tuple(records) for kind, records in decoded_by_kind.items()}
 
 
 def _decode_canonical_record(raw: bytes) -> tuple[CanonicalRecordKind, str, object] | None:

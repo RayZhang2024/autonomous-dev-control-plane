@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 import hashlib
 import json
 
@@ -76,21 +76,24 @@ def admitted_authorization(*, epoch=EPOCH, task_id=TASK):
     )
 
 
-def backend():
+def resolved_target():
     registration = mint(
         AdmittedTargetRegistration,
         target_registration_id=TARGET,
         repository_id=REPOSITORY,
         policy_epoch_identity=EPOCH,
     )
-    resolved = mint(
+    return mint(
         ResolvedTargetRegistration,
         registration=registration,
         target_registration_id=TARGET,
         root_config_id=ImmutableConfigId("root-target-config"),
         policy_epoch_identity=EPOCH,
     )
-    return InMemoryCanonicalStateBackend((resolved,))
+
+
+def backend():
+    return InMemoryCanonicalStateBackend((resolved_target(),))
 
 
 def task(*, epoch=EPOCH):
@@ -472,6 +475,17 @@ def test_coherent_working_set_is_immutable_and_contains_complete_membership():
     assert not hasattr(store, "force_write") and not hasattr(store, "put_any_record")
 
 
+def canonical_root_for(*typed_records):
+    grouped = {kind: [] for kind in CanonicalRecordKind}
+    stored = []
+    for kind, record in typed_records:
+        reference = canonical_object_ref(kind, record)
+        grouped[kind].append(CanonicalIndexEntry(canonical_logical_identity(kind, record), reference))
+        stored.append(CanonicalStoredObject(reference, canonical_record_bytes(kind, record)))
+    indexes = tuple(tuple(sorted(grouped[kind], key=lambda item: item.logical_identity)) for kind in CanonicalRecordKind)
+    return CanonicalStateRootManifest("1", None, *indexes), tuple(stored)
+
+
 def test_root_digest_indexes_and_unrelated_staging_objects():
     payload = task()
     with pytest.raises(TypeError):
@@ -485,7 +499,8 @@ def test_root_digest_indexes_and_unrelated_staging_objects():
     extra_payload = replace(payload, task_id=TaskId("staging"))
     extra_ref = canonical_object_ref(CanonicalRecordKind.TASK, extra_payload)
     extra = CanonicalStoredObject(extra_ref, canonical_record_bytes(CanonicalRecordKind.TASK, extra_payload))
-    assert validate_canonical_root(manifest, (stored, extra))
+    assert validate_canonical_root_object_integrity(manifest, (stored, extra))
+    assert not validate_canonical_root(manifest, (stored, extra), (resolved_target(),))
     assert not validate_canonical_root(manifest, ())
     corrupt = CanonicalStoredObject(reference, b"different")
     assert not validate_canonical_root(manifest, (corrupt,))
@@ -571,7 +586,205 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind()
         reference = canonical_object_ref(kind, record)
         indexes.append((CanonicalIndexEntry(canonical_logical_identity(kind, record), reference),))
         stored.append(CanonicalStoredObject(reference, canonical_record_bytes(kind, record)))
-    assert validate_canonical_root(CanonicalStateRootManifest("1", None, *indexes), tuple(stored))
+    manifest = CanonicalStateRootManifest("1", None, *indexes)
+    assert validate_canonical_root_object_integrity(manifest, tuple(stored))
+    assert not validate_canonical_root(manifest, tuple(stored), (resolved_target(),))
+
+
+def test_complete_coherent_reconstructed_root_passes_graph_closure():
+    membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), ())
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, admitted_authorization()),
+        (CanonicalRecordKind.TASK, task()),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
+    )
+    assert not validate_canonical_root(manifest, objects)
+    assert validate_canonical_root(manifest, objects, (resolved_target(),))
+
+
+def test_root_rejects_dangling_task_candidate_and_operation_references():
+    authorization = admitted_authorization()
+    base_task = task()
+    empty_membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), ())
+
+    def rejected(*records):
+        manifest, objects = canonical_root_for(*records)
+        assert validate_canonical_root_object_integrity(manifest, objects)
+        assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    rejected(
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, replace(
+            base_task, revision=2, state=TaskState.EVALUATING,
+            current_candidate_id=CandidateId("missing"),
+        )),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, replace(
+            base_task, revision=2, state=TaskState.INTEGRATION_READY,
+            next_integration_operation_id=OperationId("missing"),
+        )),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    parent_missing = CandidateRecord(
+        CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
+        (CandidateId("missing-parent"),),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.CANDIDATE, parent_missing),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    creation_missing = CandidateRecord(
+        CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
+        (), OperationId("missing-creation"),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.CANDIDATE, creation_missing),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    evidence_missing = operation(evidence=(EvidenceId("missing-evidence"),))
+    evidence_membership = TaskOperationMembershipRecord(
+        TASK, 1, OperationMembershipBindingId("membership"), (evidence_missing.intent.operation_id,),
+    )
+    rejected(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.OPERATION, evidence_missing),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, evidence_membership),
+    )
+
+
+def test_root_rejects_incomplete_operation_membership_and_review_binding_closure():
+    authorization, base_task, op = admitted_authorization(), task(), operation()
+    empty_membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("empty"), ())
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.OPERATION, op),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    wrong_task_intent = mint(
+        type(op.intent),
+        **{
+            field.name: TaskId("other-task") if field.name == "task_id" else getattr(op.intent, field.name)
+            for field in fields(op.intent)
+        },
+    )
+    wrong_task_operation = OperationRecord(wrong_task_intent, 1, OperationState.RESERVED)
+    wrong_membership = TaskOperationMembershipRecord(
+        TASK, 1, OperationMembershipBindingId("wrong"), (wrong_task_operation.intent.operation_id,),
+    )
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.OPERATION, wrong_task_operation),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, wrong_membership),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    binding = ReviewAttemptBindingRecord(
+        effective_subject(), ReviewInvocationId("invocation"), ReviewSlotId("slot"),
+        OperationId("missing-operation"), CanonicalRequestId("request"),
+    )
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+        (CanonicalRecordKind.REVIEW_ATTEMPT_BINDING, binding),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    membership = TaskOperationMembershipRecord(
+        TASK, 1, OperationMembershipBindingId("operation"), (op.intent.operation_id,),
+    )
+    mismatched_binding = replace(binding, operation_id=op.intent.operation_id)
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.OPERATION, op),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
+        (CanonicalRecordKind.REVIEW_ATTEMPT_BINDING, mismatched_binding),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+
+def test_root_rejects_incomplete_evidence_history_and_supersession_closure():
+    authorization, base_task = admitted_authorization(), task()
+    subject = effective_subject()
+    candidate = CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, ())
+    empty_membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("empty"), ())
+    history_with_missing = EvidenceHistoryMembershipRecord(
+        subject, 1, EvidenceHistoryMembershipBindingId("history"), (EvidenceId("missing"),),
+    )
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.CANDIDATE, candidate),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+        (CanonicalRecordKind.EVIDENCE_HISTORY, history_with_missing),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    admitted_evidence = evidence(subject)
+    review_operation = operation("review-operation", candidate_id=subject.candidate_id)
+    membership = TaskOperationMembershipRecord(
+        TASK, 1, OperationMembershipBindingId("review"), (review_operation.intent.operation_id,),
+    )
+    binding = ReviewAttemptBindingRecord(
+        subject, admitted_evidence.payload.invocation_id, admitted_evidence.payload.slot_id,
+        review_operation.intent.operation_id, admitted_evidence.payload.canonical_request_id,
+    )
+    empty_history = EvidenceHistoryMembershipRecord(
+        subject, 1, EvidenceHistoryMembershipBindingId("history"), (),
+    )
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.CANDIDATE, candidate),
+        (CanonicalRecordKind.OPERATION, review_operation),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
+        (CanonicalRecordKind.REVIEW_ATTEMPT_BINDING, binding),
+        (CanonicalRecordKind.EVIDENCE, admitted_evidence),
+        (CanonicalRecordKind.EVIDENCE_HISTORY, empty_history),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
+
+    earlier, later = EvidenceId("missing-earlier"), EvidenceId("missing-later")
+    supersession_authorization = mint(
+        TrustedSupersessionAuthorization,
+        decision_id=SupersessionDecisionId("decision"), subject_id=subject.subject_id,
+        policy_epoch_identity=EPOCH, earlier_evidence_id=earlier,
+        later_evidence_id=later, authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
+    )
+    supersession = mint(
+        EvidenceSupersessionRecord, earlier_evidence_id=earlier, later_evidence_id=later,
+        subject_id=subject.subject_id, policy_epoch_identity=EPOCH,
+        authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
+        decision_id=SupersessionDecisionId("decision"), authorization=supersession_authorization,
+    )
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.AUTHORIZATION, authorization),
+        (CanonicalRecordKind.TASK, base_task),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
+        (CanonicalRecordKind.SUPERSESSION, supersession),
+    )
+    assert not validate_canonical_root(manifest, objects, (resolved_target(),))
 
 
 @pytest.mark.parametrize("revision", [True, False, 1.0, "1", 0, -1])
