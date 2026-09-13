@@ -9,24 +9,68 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-from threading import RLock
 
-from .audit import FixtureGateAudit, GateAuditOutcome
+from .audit import (
+    AuditAppendStatus, FixtureGateAudit, GateAuditEventPreimage, GateAuditOutcome,
+    build_gate_audit_event,
+)
 from .backend import (
-    CanonicalTransaction, CanonicalWriteResult, CanonicalWriteStatus,
-    InMemoryCanonicalStateBackend, ReplaceOperation,
+    AuthorizationExistsAndMatches, CanonicalNamespace, CanonicalTransaction,
+    CanonicalWriteResult, CanonicalWriteStatus, CreateAuthorization, CreateCandidate,
+    CreateEvidenceAndAdvanceHistory, CreateOperationAndAdvanceMembership,
+    CreateTaskAndInitialOperationMembership, EvidenceHistoryMembershipEquals,
+    InMemoryCanonicalStateBackend, OperationRevisionEquals, RecordAbsent,
+    ReplaceOperation, ReplaceTask, TaskCancellationStatusEquals,
+    TaskCurrentCandidateEquals, TaskOperationMembershipEquals, TaskRevisionEquals,
+    canonical_json_bytes,
+)
+from .authorization import (
+    AdmittedAuthorization, AuthenticatedHumanAuthorizationApproval,
+    AuthorizationKind, AuthorizationPolicyContext, CandidateAuthorizationProposal,
+    ContractAuthorityCeiling, DirectIssuerAuthorityEnvelope,
+    OrdinaryRootProtectionContext, admit_delegated_authorization,
+    admit_direct_authorization,
+)
+from .evidence import (
+    EvidenceAdmissionDecision, SemanticEvidenceAdmissionRequest, admit_semantic_review,
 )
 from .errors import G4FailureCode
-from .fixture_platform import FixtureGitPlatform, ProtectedEffectMarker
-from .identity import GitRef, GitSha, ImmutableConfigId, OperationStartBindingId, RootContextId
-from .materialization import CandidateMaterialization, inventory_is_authorized
-from .operation import (
-    AuthoritativeStateBindingId, IntegrationBound, OperationId, OperationRecord,
-    OperationState, transition_operation,
+from .fixture_platform import (
+    ActiveFixtureRuntimeRegistry, CreatedCandidatePrEffectSubject,
+    FastForwardMergeEffectSubject, FixtureFenceToken, FixtureGitPlatform,
+    ProtectedEffectMarker, ProtectedEffectMarkerPreimage,
+    PublishedCandidateRefEffectSubject, build_protected_effect_marker,
 )
-from .scope import CanonicalBranchRef, GitHubRepositoryId, MutationScope, ServicePrincipalId
+from .identity import (
+    GitRef, GitSha, ImmutableConfigId, OperationStartBindingId,
+    PreparedProtectedStartId, RawSha256, RootContextId,
+)
+from .materialization import (
+    CandidateMaterialization, create_materialized_candidate_record,
+    inventory_is_authorized,
+)
+from .operation import (
+    AuthoritativeStateBindingId, IntegrationBound, NotIntegrationBound,
+    OperationId, OperationIntent,
+    OperationRecord, OperationState, ReconciliationFinding,
+    TrustedReconciliationFinding,
+    reconcile_operation as decide_reconciliation, transition_operation,
+)
+from .scope import (
+    AuthorizationId, CanonicalBranchRef, ContractId, GitHubRepositoryId,
+    MutationScope, ServicePrincipalId, TargetRegistrationId, TaskId,
+)
+from .state import (
+    CandidateApplicabilityDetermination, CancellationRequestId, CancellationStatus,
+    EvidenceBindingRef, OperationRevisionBinding, RepairBudget, TaskEvaluationInput,
+    adopt_candidate, evaluate_task, initial_task_proposal, reserve_task_operation,
+    revise_supporting_evidence, set_cancellation, start_operation as decide_start_operation,
+)
+from .manifest import PolicyEpochIdentity
+from .operation import AdmissionEventId, CandidateId, DecisionEventId
 from .state_reader import (
-    AuthoritativeObservationProfile, AuthoritativeStateReadStatus, GitHubStateReader,
+    AuthoritativeObservationProfile, AuthoritativeStateReadStatus, GitHubPullRequestNumber,
+    GitHubStateReader,
 )
 from .target_registration import AdmittedTargetRegistration
 
@@ -190,15 +234,24 @@ class _OneUse:
 
 
 class ControlStateCommitLease(_OneUse):
-    __slots__ = ("root_context_id", "runtime_generation", "runtime_binding", "dependencies", "capability")
+    __slots__ = ("root_context_id", "runtime_generation", "runtime_binding", "dependencies", "capability", "fence_token")
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("control-state leases are minted only by the active gate")
 
 
 class PreparedStartCommitLease(_OneUse):
-    __slots__ = ("control_lease", "action_target_fence", "prepared_start", "target_capability", "runtime_binding", "authorized_scope", "root_forbidden_scope")
+    __slots__ = ("control_lease", "action_target_fence", "prepared_start", "target_capability", "runtime_binding", "authorized_scope", "root_forbidden_scope", "target_fence_token")
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("prepared-start leases are minted only by the active gate")
 
 
 class LiveProtectedEffectContinuation(_OneUse):
-    __slots__ = ("operation_id", "idempotency_key", "action_id", "start_binding_id", "subject", "action_target_fence", "integration_binding", "authorized_scope", "root_forbidden_scope", "dependencies")
+    __slots__ = ("operation_id", "idempotency_key", "action_id", "intent", "start_binding_id", "prepared_start_id", "subject", "action_target_fence", "integration_binding", "authorized_scope", "root_forbidden_scope", "dependencies", "target_fence_token")
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("effect continuations are minted only by a freshly audited start")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +260,8 @@ class ActionTargetFence:
     ref: CanonicalBranchRef
     expected_sha: GitSha | None
     platform_generation: int
+    base_ref: CanonicalBranchRef | None = None
+    base_expected_sha: GitSha | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository_id) is not GitHubRepositoryId or type(self.ref) is not CanonicalBranchRef:
@@ -215,10 +270,29 @@ class ActionTargetFence:
             raise TypeError("expected_sha must be exact GitSha or None")
         if type(self.platform_generation) is not int or self.platform_generation < 1:
             raise ValueError("platform generation must be positive")
+        if (self.base_ref is None) != (self.base_expected_sha is None):
+            raise ValueError("secondary base ref and SHA must be present together")
+        if self.base_ref is not None and (
+            type(self.base_ref) is not CanonicalBranchRef
+            or type(self.base_expected_sha) is not GitSha
+        ):
+            raise TypeError("secondary base fence has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProtectedStartPreimage:
+    format: str
+    operation_id: OperationId
+    action: ProtectedEffectSubject
+    target_fence: ActionTargetFence
+    root_context_id: RootContextId
+    runtime_generation: FixtureRuntimeGeneration
+    service_identity: ServicePrincipalId
+    dependencies: ControlStateAuthoritativeDependencySet
 
 
 class PreparedProtectedStart:
-    __slots__ = ("operation", "subject", "fence", "_state", "_owner", "_nonce")
+    __slots__ = ("prepared_start_id", "operation", "subject", "fence", "_state", "_owner", "_nonce")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("prepared protected starts are gate-private")
@@ -243,48 +317,14 @@ class PreparedProtectedStart:
         raise TypeError("prepared gate state cannot be serialized")
 
 
-@dataclass(frozen=True, slots=True)
-class PublishedCandidateRefEffectSubject:
-    materialization_id: object
-    destination: CanonicalBranchRef
-
-    def __post_init__(self) -> None:
-        from .identity import CandidateMaterializationId
-        if type(self.materialization_id) is not CandidateMaterializationId or type(self.destination) is not CanonicalBranchRef:
-            raise TypeError("published-ref subject has wrong exact type")
-
-
-@dataclass(frozen=True, slots=True)
-class CreatedCandidatePrEffectSubject:
-    published_candidate_ref_operation_id: OperationId
-    destination: CanonicalBranchRef
-
-    def __post_init__(self) -> None:
-        if type(self.published_candidate_ref_operation_id) is not OperationId or type(self.destination) is not CanonicalBranchRef:
-            raise TypeError("created-PR subject has wrong exact type")
-
-
-@dataclass(frozen=True, slots=True)
-class FastForwardMergeEffectSubject:
-    created_candidate_pr_operation_id: OperationId
-    integration_ref: CanonicalBranchRef
-
-    def __post_init__(self) -> None:
-        if type(self.created_candidate_pr_operation_id) is not OperationId or type(self.integration_ref) is not CanonicalBranchRef:
-            raise TypeError("merge subject has wrong exact type")
-
-
+@dataclass(frozen=True, slots=True, init=False)
 class ControlStateCommitRequest:
-    __slots__ = ("command_kind", "transaction", "_key")
+    command_kind: TrustedControlCommandKind
+    transaction: CanonicalTransaction
+    _key: object
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("commit requests are emitted only by DeterministicTrustedController")
-
-
-def _request(kind: TrustedControlCommandKind, transaction: CanonicalTransaction, key: object) -> ControlStateCommitRequest:
-    value = object.__new__(ControlStateCommitRequest)
-    value.command_kind, value.transaction, value._key = kind, transaction, key
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,61 +348,511 @@ class GateResult:
 class DeterministicTrustedController:
     """Closed command-to-proposal boundary; caller G4 objects are never accepted."""
 
-    __slots__ = ("_key",)
+    __slots__ = ("_key", "_backend")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("trusted controller is installed only by the active gate runtime")
 
-    def _prepare_commit(self, command_kind: TrustedControlCommandKind,
-                        transaction: CanonicalTransaction) -> ControlStateCommitRequest:
-        if type(command_kind) is not TrustedControlCommandKind or type(transaction) is not CanonicalTransaction:
-            raise TypeError("exact closed command and canonical transaction required")
-        return _request(command_kind, transaction, self._key)
+    def admit_authorization(
+        self, proposal: CandidateAuthorizationProposal,
+        target: AdmittedTargetRegistration | None,
+        contract: ContractAuthorityCeiling | None,
+        policy: AuthorizationPolicyContext | None,
+        root: OrdinaryRootProtectionContext | None,
+        *, approval: AuthenticatedHumanAuthorizationApproval | None = None,
+        issuer: DirectIssuerAuthorityEnvelope | None = None,
+    ) -> ControlStateCommitRequest:
+        if type(proposal) is not CandidateAuthorizationProposal:
+            raise TypeError("exact candidate authorization proposal required")
+        resolved = self._backend.read_resolved_target_registration(
+            proposal.target_registration_id
+        )
+        if resolved is None or resolved.registration != target:
+            raise ValueError("target registration is not the exact root-resolved value")
+        if proposal.kind is AuthorizationKind.DIRECT_HUMAN:
+            result = admit_direct_authorization(
+                proposal, target, contract, policy, approval, issuer, root
+            )
+        else:
+            parent = (
+                None if proposal.parent_authorization_id is None
+                else self._backend.read_authorization(proposal.parent_authorization_id)
+            )
+            result = admit_delegated_authorization(
+                proposal, target, contract, policy, parent, root
+            )
+        if result.admitted_authorization is None:
+            raise ValueError(result.reason_code.value)
+        admitted = result.admitted_authorization
+        transaction = CanonicalTransaction(
+            self._backend.occurrence,
+            (RecordAbsent(CanonicalNamespace.AUTHORIZATION, admitted.authorization_id),),
+            (CreateAuthorization(admitted),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.ADMIT_AUTHORIZATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
 
+    def create_task(
+        self, *, task_id: TaskId, contract_id: ContractId,
+        contract_raw_sha256: RawSha256, authorization_id: AuthorizationId,
+        admission_event_id: AdmissionEventId,
+        target_registration_id: TargetRegistrationId,
+        policy_epoch_identity: PolicyEpochIdentity, repair_budget: RepairBudget,
+    ) -> ControlStateCommitRequest:
+        proposal = initial_task_proposal(
+            task_id=task_id, contract_id=contract_id,
+            contract_raw_sha256=contract_raw_sha256,
+            authorization_id=authorization_id, admission_event_id=admission_event_id,
+            target_registration_id=target_registration_id,
+            policy_epoch_identity=policy_epoch_identity, repair_budget=repair_budget,
+        )
+        working = self._backend.read_authorization(authorization_id)
+        if working is None:
+            raise ValueError("authorization is not canonical")
+        transaction = CanonicalTransaction(
+            self._backend.occurrence,
+            (
+                AuthorizationExistsAndMatches(working),
+                RecordAbsent(CanonicalNamespace.TASK, task_id),
+            ),
+            (CreateTaskAndInitialOperationMembership(proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.CREATE_TASK)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
 
-def _new_controller(key: object) -> DeterministicTrustedController:
+    def create_candidate_and_adopt(
+        self, *, task_id: TaskId, materialization: CandidateMaterialization,
+        admission_event_id: AdmissionEventId,
+        decision_event_id: DecisionEventId,
+        parent_candidate_ids: tuple[CandidateId, ...] = (),
+        creation_operation_id: OperationId | None = None,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        task = current.task
+        candidate = create_materialized_candidate_record(
+            materialization=materialization, task_id=task.task_id,
+            contract_id=task.contract_id,
+            contract_raw_sha256=task.contract_raw_sha256,
+            authorization_id=task.authorization_id,
+            admission_event_id=admission_event_id,
+            target_registration_id=task.target_registration_id,
+            policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+            parent_candidate_ids=parent_candidate_ids,
+            creation_operation_id=creation_operation_id,
+        )
+        if type(decision_event_id) is not DecisionEventId:
+            raise TypeError("exact decision event identity required")
+        determination = object.__new__(CandidateApplicabilityDetermination)
+        for name, value in (
+            ("decision_event_id", decision_event_id),
+            ("candidate_id", candidate.candidate_id), ("task_id", task.task_id),
+            ("expected_task_revision", task.revision),
+            ("contract_id", task.contract_id),
+            ("contract_raw_sha256", task.contract_raw_sha256),
+            ("authorization_id", task.authorization_id),
+            ("admission_event_id", task.admission_event_id),
+            ("target_registration_id", task.target_registration_id),
+            ("policy_epoch_identity", task.last_evaluated_policy_epoch_identity),
+        ):
+            object.__setattr__(determination, name, value)
+        result = adopt_candidate(
+            task, candidate, determination, expected_task_revision=task.revision,
+            snapshot=current.task_operation_snapshot(),
+            expected_membership_binding_id=current.task_operation_membership.membership_binding_id,
+            expected_operation_revisions=tuple(
+                OperationRevisionBinding(item.intent.operation_id, item.revision)
+                for item in current.operations
+                if item.intent.candidate_id == task.current_candidate_id
+            ),
+        )
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (
+                TaskRevisionEquals(task.task_id, task.revision),
+                TaskOperationMembershipEquals(
+                    task.task_id, current.task_operation_membership.membership_binding_id
+                ),
+                RecordAbsent(CanonicalNamespace.CANDIDATE, candidate.candidate_id),
+            ),
+            (CreateCandidate(candidate), ReplaceTask(task.revision, result.proposal.proposed)),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.CREATE_CANDIDATE)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def revise_supporting_evidence(
+        self, task_id: TaskId, refs: tuple[EvidenceBindingRef, ...]
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        result = revise_supporting_evidence(
+            current.task, refs, expected_task_revision=current.task.revision
+        )
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (TaskRevisionEquals(task_id, current.task.revision),),
+            (ReplaceTask(current.task.revision, result.proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.REVISE_SUPPORTING_EVIDENCE)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def reserve_operation(self, task_id: TaskId,
+                          intent: OperationIntent) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        result = reserve_task_operation(
+            current.task, intent, current.task_operation_snapshot(),
+            expected_task_revision=current.task.revision,
+            expected_membership_binding_id=current.task_operation_membership.membership_binding_id,
+        )
+        proposal = result.operation_create_proposal
+        if proposal is None:
+            raise ValueError("operation reservation was not a fresh proposal")
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (
+                TaskRevisionEquals(task_id, current.task.revision),
+                TaskOperationMembershipEquals(
+                    task_id, current.task_operation_membership.membership_binding_id
+                ),
+                RecordAbsent(CanonicalNamespace.OPERATION, intent.operation_id),
+            ),
+            (CreateOperationAndAdvanceMembership(
+                proposal.proposed, proposal.expected_task_revision,
+                proposal.expected_membership_binding_id,
+            ),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.RESERVE_OPERATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def start_operation(self, task_id: TaskId, operation_id: OperationId,
+                        prepared_start_id: PreparedProtectedStartId) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        operation = next(
+            (item for item in current.operations if item.intent.operation_id == operation_id), None
+        )
+        if operation is None:
+            raise ValueError("operation is not canonical")
+        result = decide_start_operation(
+            current.task, operation, expected_task_revision=current.task.revision,
+            expected_operation_revision=operation.revision,
+            expected_cancellation_status=current.task.cancellation_status,
+            operation_start_binding_id=operation_start_binding_id(prepared_start_id),
+        )
+        proposal = result.operation_start_proposal
+        if proposal is None:
+            raise ValueError(result.failure.code.value)
+        conditions = (
+            TaskRevisionEquals(task_id, current.task.revision),
+            OperationRevisionEquals(operation_id, operation.revision),
+            TaskCancellationStatusEquals(task_id, current.task.cancellation_status),
+            TaskCurrentCandidateEquals(task_id, current.task.current_candidate_id),
+        )
+        mutations = (ReplaceOperation(operation.revision, proposal.proposed_operation),)
+        if proposal.proposed_task is not None:
+            mutations = (ReplaceTask(current.task.revision, proposal.proposed_task), *mutations)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding, conditions, mutations
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.START_OPERATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def _decide_reconciliation(
+        self, task_id: TaskId, operation_id: OperationId,
+        finding: TrustedReconciliationFinding,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        operation = next(
+            (item for item in current.operations if item.intent.operation_id == operation_id), None
+        )
+        if operation is None:
+            raise ValueError("operation is not canonical")
+        result = decide_reconciliation(operation, operation.revision, finding)
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (OperationRevisionEquals(operation_id, operation.revision),),
+            (ReplaceOperation(operation.revision, result.proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.RECONCILE_OPERATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def _transition_unstarted_conflict(
+        self, task_id: TaskId, operation_id: OperationId,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        operation = next(
+            (item for item in current.operations if item.intent.operation_id == operation_id), None
+        )
+        if operation is None:
+            raise ValueError("operation is not canonical")
+        result = transition_operation(
+            operation, operation.revision, OperationState.CONFLICT,
+            reason_code=G4FailureCode.ACTION_PRECONDITION_CONFLICT,
+        )
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (OperationRevisionEquals(operation_id, operation.revision),),
+            (ReplaceOperation(operation.revision, result.proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.START_OPERATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def _transition_started_failed(
+        self, task_id: TaskId, operation_id: OperationId,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        operation = next(
+            (item for item in current.operations if item.intent.operation_id == operation_id), None
+        )
+        if operation is None:
+            raise ValueError("operation is not canonical")
+        result = transition_operation(operation, operation.revision, OperationState.FAILED)
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (OperationRevisionEquals(operation_id, operation.revision),),
+            (ReplaceOperation(operation.revision, result.proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.RECONCILE_OPERATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def evaluate_task(self, task_id: TaskId,
+                      evaluation: TaskEvaluationInput) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        result = evaluate_task(current.task, evaluation)
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        proposal = result.proposal
+        conditions = [TaskRevisionEquals(task_id, current.task.revision)]
+        if proposal.expected_membership_binding_id is not None:
+            conditions.append(TaskOperationMembershipEquals(
+                task_id, proposal.expected_membership_binding_id
+            ))
+        conditions.extend(OperationRevisionEquals(item.operation_id, item.revision)
+                          for item in proposal.expected_operation_revisions)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding, tuple(conditions),
+            (ReplaceTask(current.task.revision, proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.EVALUATE_TASK)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def set_cancellation(
+        self, task_id: TaskId, status: CancellationStatus,
+        request_id: CancellationRequestId | None,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        bindings = tuple(
+            OperationRevisionBinding(item.intent.operation_id, item.revision)
+            for item in current.operations
+            if item.state in (
+                OperationState.RESERVED, OperationState.PERFORMING,
+                OperationState.INDETERMINATE,
+            )
+        )
+        result = set_cancellation(
+            current.task, status, request_id,
+            expected_task_revision=current.task.revision,
+            snapshot=current.task_operation_snapshot(),
+            expected_membership_binding_id=current.task_operation_membership.membership_binding_id,
+            expected_operation_revisions=bindings,
+        )
+        if result.proposal is None:
+            raise ValueError(result.failure.code.value)
+        proposal = result.proposal
+        conditions = [TaskRevisionEquals(task_id, current.task.revision)]
+        if proposal.expected_membership_binding_id is not None:
+            conditions.append(TaskOperationMembershipEquals(
+                task_id, proposal.expected_membership_binding_id
+            ))
+        conditions.extend(OperationRevisionEquals(item.operation_id, item.revision)
+                          for item in proposal.expected_operation_revisions)
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding, tuple(conditions),
+            (ReplaceTask(current.task.revision, proposal.proposed),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.SET_CANCELLATION)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def admit_semantic_evidence(
+        self, request: SemanticEvidenceAdmissionRequest,
+    ) -> ControlStateCommitRequest:
+        result = admit_semantic_review(request)
+        if (result.decision is not EvidenceAdmissionDecision.ADMIT
+                or result.proposed_evidence_record is None
+                or result.expected_evidence_history_membership_binding is None):
+            raise ValueError(result.reason_code.value)
+        subject = request.effective_subject
+        snapshot = self._backend.read_review_eligibility_snapshot(subject.subject_id)
+        if snapshot is None or snapshot.evidence_history_membership.membership_binding_id != result.expected_evidence_history_membership_binding:
+            raise ValueError("canonical evidence history changed")
+        transaction = CanonicalTransaction(
+            snapshot.canonical_state_occurrence_binding,
+            (EvidenceHistoryMembershipEquals(
+                subject.subject_id, result.expected_evidence_history_membership_binding
+            ),),
+            (CreateEvidenceAndAdvanceHistory(
+                subject, result.expected_evidence_history_membership_binding,
+                result.proposed_evidence_record,
+            ),),
+        )
+        response = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(response, "command_kind", TrustedControlCommandKind.ADMIT_SEMANTIC_EVIDENCE)
+        object.__setattr__(response, "transaction", transaction)
+        object.__setattr__(response, "_key", self._key)
+        return response
+
+def _new_controller(key: object, backend: InMemoryCanonicalStateBackend) -> DeterministicTrustedController:
     value = object.__new__(DeterministicTrustedController)
-    value._key = key
+    value._key, value._backend = key, backend
     return value
 
 
 class TrustedControlCommandBoundary:
-    __slots__ = ("_controller",)
+    __slots__ = ("_controller", "_runtime")
 
-    def __init__(self, controller: DeterministicTrustedController) -> None:
+    def __init__(self, controller: DeterministicTrustedController,
+                 runtime: "FixtureProtectedGateRuntime") -> None:
         if type(controller) is not DeterministicTrustedController:
             raise TypeError("exact trusted controller required")
-        self._controller = controller
+        self._controller, self._runtime = controller, runtime
 
     def submit(self, *_: object, **__: object) -> ControlStateCommitRequest:
-        raise TypeError("callers submit semantic command inputs, never commit requests or transactions")
+        raise TypeError("use one explicit closed semantic command method")
 
-    def _accept_trusted_result(self, command_kind: TrustedControlCommandKind,
-                               transaction: CanonicalTransaction) -> ControlStateCommitRequest:
-        return self._controller._prepare_commit(command_kind, transaction)
+    def admit_authorization(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.admit_authorization(*args, **kwargs)
+
+    def create_task(self, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.create_task(**kwargs)
+
+    def create_candidate_and_adopt(self, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.create_candidate_and_adopt(**kwargs)
+
+    def revise_supporting_evidence(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.revise_supporting_evidence(*args, **kwargs)
+
+    def reserve_operation(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.reserve_operation(*args, **kwargs)
+
+    def start_operation(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.start_operation(*args, **kwargs)
+
+    def reconcile_operation(
+        self, task_id: TaskId, operation_id: OperationId,
+        subject: ProtectedEffectSubject,
+        dependencies: ControlStateAuthoritativeDependencySet,
+        independence: ExternalStateIndependence | None = None,
+    ) -> GateResult:
+        current = self._controller._backend.read_task_working_set(task_id)
+        if current is None:
+            raise ValueError("task is not canonical")
+        operation = next(
+            (item for item in current.operations if item.intent.operation_id == operation_id), None
+        )
+        if operation is None:
+            raise ValueError("operation is not canonical")
+        return self._runtime.reconcile_recovered_effect(
+            operation, subject, dependencies, independence
+        )
+
+    def evaluate_task(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.evaluate_task(*args, **kwargs)
+
+    def set_cancellation(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.set_cancellation(*args, **kwargs)
+
+    def admit_semantic_evidence(self, *args, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.admit_semantic_evidence(*args, **kwargs)
 
 
 class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_control", "_publication", "_merge")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
-                 platform: FixtureGitPlatform, audit: FixtureGateAudit) -> None:
+                 platform: FixtureGitPlatform, audit: FixtureGateAudit,
+                 registry: ActiveFixtureRuntimeRegistry | None = None) -> None:
         if type(binding) is not GateRuntimeBinding or type(backend) is not InMemoryCanonicalStateBackend:
             raise TypeError("runtime binding/backend has wrong exact type")
         if type(platform) is not FixtureGitPlatform or type(audit) is not FixtureGateAudit:
             raise TypeError("fixture platform/audit has wrong exact type")
         self.binding, self.backend, self.platform, self.audit = binding, backend, platform, audit
-        self._lock, self._nonce, self._controller_key = RLock(), object(), object()
+        self.registry = registry or ActiveFixtureRuntimeRegistry()
+        self.platform.attach_registry(self.registry)
+        self._lock, self._nonce, self._controller_key = self.registry.lock, object(), object()
         self._profiles: dict[ImmutableConfigId, AuthoritativeObservationProfile] = {}
         self._readers: dict[ImmutableConfigId, GitHubStateReader] = {}
         self._control = _mint_capability(ControlStateCapability, self._nonce, binding.control_state_principal)
         self._publication = _mint_capability(TargetPublicationCapability, self._nonce, binding.publication_principal)
         self._merge = _mint_capability(MergeCapability, self._nonce, binding.merge_principal)
-        self.controller = _new_controller(self._controller_key)
-        self.boundary = TrustedControlCommandBoundary(self.controller)
+        self._control_runtime, self._publication_runtime, self._merge_runtime = object(), object(), object()
+        if not self.registry.activate(
+            binding.root_context_id, binding.runtime_generation.value,
+            self._control_runtime, self._publication_runtime, self._merge_runtime,
+        ):
+            raise RuntimeError("cannot replace active runtime while a gate lease is live")
+        self.controller = _new_controller(self._controller_key, self.backend)
+        self.boundary = TrustedControlCommandBoundary(self.controller, self)
 
     @property
     def control_capability(self) -> ControlStateCapability:
@@ -375,6 +865,45 @@ class FixtureProtectedGateRuntime:
     @property
     def merge_capability(self) -> MergeCapability:
         return self._merge
+
+    def _is_active(self) -> bool:
+        return self.registry.is_active(
+            self.binding.root_context_id, self.binding.runtime_generation.value,
+            self._control_runtime, self._publication_runtime, self._merge_runtime,
+        )
+
+    @staticmethod
+    def _dependency_digest(dependencies: ControlStateAuthoritativeDependencySet) -> RawSha256:
+        return RawSha256(hashlib.sha256(canonical_json_bytes(dependencies)).hexdigest())
+
+    def _audit_event(self, gate: str, action: str, outcome: GateAuditOutcome, *,
+                     service: ServicePrincipalId, dependencies: ControlStateAuthoritativeDependencySet,
+                     operation_id: OperationId | None = None,
+                     start_id: OperationStartBindingId | None = None,
+                     marker: ProtectedEffectMarker | None = None,
+                     action_digest: RawSha256 | None = None,
+                     result_identity: str = "", detail: str = "",
+                     intent: OperationIntent | None = None,
+                     materialization: CandidateMaterialization | None = None) -> AuditAppendStatus:
+        preimage = GateAuditEventPreimage(
+            "autodev.gate-audit-event/v1", gate, action, outcome,
+            self.binding.root_context_id, self.binding.runtime_generation.value,
+            service, self._dependency_digest(dependencies), operation_id, start_id,
+            None if marker is None else marker.marker_id, action_digest,
+            result_identity, detail,
+            None if intent is None else intent.task_id,
+            None if intent is None else intent.candidate_id,
+            None if intent is None else intent.authorization_id,
+            None if intent is None else intent.target_registration_id,
+            None if intent is None else intent.policy_epoch_identity,
+            None if materialization is None else materialization.materialization_id,
+            None if materialization is None else materialization.inventory.inventory_id,
+        )
+        return self.audit.append_event(build_gate_audit_event(preimage))
+
+    @staticmethod
+    def _audit_ok(status: AuditAppendStatus) -> bool:
+        return status in (AuditAppendStatus.APPENDED, AuditAppendStatus.ALREADY_PRESENT)
 
     def register_authoritative_source(self, profile: AuthoritativeObservationProfile,
                                       reader: GitHubStateReader) -> None:
@@ -398,21 +927,29 @@ class FixtureProtectedGateRuntime:
     def acquire_control_lease(self, capability: ControlStateCapability,
                               dependencies: ControlStateAuthoritativeDependencySet,
                               independence: ExternalStateIndependence | None = None) -> ControlStateCommitLease | None:
-        if capability is not self._control or type(dependencies) is not ControlStateAuthoritativeDependencySet:
+        if (capability is not self._control or type(dependencies) is not ControlStateAuthoritativeDependencySet
+                or not self._is_active()):
             return None
         if not dependencies.dependencies:
             if type(independence) is not ExternalStateIndependence or independence._nonce is not self._nonce:
                 return None
         elif independence is not None:
             return None
-        if not self._dependencies_fresh_set(dependencies):
+        facts = frozenset(("repository", item.repository_id) for item in dependencies.dependencies)
+        token = self.registry.acquire(self, facts)
+        if token is None:
             return None
-        lease = ControlStateCommitLease(self, self._nonce)
+        if not self._is_active() or not self._dependencies_fresh_set(dependencies):
+            self.registry.release(token)
+            return None
+        lease = object.__new__(ControlStateCommitLease)
+        lease._owner, lease._nonce, lease._used = self, self._nonce, False
         lease.root_context_id = self.binding.root_context_id
         lease.runtime_generation = self.binding.runtime_generation
         lease.runtime_binding = self.binding
         lease.dependencies = dependencies
         lease.capability = capability
+        lease.fence_token = token
         return lease
 
     def _dependencies_fresh(self, lease: ControlStateCommitLease) -> bool:
@@ -438,7 +975,7 @@ class FixtureProtectedGateRuntime:
         with self._lock:
             if type(request) is not ControlStateCommitRequest or request._key is not self._controller_key:
                 return GateResult(GateResultCode.REJECTED)
-            if type(lease) is not ControlStateCommitLease or not self._dependencies_fresh(lease):
+            if type(lease) is not ControlStateCommitLease or not self._dependencies_fresh(lease) or not self._is_active():
                 return GateResult(GateResultCode.LEASE_INVALID)
             if (lease.runtime_binding is not self.binding or lease.root_context_id != self.binding.root_context_id
                     or lease.runtime_generation != self.binding.runtime_generation
@@ -446,30 +983,49 @@ class FixtureProtectedGateRuntime:
                 return GateResult(GateResultCode.LEASE_INVALID)
             if not lease._consume(self, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
-            runtime_id = f"{self.binding.root_context_id.value}@{self.binding.runtime_generation.value}"
-            dependency_id = "|".join(
-                f"{item.repository_id.value}:{item.observation_profile_id.value}:{item.transport_config_id.value}:{item.expected_binding_id.value}"
-                for item in lease.dependencies.dependencies
-            )
-            audit_fields = dict(runtime_identity=runtime_id,
-                                service_identity=self.binding.control_state_principal.value,
-                                dependency_identity=dependency_id)
-            if not self.audit.append("CONTROL_STATE", request.command_kind.value, GateAuditOutcome.ATTEMPTED, **audit_fields):
-                return GateResult(GateResultCode.AUDIT_FAILURE_BEFORE_COMMIT)
-            result = self.backend.apply(request.transaction)
-            if result.status is not CanonicalWriteStatus.APPLIED:
-                outcome = GateAuditOutcome.CAS_CONFLICT if result.status is CanonicalWriteStatus.CAS_CONFLICT else GateAuditOutcome.DENIED
-                self.audit.append("CONTROL_STATE", request.command_kind.value, outcome, result.status.value, **audit_fields)
-                return GateResult(GateResultCode.REJECTED, result)
-            if not self.audit.append("CONTROL_STATE", request.command_kind.value, GateAuditOutcome.APPLIED, **audit_fields):
-                return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, result)
-            return GateResult(GateResultCode.COMMITTED, result)
+            try:
+                request_digest = RawSha256(hashlib.sha256(canonical_json_bytes(request.transaction)).hexdigest())
+                audit_intent = next((
+                    mutation.operation.intent
+                    for mutation in request.transaction.mutations
+                    if type(mutation) in (ReplaceOperation, CreateOperationAndAdvanceMembership)
+                ), None)
+                if not self._audit_ok(self._audit_event(
+                    "CONTROL_STATE", request.command_kind.value, GateAuditOutcome.ATTEMPTED,
+                    service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                    action_digest=request_digest, intent=audit_intent,
+                )):
+                    return GateResult(GateResultCode.AUDIT_FAILURE_BEFORE_COMMIT)
+                result = self.backend.apply(request.transaction)
+                if result.status is not CanonicalWriteStatus.APPLIED:
+                    outcome = GateAuditOutcome.CAS_CONFLICT if result.status is CanonicalWriteStatus.CAS_CONFLICT else GateAuditOutcome.DENIED
+                    self._audit_event(
+                        "CONTROL_STATE", request.command_kind.value, outcome,
+                        service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                        action_digest=request_digest, detail=result.status.value,
+                        intent=audit_intent,
+                    )
+                    return GateResult(GateResultCode.REJECTED, result)
+                if not self._audit_ok(self._audit_event(
+                    "CONTROL_STATE", request.command_kind.value, GateAuditOutcome.APPLIED,
+                    service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                    action_digest=request_digest, intent=audit_intent,
+                )):
+                    return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, result)
+                return GateResult(GateResultCode.COMMITTED, result)
+            finally:
+                self.registry.release(lease.fence_token)
 
     def prepare_protected_start(self, operation: OperationRecord, subject: ProtectedEffectSubject,
                                 fence: ActionTargetFence, control_lease: ControlStateCommitLease,
                                 target_capability: TargetPublicationCapability | MergeCapability,
                                 authorized_scope: MutationScope,
-                                root_forbidden_scope: MutationScope) -> PreparedStartCommitLease:
+                                root_forbidden_scope: MutationScope, *,
+                                materialization: CandidateMaterialization,
+                                target_registration: AdmittedTargetRegistration,
+                                base_ref: CanonicalBranchRef | None = None,
+                                provenance_operation_id: OperationId | None = None,
+                                ) -> PreparedStartCommitLease:
         if type(operation) is not OperationRecord or operation.state is not OperationState.RESERVED:
             raise ValueError("only RESERVED operation may be prepared")
         if type(subject) is not ProtectedEffectSubject or type(fence) is not ActionTargetFence:
@@ -479,19 +1035,151 @@ class FixtureProtectedGateRuntime:
             raise ValueError("action capability does not match exact gate/principal")
         if type(authorized_scope) is not MutationScope or type(root_forbidden_scope) is not MutationScope:
             raise TypeError("exact admitted/root mutation scopes required")
-        prepared = self.prepare_action(operation, subject, fence)
-        value = PreparedStartCommitLease(self, self._nonce)
+        if type(control_lease) is not ControlStateCommitLease or control_lease._used or not self._is_active():
+            raise ValueError("exact live current control-state lease required")
+        target_fact_values = {
+            ("repository", fence.repository_id), ("ref", fence.repository_id, fence.ref),
+            ("prepared", operation.intent.operation_id, subject.value),
+        }
+        if subject is not ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
+            target_fact_values.add(("prs", fence.repository_id))
+        if fence.base_ref is not None:
+            target_fact_values.add(("ref", fence.repository_id, fence.base_ref))
+        target_facts = frozenset(target_fact_values)
+        target_token = self.registry.acquire(self, target_facts)
+        if target_token is None or not self._is_active():
+            if target_token is not None:
+                self.registry.release(target_token)
+            raise RuntimeError("target runtime is not active")
+        if not self._action_start_is_valid(
+            operation, subject, fence, target_capability, authorized_scope,
+            root_forbidden_scope, materialization, target_registration,
+            base_ref, provenance_operation_id,
+        ):
+            self.registry.release(target_token)
+            conflict_request = self.controller._transition_unstarted_conflict(
+                operation.intent.task_id, operation.intent.operation_id
+            )
+            self.commit(conflict_request, control_lease)
+            raise ValueError("protected action preconditions are not satisfied")
+        prepared = self.prepare_action(
+            operation, subject, fence, control_lease.dependencies,
+            target_capability.service_identity,
+        )
+        value = object.__new__(PreparedStartCommitLease)
+        value._owner, value._nonce, value._used = self, self._nonce, False
         value.control_lease, value.action_target_fence = control_lease, fence
         value.prepared_start = prepared
         value.target_capability, value.runtime_binding = target_capability, self.binding
         value.authorized_scope, value.root_forbidden_scope = authorized_scope, root_forbidden_scope
+        value.target_fence_token = target_token
         return value
 
+    def _action_start_is_valid(
+        self, operation: OperationRecord, subject: ProtectedEffectSubject,
+        fence: ActionTargetFence,
+        capability: TargetPublicationCapability | MergeCapability,
+        authorized_scope: MutationScope, root_forbidden_scope: MutationScope,
+        materialization: CandidateMaterialization,
+        target: AdmittedTargetRegistration,
+        base_ref: CanonicalBranchRef | None,
+        provenance_operation_id: OperationId | None,
+    ) -> bool:
+        intent = operation.intent
+        resolved = self.backend.read_resolved_target_registration(intent.target_registration_id)
+        if (
+            type(materialization) is not CandidateMaterialization
+            or type(target) is not AdmittedTargetRegistration
+            or resolved is None or resolved.registration != target
+            or materialization.repository_id != fence.repository_id
+            or target.repository_id != fence.repository_id
+            or materialization.task_id != intent.task_id
+            or materialization.candidate_id != intent.candidate_id
+            or materialization.contract_id != intent.contract_id
+            or materialization.contract_raw_sha256 != intent.contract_raw_sha256
+            or materialization.authorization_id != intent.authorization_id
+            or materialization.target_registration_id != intent.target_registration_id
+            or materialization.policy_epoch_identity != intent.policy_epoch_identity
+            or not self.platform.verify_materialization(materialization)
+            or not inventory_is_authorized(
+                materialization.inventory, authorized_scope, root_forbidden_scope
+            )
+            or not inventory_is_authorized(
+                materialization.inventory, target.ordinary_allowed_scope,
+                target.ordinary_forbidden_scope,
+            )
+        ):
+            return False
+        if subject is ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
+            return (
+                capability is self._publication
+                and fence.ref == materialization.candidate_branch
+                and fence.expected_sha is None and fence.base_ref is None
+                and publication_context_is_valid(
+                    target, capability, materialization, intent.integration_binding
+                )
+            )
+        if subject is ProtectedEffectSubject.PULL_REQUEST_CREATION:
+            provenance = None if provenance_operation_id is None else self.platform.marker(
+                provenance_operation_id,
+                ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+            )
+            published = None if provenance is None else provenance.preimage.effect_subject
+            return (
+                capability is self._publication
+                and target.target_publication is not None
+                and target.target_publication.service_identity == capability.service_identity
+                and target.merge is not None and type(base_ref) is CanonicalBranchRef
+                and base_ref in target.merge.allowed_integration_refs
+                and fence.ref == materialization.candidate_branch
+                and fence.expected_sha == materialization.commit
+                and fence.base_ref == base_ref
+                and type(published) is PublishedCandidateRefEffectSubject
+                and published == PublishedCandidateRefEffectSubject(
+                    fence.repository_id, materialization.candidate_branch,
+                    GitRef(materialization.candidate_branch.value), materialization.commit,
+                )
+                and self._marker_postcondition(provenance)
+            )
+        provenance = None if provenance_operation_id is None else self.platform.marker(
+            provenance_operation_id, ProtectedEffectSubject.PULL_REQUEST_CREATION.value
+        )
+        created = None if provenance is None else provenance.preimage.effect_subject
+        pr = (
+            None if type(created) is not CreatedCandidatePrEffectSubject
+            else self.platform.pull_request(created.pull_request_number)
+        )
+        return (
+            capability is self._merge and target.merge is not None
+            and target.merge.service_identity == capability.service_identity
+            and fence.ref in target.merge.allowed_integration_refs
+            and fence.expected_sha is not None
+            and materialization.base == fence.expected_sha
+            and type(created) is CreatedCandidatePrEffectSubject
+            and created.repository_id == fence.repository_id
+            and created.head_ref == GitRef(materialization.candidate_branch.value)
+            and created.head_sha == materialization.commit
+            and created.base_ref == GitRef(fence.ref.value)
+            and created.base_sha == fence.expected_sha
+            and pr is not None and not pr.merged
+            and self._marker_postcondition(provenance)
+        )
+
     def prepare_action(self, operation: OperationRecord, subject: ProtectedEffectSubject,
-                       fence: ActionTargetFence) -> PreparedProtectedStart:
+                       fence: ActionTargetFence,
+                       dependencies: ControlStateAuthoritativeDependencySet,
+                       service_identity: ServicePrincipalId) -> PreparedProtectedStart:
         if type(operation) is not OperationRecord or operation.state is not OperationState.RESERVED:
             raise ValueError("only RESERVED operation may be prepared")
         value = object.__new__(PreparedProtectedStart)
+        preimage = PreparedProtectedStartPreimage(
+            "autodev.prepared-protected-start/v1", operation.intent.operation_id,
+            subject, fence, self.binding.root_context_id, self.binding.runtime_generation,
+            service_identity, dependencies,
+        )
+        value.prepared_start_id = PreparedProtectedStartId(
+            RawSha256(hashlib.sha256(canonical_json_bytes(preimage)).hexdigest())
+        )
         value.operation, value.subject, value.fence = operation, subject, fence
         value._state, value._owner, value._nonce = PreparedProtectedStartState.PREPARED, self, self._nonce
         return value
@@ -506,65 +1194,93 @@ class FixtureProtectedGateRuntime:
             if type(prepared) is not PreparedStartCommitLease or not prepared._consume(self, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             expected_capability = self._merge if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE else self._publication
-            if prepared.runtime_binding is not self.binding or prepared.target_capability is not expected_capability:
+            if (prepared.runtime_binding is not self.binding or prepared.target_capability is not expected_capability
+                    or not prepared.target_fence_token.active or not self._is_active()):
                 return GateResult(GateResultCode.LEASE_INVALID)
-            fence = prepared.action_target_fence
-            if self.platform.snapshot().generation != fence.platform_generation or self.platform.read_ref(fence.repository_id, fence.ref) != fence.expected_sha:
+            if (request.command_kind is not TrustedControlCommandKind.START_OPERATION
+                    or operation != prepared.prepared_start.operation
+                    or subject is not prepared.prepared_start.subject):
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(GateResultCode.REJECTED)
+            proposed = next((mutation.operation for mutation in request.transaction.mutations
+                             if type(mutation) is ReplaceOperation
+                             and mutation.operation.intent.operation_id == operation.intent.operation_id), None)
+            expected_start_id = operation_start_binding_id(
+                prepared.prepared_start.prepared_start_id
+            )
+            if (proposed is None or proposed.state is not OperationState.PERFORMING
+                    or proposed.start_binding_id != expected_start_id):
                 prepared.prepared_start._release(self, self._nonce)
-                conflict = transition_operation(
-                    operation, operation.revision, OperationState.CONFLICT,
-                    reason_code=G4FailureCode.ACTION_PRECONDITION_CONFLICT,
-                )
-                conflict_request = _request(
-                    request.command_kind,
-                    CanonicalTransaction(
-                        request.transaction.expected_state_occurrence,
-                        request.transaction.conditions,
-                        (ReplaceOperation(operation.revision, conflict.operation),),
-                    ),
-                    self._controller_key,
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(GateResultCode.REJECTED)
+            fence = prepared.action_target_fence
+            if (self.platform.snapshot().generation != fence.platform_generation
+                    or self.platform.read_ref(fence.repository_id, fence.ref) != fence.expected_sha
+                    or (fence.base_ref is not None and self.platform.read_ref(
+                        fence.repository_id, fence.base_ref
+                    ) != fence.base_expected_sha)):
+                prepared.prepared_start._release(self, self._nonce)
+                conflict_request = self.controller._transition_unstarted_conflict(
+                    operation.intent.task_id, operation.intent.operation_id
                 )
                 conflict_commit = self.commit(conflict_request, prepared.control_lease)
                 if conflict_commit.code is not GateResultCode.COMMITTED:
+                    self.registry.release(prepared.target_fence_token)
                     return conflict_commit
+                self.registry.release(prepared.target_fence_token)
                 return GateResult(GateResultCode.ACTION_PRECONDITION_CONFLICT,
                                   conflict_commit.canonical_result,
                                   failure_code=G4FailureCode.ACTION_PRECONDITION_CONFLICT)
             committed = self.commit(request, prepared.control_lease)
             if committed.code is not GateResultCode.COMMITTED:
                 prepared.prepared_start._release(self, self._nonce)
+                self.registry.release(prepared.target_fence_token)
                 return committed
-            proposed = next((mutation.operation for mutation in request.transaction.mutations
-                             if hasattr(mutation, "operation") and type(mutation.operation) is OperationRecord
-                             and mutation.operation.intent.operation_id == operation.intent.operation_id), None)
-            if proposed is None or proposed.state is not OperationState.PERFORMING or proposed.start_binding_id is None:
-                prepared.prepared_start._release(self, self._nonce)
-                return GateResult(GateResultCode.REJECTED)
-            self.platform.prepare_effect(proposed.intent.operation_id.value, subject.value)
-            start_dependencies = "|".join(
-                f"{item.repository_id.value}:{item.observation_profile_id.value}:{item.transport_config_id.value}:{item.expected_binding_id.value}"
-                for item in prepared.control_lease.dependencies.dependencies
+            self.platform.prepare_effect(
+                proposed.intent.operation_id, subject.value,
+                _fence_token=prepared.target_fence_token,
             )
-            if not self.audit.append(
-                "PROTECTED_START", proposed.intent.operation_id.value, GateAuditOutcome.APPLIED,
-                runtime_identity=f"{self.binding.root_context_id.value}@{self.binding.runtime_generation.value}",
-                service_identity=prepared.target_capability.service_identity.value,
-                dependency_identity=start_dependencies,
-            ):
+            if not self._audit_ok(self._audit_event(
+                "PROTECTED_START", subject.value, GateAuditOutcome.APPLIED,
+                service=prepared.target_capability.service_identity,
+                dependencies=prepared.control_lease.dependencies,
+                operation_id=proposed.intent.operation_id,
+                start_id=proposed.start_binding_id,
+                action_digest=prepared.prepared_start.prepared_start_id.raw_sha256,
+                intent=proposed.intent,
+            )):
                 prepared.prepared_start._consume(self, self._nonce)
+                self.platform.release_prepared_effect(
+                    proposed.intent.operation_id, subject.value,
+                    _fence_token=prepared.target_fence_token,
+                )
+                self.registry.release(prepared.target_fence_token)
+                recovery_lease = self.acquire_control_lease(
+                    self._control, ControlStateAuthoritativeDependencySet(()),
+                    self.attest_external_state_independence(),
+                )
+                if recovery_lease is not None:
+                    recovery = self.controller._transition_started_failed(
+                        proposed.intent.task_id, proposed.intent.operation_id
+                    )
+                    self.commit(recovery, recovery_lease)
                 return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
             prepared.prepared_start._consume(self, self._nonce)
-            continuation = LiveProtectedEffectContinuation(self, self._nonce)
+            continuation = object.__new__(LiveProtectedEffectContinuation)
+            continuation._owner, continuation._nonce, continuation._used = self, self._nonce, False
             continuation.operation_id = proposed.intent.operation_id
             continuation.idempotency_key = proposed.intent.idempotency_key
             continuation.action_id = proposed.intent.action_id
+            continuation.intent = proposed.intent
             continuation.start_binding_id = proposed.start_binding_id
+            continuation.prepared_start_id = prepared.prepared_start.prepared_start_id
             continuation.subject = subject
             continuation.action_target_fence = fence
             continuation.integration_binding = proposed.intent.integration_binding
             continuation.authorized_scope = prepared.authorized_scope
             continuation.root_forbidden_scope = prepared.root_forbidden_scope
             continuation.dependencies = prepared.control_lease.dependencies
+            continuation.target_fence_token = prepared.target_fence_token
             return GateResult(GateResultCode.START_COMMITTED, committed.canonical_result, continuation)
 
     def perform_effect(self, continuation: LiveProtectedEffectContinuation,
@@ -577,13 +1293,24 @@ class FixtureProtectedGateRuntime:
             if type(continuation) is not LiveProtectedEffectContinuation or not continuation._consume(self, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             fence, subject = continuation.action_target_fence, continuation.subject
-            if not self._dependencies_fresh_set(continuation.dependencies):
-                return GateResult(GateResultCode.INDETERMINATE)
-            marker = self.platform.marker(continuation.operation_id.value, subject.value)
-            if marker is not None:
-                return GateResult(GateResultCode.ALREADY_APPLIED)
             try:
+                if not continuation.target_fence_token.active or not self._is_active():
+                    return GateResult(GateResultCode.LEASE_INVALID)
+                if not self._dependencies_fresh_set(continuation.dependencies):
+                    return GateResult(GateResultCode.INDETERMINATE)
                 if type(materialization) is not CandidateMaterialization:
+                    return GateResult(GateResultCode.REJECTED)
+                intent = continuation.intent
+                if (
+                    materialization.repository_id != fence.repository_id
+                    or materialization.task_id != intent.task_id
+                    or materialization.candidate_id != intent.candidate_id
+                    or materialization.contract_id != intent.contract_id
+                    or materialization.contract_raw_sha256 != intent.contract_raw_sha256
+                    or materialization.authorization_id != intent.authorization_id
+                    or materialization.target_registration_id != intent.target_registration_id
+                    or materialization.policy_epoch_identity != intent.policy_epoch_identity
+                ):
                     return GateResult(GateResultCode.REJECTED)
                 if not self.platform.verify_materialization(materialization):
                     return GateResult(GateResultCode.REJECTED)
@@ -591,29 +1318,24 @@ class FixtureProtectedGateRuntime:
                                                continuation.root_forbidden_scope):
                     return GateResult(GateResultCode.REJECTED)
                 if (type(target_registration) is not AdmittedTargetRegistration
+                        or target_registration.repository_id != fence.repository_id
+                        or target_registration.target_registration_id != intent.target_registration_id
+                        or target_registration.policy_epoch_identity != intent.policy_epoch_identity
                         or not inventory_is_authorized(
                             materialization.inventory,
                             target_registration.ordinary_allowed_scope,
                             target_registration.ordinary_forbidden_scope,
                         )):
                     return GateResult(GateResultCode.REJECTED)
-                pre_state = "ABSENT" if fence.expected_sha is None else fence.expected_sha.value
-
-                def exact_marker(result_identity: str) -> ProtectedEffectMarker:
-                    action_digest = hashlib.sha256("\0".join((
-                        subject.value, continuation.action_id.value,
-                        materialization.materialization_id.value,
-                        materialization.inventory.inventory_id.value, pre_state, result_identity,
-                    )).encode()).hexdigest()
-                    return ProtectedEffectMarker(
-                        continuation.operation_id.value, continuation.idempotency_key.value,
-                        continuation.action_id.value, action_digest,
-                        materialization.materialization_id.value,
-                        materialization.inventory.inventory_id.value,
-                        continuation.start_binding_id.value, self.binding.root_context_id.value,
-                        self.binding.runtime_generation.value, capability.service_identity.value,
-                        subject.value, fence.repository_id, pre_state, result_identity, result_identity,
-                    )
+                resolved_target = self.backend.read_resolved_target_registration(
+                    intent.target_registration_id
+                )
+                if (resolved_target is None
+                        or resolved_target.registration != target_registration):
+                    return GateResult(GateResultCode.REJECTED)
+                effect_subject: PublishedCandidateRefEffectSubject | CreatedCandidatePrEffectSubject | FastForwardMergeEffectSubject
+                current = self.platform.marker(continuation.operation_id, subject.value)
+                prerequisite_marker_id = None
 
                 if subject is ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
                     if (capability is not self._publication
@@ -623,97 +1345,280 @@ class FixtureProtectedGateRuntime:
                             or not publication_context_is_valid(target_registration, capability, materialization,
                                                                 continuation.integration_binding)):
                         return GateResult(GateResultCode.REJECTED)
-                    if self.platform.read_ref(fence.repository_id, materialization.candidate_branch) is not None:
-                        return GateResult(GateResultCode.PRECONDITION_CONFLICT)
-                    result_identity = materialization.candidate_branch.value + "@" + materialization.commit.value
-                    if not self.platform.publish_and_mark(
+                    effect_subject = PublishedCandidateRefEffectSubject(
                         fence.repository_id, materialization.candidate_branch,
-                        materialization.commit, exact_marker(result_identity),
-                    ):
-                        return GateResult(GateResultCode.PRECONDITION_CONFLICT)
+                        GitRef(materialization.candidate_branch.value), materialization.commit,
+                    )
                 elif subject is ProtectedEffectSubject.PULL_REQUEST_CREATION:
                     provenance = None if provenance_operation_id is None else self.platform.marker(
-                        provenance_operation_id.value, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value
+                        provenance_operation_id, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value
                     )
+                    published = None if provenance is None else provenance.preimage.effect_subject
                     if (capability is not self._publication
                             or type(base_ref) is not CanonicalBranchRef
+                            or base_ref != fence.base_ref
                             or type(target_registration) is not AdmittedTargetRegistration
                             or target_registration.target_publication.service_identity != capability.service_identity
                             or target_registration.merge is None
                             or base_ref not in target_registration.merge.allowed_integration_refs
                             or fence.ref != materialization.candidate_branch
                             or fence.expected_sha != materialization.commit
-                            or provenance is None
-                            or provenance.result_identity != materialization.candidate_branch.value + "@" + materialization.commit.value):
+                            or type(published) is not PublishedCandidateRefEffectSubject
+                            or published != PublishedCandidateRefEffectSubject(
+                                fence.repository_id, materialization.candidate_branch,
+                                GitRef(materialization.candidate_branch.value), materialization.commit,
+                            )
+                            or not self._marker_postcondition(provenance)):
                         return GateResult(GateResultCode.REJECTED)
-                    result_identity = str(self.platform.next_pull_request_number())
-                    pr = self.platform.create_pull_request_and_mark(
-                        fence.repository_id, materialization.candidate_branch, base_ref,
-                        materialization.commit, exact_marker(result_identity),
-                    )
-                    if pr is None:
+                    prerequisite_marker_id = provenance.marker_id
+                    base_sha = self.platform.read_ref(fence.repository_id, base_ref)
+                    if base_sha is None or base_sha != fence.base_expected_sha:
+                        return GateResult(GateResultCode.PRECONDITION_CONFLICT)
+                    existing_subject = None if current is None else current.preimage.effect_subject
+                    if current is not None and type(existing_subject) is not CreatedCandidatePrEffectSubject:
                         return GateResult(GateResultCode.INDETERMINATE)
+                    number = (
+                        self.platform.next_pull_request_number()
+                        if existing_subject is None
+                        else existing_subject.pull_request_number.value
+                    )
+                    effect_subject = CreatedCandidatePrEffectSubject(
+                        fence.repository_id, GitHubPullRequestNumber(number),
+                        GitRef(materialization.candidate_branch.value), materialization.commit,
+                        GitRef(base_ref.value), base_sha,
+                    )
                 else:
                     provenance = None if provenance_operation_id is None else self.platform.marker(
-                        provenance_operation_id.value, ProtectedEffectSubject.PULL_REQUEST_CREATION.value
+                        provenance_operation_id, ProtectedEffectSubject.PULL_REQUEST_CREATION.value
                     )
+                    created = None if provenance is None else provenance.preimage.effect_subject
                     if (capability is not self._merge
                             or type(target_registration) is not AdmittedTargetRegistration
                             or target_registration.merge is None
                             or target_registration.merge.service_identity != capability.service_identity
                             or fence.ref not in target_registration.merge.allowed_integration_refs
-                            or provenance is None):
+                            or type(created) is not CreatedCandidatePrEffectSubject
+                            or created.repository_id != fence.repository_id
+                            or created.head_ref != GitRef(materialization.candidate_branch.value)
+                            or created.head_sha != materialization.commit
+                            or created.base_ref != GitRef(fence.ref.value)
+                            or created.base_sha != fence.expected_sha
+                            or not self._marker_postcondition(provenance)):
                         return GateResult(GateResultCode.REJECTED)
-                    result_identity = materialization.commit.value
-                    try:
-                        pull_request_number = int(provenance.result_identity)
-                    except (TypeError, ValueError):
-                        return GateResult(GateResultCode.REJECTED)
-                    if not self.platform.fast_forward_and_mark(
+                    prerequisite_marker_id = provenance.marker_id
+                    effect_subject = FastForwardMergeEffectSubject(
+                        fence.repository_id, created.pull_request_number,
+                        GitRef(fence.ref.value), fence.expected_sha, materialization.commit,
+                    )
+
+                pre_identity = RawSha256(hashlib.sha256(canonical_json_bytes(("pre", fence))).hexdigest())
+                post_identity = RawSha256(hashlib.sha256(canonical_json_bytes(("post", effect_subject))).hexdigest())
+                action_digest = RawSha256(hashlib.sha256(canonical_json_bytes((
+                    subject, continuation.action_id, materialization.materialization_id,
+                    materialization.inventory.inventory_id, effect_subject,
+                ))).hexdigest())
+                marker = build_protected_effect_marker(ProtectedEffectMarkerPreimage(
+                    "autodev.protected-effect-marker/v1", subject.value,
+                    continuation.operation_id, continuation.idempotency_key,
+                    continuation.action_id, action_digest, materialization.materialization_id,
+                    materialization.inventory.inventory_id, continuation.prepared_start_id,
+                    self.binding.root_context_id, self.binding.runtime_generation.value,
+                    capability.service_identity, effect_subject, pre_identity, post_identity,
+                    prerequisite_marker_id,
+                ))
+                if current is not None:
+                    if current != marker or not self._marker_postcondition(current):
+                        return GateResult(GateResultCode.INDETERMINATE)
+                    if not self._audit_ok(self._audit_event(
+                        subject.value, continuation.action_id.value,
+                        GateAuditOutcome.ALREADY_APPLIED,
+                        service=capability.service_identity,
+                        dependencies=continuation.dependencies,
+                        operation_id=continuation.operation_id,
+                        start_id=continuation.start_binding_id, marker=current,
+                        action_digest=action_digest,
+                        result_identity=current.marker_id.raw_sha256.value,
+                        intent=continuation.intent, materialization=materialization,
+                    )):
+                        return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT)
+                    return GateResult(GateResultCode.ALREADY_APPLIED)
+
+                if subject is ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
+                    applied = self.platform.publish_and_mark(
+                        fence.repository_id, materialization.candidate_branch,
+                        materialization.commit, marker,
+                        _fence_token=continuation.target_fence_token,
+                    )
+                elif subject is ProtectedEffectSubject.PULL_REQUEST_CREATION:
+                    applied = self.platform.create_pull_request_and_mark(
+                        fence.repository_id, materialization.candidate_branch, base_ref,
+                        materialization.commit, marker,
+                        _fence_token=continuation.target_fence_token,
+                    ) is not None
+                else:
+                    applied = self.platform.fast_forward_and_mark(
                         fence.repository_id, fence.ref, fence.expected_sha,
                         materialization.commit, materialization.base,
-                        pull_request_number, exact_marker(result_identity),
-                    ):
-                        return GateResult(GateResultCode.PRECONDITION_CONFLICT)
-            except Exception:
-                self.audit.append(subject.value, continuation.operation_id.value, GateAuditOutcome.INDETERMINATE)
-                return GateResult(GateResultCode.INDETERMINATE)
-            if not self.audit.append(
-                subject.value, continuation.operation_id.value, GateAuditOutcome.APPLIED,
-                runtime_identity=f"{self.binding.root_context_id.value}@{self.binding.runtime_generation.value}",
-                service_identity=capability.service_identity.value,
-                dependency_identity="|".join(
-                    f"{item.repository_id.value}:{item.observation_profile_id.value}:{item.transport_config_id.value}:{item.expected_binding_id.value}"
-                    for item in continuation.dependencies.dependencies
-                ),
-            ):
-                return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT)
-            return GateResult(GateResultCode.EFFECT_SUCCEEDED)
+                        effect_subject.pull_request_number.value, marker,
+                        _fence_token=continuation.target_fence_token,
+                    )
+                if not applied:
+                    return self._fail_started_effect_proven_absent(continuation)
 
-    def reconcile_recovered_effect(self, operation: OperationRecord,
-                                   subject: ProtectedEffectSubject) -> OperationState:
-        """Classify recovery only; it never recreates an effect continuation."""
+                if not self._audit_ok(self._audit_event(
+                    subject.value, continuation.action_id.value, GateAuditOutcome.APPLIED,
+                    service=capability.service_identity, dependencies=continuation.dependencies,
+                    operation_id=continuation.operation_id,
+                    start_id=continuation.start_binding_id, marker=marker,
+                    action_digest=action_digest,
+                    result_identity=marker.marker_id.raw_sha256.value,
+                    intent=continuation.intent, materialization=materialization,
+                )):
+                    return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT)
+                return GateResult(GateResultCode.EFFECT_SUCCEEDED)
+            except Exception:
+                return GateResult(GateResultCode.INDETERMINATE)
+            finally:
+                self.registry.release(continuation.target_fence_token)
+
+    def _fail_started_effect_proven_absent(
+        self, continuation: LiveProtectedEffectContinuation,
+    ) -> GateResult:
+        if self.platform.marker(
+            continuation.operation_id, continuation.subject.value
+        ) is not None:
+            return GateResult(GateResultCode.INDETERMINATE)
+        if not self.platform.release_prepared_effect(
+            continuation.operation_id, continuation.subject.value,
+            _fence_token=continuation.target_fence_token,
+        ):
+            return GateResult(GateResultCode.INDETERMINATE)
+        independence = (
+            self.attest_external_state_independence()
+            if not continuation.dependencies.dependencies else None
+        )
+        lease = self.acquire_control_lease(
+            self._control, continuation.dependencies, independence
+        )
+        if lease is None:
+            return GateResult(GateResultCode.INDETERMINATE)
+        try:
+            request = self.controller._transition_started_failed(
+                continuation.intent.task_id, continuation.operation_id
+            )
+        except (TypeError, ValueError):
+            self.registry.release(lease.fence_token)
+            return GateResult(GateResultCode.INDETERMINATE)
+        committed = self.commit(request, lease)
+        if committed.code is not GateResultCode.COMMITTED:
+            return GateResult(GateResultCode.INDETERMINATE, committed.canonical_result)
+        if not self._audit_ok(self._audit_event(
+            continuation.subject.value, continuation.action_id.value,
+            GateAuditOutcome.PRECONDITION_CONFLICT,
+            service=(
+                self.binding.merge_principal
+                if continuation.subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
+                else self.binding.publication_principal
+            ),
+            dependencies=continuation.dependencies,
+            operation_id=continuation.operation_id,
+            start_id=continuation.start_binding_id,
+            intent=continuation.intent,
+        )):
+            return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
+        return GateResult(GateResultCode.PRECONDITION_CONFLICT, committed.canonical_result)
+
+    def _marker_postcondition(self, marker: ProtectedEffectMarker) -> bool:
+        subject = marker.preimage.effect_subject
+        if type(subject) is PublishedCandidateRefEffectSubject:
+            return self.platform.read_ref(subject.repository_id, subject.destination_branch) == subject.published_commit
+        if type(subject) is CreatedCandidatePrEffectSubject:
+            pr = self.platform.pull_request(subject.pull_request_number)
+            return pr is not None and (
+                pr.repository_id, GitRef(pr.head.value), pr.head_sha,
+                GitRef(pr.base.value), pr.base_sha, pr.merged,
+            ) == (subject.repository_id, subject.head_ref, subject.head_sha,
+                  subject.base_ref, subject.base_sha, False)
+        if type(subject) is FastForwardMergeEffectSubject:
+            pr = self.platform.pull_request(subject.pull_request_number)
+            return (pr is not None and pr.merged
+                    and self.platform.read_ref(subject.repository_id, CanonicalBranchRef(subject.integration_ref.value)) == subject.after_sha)
+        return False
+
+    def reconcile_recovered_effect(
+        self, operation: OperationRecord, subject: ProtectedEffectSubject,
+        dependencies: ControlStateAuthoritativeDependencySet,
+        independence: ExternalStateIndependence | None = None,
+    ) -> GateResult:
+        """Reconcile recovered PERFORMING state; never reconstruct or retry an effect."""
+        if not self._is_active():
+            return GateResult(GateResultCode.LEASE_INVALID)
         if type(operation) is not OperationRecord or operation.state not in (OperationState.PERFORMING, OperationState.INDETERMINATE):
             raise ValueError("only unresolved started operations can be recovered")
         if type(subject) is not ProtectedEffectSubject:
             raise TypeError("subject has wrong exact type")
-        marker = self.platform.marker(operation.intent.operation_id.value, subject.value)
-        prepared = self.platform.prepared_effect_state(operation.intent.operation_id.value, subject.value)
+        if type(dependencies) is not ControlStateAuthoritativeDependencySet:
+            raise TypeError("exact dependency set required")
+        marker = self.platform.marker(operation.intent.operation_id, subject.value)
+        prepared = self.platform.prepared_effect_state(operation.intent.operation_id, subject.value)
         if marker is not None and prepared == "CONSUMED":
-            return OperationState.SUCCEEDED
-        if marker is None and prepared == "PREPARED":
-            return OperationState.FAILED if self.platform.release_prepared_effect(
-                operation.intent.operation_id.value, subject.value
-            ) else OperationState.INDETERMINATE
-        return OperationState.INDETERMINATE
+            finding_value = (
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN
+                if self._marker_postcondition(marker)
+                else ReconciliationFinding.UNRESOLVED
+            )
+        elif marker is None and prepared == "PREPARED":
+            finding_value = (
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT
+                if self.platform.release_prepared_effect(
+                    operation.intent.operation_id, subject.value
+                ) else ReconciliationFinding.UNRESOLVED
+            )
+        else:
+            finding_value = ReconciliationFinding.UNRESOLVED
+        finding = object.__new__(TrustedReconciliationFinding)
+        object.__setattr__(finding, "finding", finding_value)
+        lease = self.acquire_control_lease(self._control, dependencies, independence)
+        if lease is None:
+            return GateResult(GateResultCode.LEASE_INVALID)
+        try:
+            request = self.controller._decide_reconciliation(
+                operation.intent.task_id, operation.intent.operation_id, finding
+            )
+        except (TypeError, ValueError):
+            self.registry.release(lease.fence_token)
+            return GateResult(GateResultCode.REJECTED)
+        committed = self.commit(request, lease)
+        if committed.code is not GateResultCode.COMMITTED:
+            return committed
+        outcome = {
+            ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateAuditOutcome.RECONCILED_SUCCEEDED,
+            ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateAuditOutcome.RECONCILED_FAILED,
+            ReconciliationFinding.UNRESOLVED: GateAuditOutcome.INDETERMINATE,
+        }[finding_value]
+        if not self._audit_ok(self._audit_event(
+            "RECOVERY", subject.value, outcome,
+            service=self.binding.control_state_principal, dependencies=dependencies,
+            operation_id=operation.intent.operation_id,
+            start_id=operation.start_binding_id, marker=marker,
+            intent=operation.intent,
+        )):
+            return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
+        code = {
+            ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateResultCode.EFFECT_SUCCEEDED,
+            ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateResultCode.EFFECT_FAILED,
+            ReconciliationFinding.UNRESOLVED: GateResultCode.INDETERMINATE,
+        }[finding_value]
+        return GateResult(code, committed.canonical_result)
 
     def restart(self) -> "FixtureProtectedGateRuntime":
+        self.registry.retire_owner_for_restart(self)
         return FixtureProtectedGateRuntime(
             GateRuntimeBinding(self.binding.root_context_id,
                                self.binding.runtime_generation,
                                self.binding.control_state_principal, self.binding.publication_principal,
                                self.binding.merge_principal),
-            self.backend, self.platform, self.audit,
+            self.backend, self.platform, self.audit, self.registry,
         )
 
 
@@ -774,14 +1679,11 @@ class MergeGate:
         )
 
 
-def operation_start_binding_id(operation_id: OperationId, fence: ActionTargetFence,
-                               subject: ProtectedEffectSubject) -> OperationStartBindingId:
-    if type(operation_id) is not OperationId or type(fence) is not ActionTargetFence or type(subject) is not ProtectedEffectSubject:
-        raise TypeError("start binding inputs have wrong exact type")
-    payload = "\0".join((operation_id.value, subject.value, fence.repository_id.value,
-                         fence.ref.value, "" if fence.expected_sha is None else fence.expected_sha.value,
-                         str(fence.platform_generation)))
-    return OperationStartBindingId(hashlib.sha256(payload.encode()).hexdigest())
+def operation_start_binding_id(prepared_start_id: PreparedProtectedStartId) -> OperationStartBindingId:
+    """Project the frozen prepared-start digest into its distinct lower-layer nominal type."""
+    if type(prepared_start_id) is not PreparedProtectedStartId:
+        raise TypeError("exact PreparedProtectedStartId required")
+    return OperationStartBindingId(prepared_start_id.raw_sha256)
 
 
 def publication_context_is_valid(registration: AdmittedTargetRegistration,
@@ -803,6 +1705,8 @@ def publication_context_is_valid(registration: AdmittedTargetRegistration,
         return False
     if type(operation_integration_ref) is IntegrationBound:
         return GitRef(destination.value) != operation_integration_ref.integration_ref
+    if type(operation_integration_ref) is NotIntegrationBound:
+        return True
     if type(operation_integration_ref) is GitRef:
         return GitRef(destination.value) != operation_integration_ref
     if operation_integration_ref is not None and type(operation_integration_ref) is not CanonicalBranchRef:

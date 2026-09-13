@@ -34,7 +34,7 @@ from autodev_control.trusted.state import (
     initial_task_proposal,
 )
 
-MAT = CandidateMaterializationId("6" * 64)
+MAT = CandidateMaterializationId(RawSha256("6" * 64))
 from autodev_control.trusted.target_registration import AdmittedTargetRegistration
 
 
@@ -261,7 +261,7 @@ def test_operation_create_advances_membership_once_and_content_update_does_not()
     after_create = store.read_task_working_set(TASK)
     assert after_create.task_operation_membership.membership_revision == 2
     updated = replace(op, revision=2, state=OperationState.PERFORMING,
-                      start_binding_id=OperationStartBindingId("8" * 64))
+                      start_binding_id=OperationStartBindingId(RawSha256("8" * 64)))
     assert apply(store, ReplaceOperation(1, updated)).status is CanonicalWriteStatus.APPLIED
     after_update = store.read_task_working_set(TASK)
     assert after_update.task_operation_membership == after_create.task_operation_membership

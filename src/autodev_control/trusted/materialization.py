@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-import json
 
-from .identity import CandidateMaterializationId, GitSha, MutationInventoryId
+from .backend import canonical_json_bytes
+from .identity import CandidateMaterializationId, GitSha, ImmutableConfigId, MutationInventoryId
 from .operation import AdmissionEventId, CandidateId, OperationId
 from .scope import (
     AuthorizationId, CanonicalBranchRef, CanonicalGitPath, ChangeType, ContractId,
-    ExactPathSelector, MutationScope, MutationScopeRule, TargetRegistrationId, TaskId,
+    ExactPathSelector, GitHubRepositoryId, MutationScope, MutationScopeRule,
+    TargetRegistrationId, TaskId,
     scope_contains, scopes_overlap,
 )
 from .identity import RawSha256
@@ -89,6 +90,17 @@ class MutationInventory:
         paths = tuple(item.path.value for item in self.mutations)
         if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
             raise ValueError("inventory paths must be unique and canonical-order sorted")
+        expected = MutationInventoryId(RawSha256(hashlib.sha256(canonical_json_bytes(
+            MutationInventoryPreimage("autodev.mutation-inventory/v1", self.mutations)
+        )).hexdigest()))
+        if self.inventory_id != expected:
+            raise ValueError("inventory identity does not match canonical content")
+
+
+@dataclass(frozen=True, slots=True)
+class MutationInventoryPreimage:
+    format: str
+    mutations: tuple[MutationFact, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,18 +112,74 @@ class CandidateMaterialization:
     parent_commits: tuple[GitSha, ...]
     inventory: MutationInventory
     candidate_branch: CanonicalBranchRef
+    repository_id: GitHubRepositoryId
+    task_id: TaskId
+    contract_id: ContractId
+    contract_raw_sha256: RawSha256
+    authorization_id: AuthorizationId
+    target_registration_id: TargetRegistrationId
+    policy_epoch_identity: PolicyEpochIdentity
+    base_tree: GitSha
+    result_tree: GitSha
+    materialization_profile_id: ImmutableConfigId
 
     def __post_init__(self) -> None:
-        exact = ((self.materialization_id, CandidateMaterializationId), (self.candidate_id, CandidateId),
-                 (self.base, GitSha), (self.commit, GitSha), (self.inventory, MutationInventory),
-                 (self.candidate_branch, CanonicalBranchRef))
+        exact = (
+            (self.materialization_id, CandidateMaterializationId),
+            (self.candidate_id, CandidateId), (self.base, GitSha),
+            (self.commit, GitSha), (self.inventory, MutationInventory),
+            (self.candidate_branch, CanonicalBranchRef),
+            (self.repository_id, GitHubRepositoryId), (self.task_id, TaskId),
+            (self.contract_id, ContractId),
+            (self.contract_raw_sha256, RawSha256),
+            (self.authorization_id, AuthorizationId),
+            (self.target_registration_id, TargetRegistrationId),
+            (self.policy_epoch_identity, PolicyEpochIdentity),
+            (self.base_tree, GitSha), (self.result_tree, GitSha),
+            (self.materialization_profile_id, ImmutableConfigId),
+        )
         if any(type(v) is not t for v, t in exact) or type(self.parent_commits) is not tuple:
             raise TypeError("materialization field has wrong exact type")
+        if any(type(item) is not GitSha for item in self.parent_commits):
+            raise TypeError("parent commits must be exact GitSha values")
         if self.parent_commits != (self.base,):
             raise ValueError("initial candidate commit must have exactly the base parent")
-        expected = f"refs/heads/autodev/candidates/{self.materialization_id.value}"
+        preimage = CandidateMaterializationPreimage(
+            "autodev.candidate-materialization/v1", self.repository_id,
+            self.task_id, self.candidate_id, self.contract_id,
+            self.contract_raw_sha256, self.authorization_id,
+            self.target_registration_id, self.policy_epoch_identity, self.base,
+            self.base_tree, self.commit, self.result_tree, self.parent_commits,
+            self.inventory.inventory_id, self.materialization_profile_id,
+        )
+        expected_identity = CandidateMaterializationId(RawSha256(
+            hashlib.sha256(canonical_json_bytes(preimage)).hexdigest()
+        ))
+        if self.materialization_id != expected_identity:
+            raise ValueError("materialization identity does not match canonical content")
+        expected = f"refs/heads/autodev/candidates/{self.materialization_id.raw_sha256.value}"
         if self.candidate_branch.value != expected:
             raise ValueError("candidate branch is not derived from materialization identity")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMaterializationPreimage:
+    format: str
+    repository_id: GitHubRepositoryId
+    task_id: TaskId
+    candidate_id: CandidateId
+    contract_id: ContractId
+    contract_raw_sha256: RawSha256
+    authorization_id: AuthorizationId
+    target_registration_id: TargetRegistrationId
+    policy_epoch_identity: PolicyEpochIdentity
+    base_commit: GitSha
+    base_tree: GitSha
+    result_commit: GitSha
+    result_tree: GitSha
+    parent_commits: tuple[GitSha, ...]
+    mutation_inventory_id: MutationInventoryId
+    materialization_profile_id: ImmutableConfigId
 
 
 def _tree(entries: tuple[GitTreeEntry, ...]) -> dict[str, tuple[GitSha, GitBlobMode]]:
@@ -145,27 +213,38 @@ def derive_mutation_inventory(
             facts.append(MutationFact(CanonicalGitPath(path), MutationKind.DELETED, old[0], None, old[1], None))
         else:
             facts.append(MutationFact(CanonicalGitPath(path), MutationKind.MODIFIED, old[0], new[0], old[1], new[1]))
-    payload = [[f.path.value, f.kind.value,
-                None if f.base_object_id is None else f.base_object_id.value,
-                None if f.candidate_object_id is None else f.candidate_object_id.value,
-                None if f.base_mode is None else f.base_mode.value,
-                None if f.candidate_mode is None else f.candidate_mode.value] for f in facts]
-    digest = hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    preimage = MutationInventoryPreimage("autodev.mutation-inventory/v1", tuple(facts))
+    digest = RawSha256(hashlib.sha256(canonical_json_bytes(preimage)).hexdigest())
     return MutationInventory(MutationInventoryId(digest), tuple(facts))
 
 
 def build_candidate_materialization(
-    candidate_id: CandidateId, base: GitSha, commit: GitSha,
+    *, repository_id: GitHubRepositoryId, task_id: TaskId,
+    candidate_id: CandidateId, contract_id: ContractId,
+    contract_raw_sha256: RawSha256, authorization_id: AuthorizationId,
+    target_registration_id: TargetRegistrationId,
+    policy_epoch_identity: PolicyEpochIdentity,
+    base: GitSha, base_tree_id: GitSha, commit: GitSha, result_tree_id: GitSha,
     parent_commits: tuple[GitSha, ...], base_tree: tuple[GitTreeEntry, ...],
-    candidate_tree: tuple[GitTreeEntry, ...],
+    candidate_tree: tuple[GitTreeEntry, ...], materialization_profile_id: ImmutableConfigId,
 ) -> CandidateMaterialization:
     inventory = derive_mutation_inventory(base_tree, candidate_tree)
-    payload = [candidate_id.value, base.value, commit.value, inventory.inventory_id.value]
-    identity = CandidateMaterializationId(
-        hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+    preimage = CandidateMaterializationPreimage(
+        "autodev.candidate-materialization/v1", repository_id, task_id, candidate_id,
+        contract_id, contract_raw_sha256, authorization_id, target_registration_id,
+        policy_epoch_identity, base, base_tree_id, commit, result_tree_id,
+        parent_commits, inventory.inventory_id, materialization_profile_id,
     )
-    branch = CanonicalBranchRef(f"refs/heads/autodev/candidates/{identity.value}")
-    return CandidateMaterialization(identity, candidate_id, base, commit, parent_commits, inventory, branch)
+    identity = CandidateMaterializationId(
+        RawSha256(hashlib.sha256(canonical_json_bytes(preimage)).hexdigest())
+    )
+    branch = CanonicalBranchRef(f"refs/heads/autodev/candidates/{identity.raw_sha256.value}")
+    return CandidateMaterialization(
+        identity, candidate_id, base, commit, parent_commits, inventory, branch,
+        repository_id, task_id, contract_id, contract_raw_sha256, authorization_id,
+        target_registration_id, policy_epoch_identity, base_tree_id, result_tree_id,
+        materialization_profile_id,
+    )
 
 
 def mutation_inventory_scope(inventory: MutationInventory) -> MutationScope:
@@ -206,6 +285,15 @@ def create_materialized_candidate_record(
     """Create the first CandidateRecord only after exact materialization exists."""
     if type(materialization) is not CandidateMaterialization:
         raise TypeError("exact verified CandidateMaterialization required")
+    if (
+        task_id != materialization.task_id
+        or contract_id != materialization.contract_id
+        or contract_raw_sha256 != materialization.contract_raw_sha256
+        or authorization_id != materialization.authorization_id
+        or target_registration_id != materialization.target_registration_id
+        or policy_epoch_identity != materialization.policy_epoch_identity
+    ):
+        raise ValueError("candidate metadata does not match exact materialization")
     from .state import CandidateRecord
     return CandidateRecord(
         materialization.candidate_id, task_id, materialization.base, contract_id,

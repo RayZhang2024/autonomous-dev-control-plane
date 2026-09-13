@@ -64,8 +64,15 @@ from .state_reader import (
     GitHubStateReader,
     authoritative_state_binding_from_result,
 )
-from .audit import FixtureGateAudit, GateAuditOutcome, GateAuditRecord
-from .fixture_platform import FixtureGitPlatform, ProtectedEffectMarker
+from .audit import (
+    AuditAppendStatus, FixtureGateAudit, GateAuditEvent, GateAuditEventPreimage,
+    GateAuditOutcome, GateAuditRecord, build_gate_audit_event,
+)
+from .fixture_platform import (
+    ActiveFixtureRuntimeRegistry, FixtureFenceConflict, FixtureGitPlatform,
+    ProtectedEffectMarker, ProtectedEffectMarkerPreimage,
+    build_protected_effect_marker,
+)
 from .gates import (
     ActionTargetFence,
     ControlStateAuthoritativeDependency,
@@ -181,8 +188,14 @@ __all__ = [
     "DeterministicTrustedController",
     "FastForwardMergeEffectSubject",
     "FixtureGateAudit",
+    "GateAuditEvent",
+    "GateAuditEventPreimage",
+    "AuditAppendStatus",
     "FixtureGitPlatform",
+    "ActiveFixtureRuntimeRegistry",
+    "FixtureFenceConflict",
     "ProtectedEffectMarker",
+    "ProtectedEffectMarkerPreimage",
     "FixtureProtectedGateRuntime",
     "FixtureRuntimeGeneration",
     "GateAuditOutcome",
@@ -210,6 +223,8 @@ __all__ = [
     "TrustedControlCommandBoundary",
     "TrustedControlCommandKind",
     "build_candidate_materialization",
+    "build_gate_audit_event",
+    "build_protected_effect_marker",
     "derive_mutation_inventory",
     "create_materialized_candidate_record",
     "inventory_is_authorized",

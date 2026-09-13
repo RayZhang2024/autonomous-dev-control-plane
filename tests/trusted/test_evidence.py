@@ -117,7 +117,7 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         admission_event_id=subject.task_admission_event_id, target_registration_id=subject.target_registration_id,
         policy_epoch_identity=subject.policy_epoch_identity,
     )
-    start_binding = None if operation_state in (OperationState.RESERVED, OperationState.CONFLICT) else OperationStartBindingId("7" * 64)
+    start_binding = None if operation_state in (OperationState.RESERVED, OperationState.CONFLICT) else OperationStartBindingId(RawSha256("7" * 64))
     operation = OperationRecord(intent, 2, operation_state, start_binding_id=start_binding)
     binding = mint(
         TrustedReviewOperationBinding, invocation_id=subject.invocation_id, slot_id=slot.slot_id,

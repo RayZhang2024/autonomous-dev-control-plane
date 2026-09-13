@@ -37,7 +37,7 @@ RAW = RawSha256("1" * 64)
 AUTH = AuthorizationId(RAW)
 TARGET = TargetRegistrationId(RAW)
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
-START = OperationStartBindingId("9" * 64)
+START = OperationStartBindingId(RawSha256("9" * 64))
 
 
 def record(value, revision, state):

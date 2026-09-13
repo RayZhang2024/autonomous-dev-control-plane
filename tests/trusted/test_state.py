@@ -65,8 +65,8 @@ TASK_ID = TaskId("task")
 CONTRACT = ContractId("contract")
 ADMISSION = AdmissionEventId("admission")
 MEMBERSHIP = OperationMembershipBindingId("membership")
-START = OperationStartBindingId("8" * 64)
-MATERIALIZATION = CandidateMaterializationId("6" * 64)
+START = OperationStartBindingId(RawSha256("8" * 64))
+MATERIALIZATION = CandidateMaterializationId(RawSha256("6" * 64))
 
 
 def _mint(cls, **fields):

@@ -1,32 +1,135 @@
 import pickle
+import inspect
+import threading
+import hashlib
 from dataclasses import FrozenInstanceError
 
 import pytest
 
-from autodev_control.trusted.audit import FixtureGateAudit, GateAuditOutcome
-from autodev_control.trusted.backend import InMemoryCanonicalStateBackend
-from autodev_control.trusted.fixture_platform import FixtureGitPlatform, ProtectedEffectMarker
+from autodev_control.trusted.audit import (
+    AuditAppendStatus, FixtureGateAudit, GateAuditEventPreimage,
+    GateAuditOutcome, build_gate_audit_event,
+)
+from autodev_control.trusted.authorization import (
+    AdmittedAuthorization, AuthorizationOperationalConstraints, DelegationAllowance,
+    DirectAuthoritySource,
+)
+from autodev_control.trusted.backend import (
+    CanonicalTransaction, CanonicalWriteStatus, CreateAuthorization,
+    InMemoryCanonicalStateBackend, ResolvedTargetRegistration,
+    canonical_json_bytes,
+)
+from autodev_control.trusted.fixture_platform import (
+    FixtureFenceConflict, FixtureGitPlatform,
+    ProtectedEffectMarkerPreimage,
+    PublishedCandidateRefEffectSubject, build_protected_effect_marker,
+)
 from autodev_control.trusted.gates import *
-from autodev_control.trusted.identity import GitSha, ImmutableConfigId, LogicalIdentifier, RootContextId
-from autodev_control.trusted.operation import AuthoritativeStateBindingId, OperationId
-from autodev_control.trusted.scope import CanonicalBranchRef, GitHubRepositoryId, ServicePrincipalId
+from autodev_control.trusted.identity import (
+    CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId,
+    LogicalIdentifier, MutationInventoryId, PreparedProtectedStartId,
+    RawSha256, RootContextId,
+)
+from autodev_control.trusted.operation import (
+    AdmissionEventId, AuthoritativeStateBindingId, CandidateId,
+    NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
+    OperationIdempotencyKey, OperationPurpose, OperationState, OperationSubjectId,
+    TrustedOperationClassification, construct_trusted_operation_intent,
+)
+from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
+from autodev_control.trusted.materialization import (
+    GitObjectKind, GitTreeEntry, build_candidate_materialization,
+)
+from autodev_control.trusted.scope import (
+    AuthenticationEventId, AuthorizationId, AuthorizationKind, CanonicalBranchRef,
+    CanonicalGitPath, ChangeType, ContractId, GitHubRepositoryId,
+    HumanPrincipalId, MutationScope, MutationScopeRule, RepositorySelector,
+    RiskTier, ServicePrincipalId, TargetRegistrationId, TaskCapability, TaskId,
+)
+from autodev_control.trusted.state import DecisionEventId, RepairBudget
 from autodev_control.trusted.state_reader import (
     AuthenticatedGitHubReadTransport, AuthoritativeObservationProfile, GitHubStateReader,
     ReadRepositoryIdentity, RegisteredStateFactDescriptor, TrustedGitHubReadTransportBinding,
+)
+from autodev_control.trusted.target_registration import (
+    AdmittedTargetRegistration, MergeConfiguration, TargetPublication,
 )
 
 
 REPO = GitHubRepositoryId("1")
 REF = CanonicalBranchRef("refs/heads/main")
 SHA = GitSha("a" * 40)
+RAW = RawSha256("6" * 64)
+AUTH = AuthorizationId(RAW)
+TARGET = TargetRegistrationId(RawSha256("7" * 64))
+TASK = TaskId("task")
+CONTRACT = ContractId("contract")
+ADMISSION = AdmissionEventId("admission")
+EPOCH = PolicyEpochIdentity(TrustedManifestId(RawSha256("8" * 64)))
 
 
-def runtime():
+def mint(cls, **values):
+    result = object.__new__(cls)
+    for name, value in values.items():
+        object.__setattr__(result, name, value)
+    return result
+
+
+def all_scope():
+    return MutationScope((MutationScopeRule(RepositorySelector(), tuple(ChangeType)),))
+
+
+def registration(integration_refs=(REF,)):
+    return mint(
+        AdmittedTargetRegistration, target_registration_id=TARGET,
+        repository_id=REPO, policy_epoch_identity=EPOCH,
+        approved_human_principal_id=HumanPrincipalId("admin"),
+        authentication_event_id=AuthenticationEventId("target-approval"),
+        path_model="git_utf8_regular_file/v1", protected_refs=(REF,),
+        allowed_task_capabilities=(TaskCapability.IMPLEMENTATION, TaskCapability.MERGE),
+        ordinary_allowed_scope=all_scope(), ordinary_forbidden_scope=MutationScope(()),
+        risk_ceiling=RiskTier.SUPERVISED,
+        target_publication=TargetPublication(ServicePrincipalId("publication"), ImmutableConfigId("publish")),
+        merge=MergeConfiguration(ServicePrincipalId("merge"), ImmutableConfigId("merge-profile"), integration_refs),
+        validation_profile_ids=(ImmutableConfigId("validation"),),
+        controlled_runtime_profile_ids=(), event_state_profile_ids=(ImmutableConfigId("event"),),
+        adapter_config_id=ImmutableConfigId("adapter"),
+    )
+
+
+def authorization():
+    empty_ops = AuthorizationOperationalConstraints((), (), 0)
+    return mint(
+        AdmittedAuthorization, authorization_id=AUTH,
+        kind=AuthorizationKind.DIRECT_HUMAN,
+        authority_source=DirectAuthoritySource(HumanPrincipalId("human"), AuthenticationEventId("auth")),
+        ancestry=(), task_id=TASK, contract_id=CONTRACT,
+        contract_raw_sha256=RAW, target_registration_id=TARGET,
+        authorized_capabilities=(TaskCapability.IMPLEMENTATION,),
+        authorized_mutation_scope=all_scope(),
+        authorized_operational_constraints=empty_ops,
+        effective_authoritative_risk=RiskTier.ROUTINE,
+        authorization_risk_ceiling=RiskTier.ROUTINE,
+        delegation=DelegationAllowance(0, (), MutationScope(()), empty_ops, None),
+        policy_epoch_identity=EPOCH,
+    )
+
+
+def runtime(target=None):
+    target = target or registration()
     binding = GateRuntimeBinding(
-        RootContextId("root"), FixtureRuntimeGeneration(1),
+        RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
         ServicePrincipalId("control"), ServicePrincipalId("publication"), ServicePrincipalId("merge"),
     )
-    return FixtureProtectedGateRuntime(binding, InMemoryCanonicalStateBackend(), FixtureGitPlatform(), FixtureGateAudit())
+    resolved = mint(
+        ResolvedTargetRegistration, registration=target,
+        target_registration_id=TARGET, root_config_id=ImmutableConfigId("target-root"),
+        policy_epoch_identity=EPOCH,
+    )
+    return FixtureProtectedGateRuntime(
+        binding, InMemoryCanonicalStateBackend((resolved,)),
+        FixtureGitPlatform(), FixtureGateAudit(),
+    )
 
 
 def dependency(binding="binding"):
@@ -58,16 +161,139 @@ def source():
 
 
 def marker(operation="one", result="result"):
-    return ProtectedEffectMarker(
-        operation, "key", "action", "a" * 64, "b" * 64, "c" * 64,
-        "d" * 64, "root", 1, "publication", "publication", REPO,
-        "ABSENT", result, result,
+    subject = PublishedCandidateRefEffectSubject(REPO, REF, GitRef(REF.value), SHA)
+    preimage = ProtectedEffectMarkerPreimage(
+        "autodev.protected-effect-marker/v1", "publication",
+        OperationId(operation), OperationIdempotencyKey("key"),
+        OperationActionId("action"), RawSha256("a" * 64),
+        CandidateMaterializationId(RawSha256("b" * 64)),
+        MutationInventoryId(RawSha256("c" * 64)),
+        PreparedProtectedStartId(RawSha256("d" * 64)),
+        RootContextId(RawSha256("1" * 64)), 1,
+        ServicePrincipalId("publication"), subject,
+        RawSha256("e" * 64), RawSha256(("f" if result == "result" else "0") * 64),
     )
+    return build_protected_effect_marker(preimage)
+
+
+def audit_event(outcome=GateAuditOutcome.ATTEMPTED):
+    return build_gate_audit_event(GateAuditEventPreimage(
+        "autodev.gate-audit-event/v1", "gate", "op", outcome,
+        RootContextId(RawSha256("1" * 64)), 1,
+        ServicePrincipalId("control"), RawSha256("2" * 64),
+        None, None, None, None, "", "",
+    ))
+
+
+def independent_lease(value):
+    return value.acquire_control_lease(
+        value.control_capability, ControlStateAuthoritativeDependencySet(()),
+        value.attest_external_state_independence(),
+    )
+
+
+def initialize_task(value):
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+    )).status is CanonicalWriteStatus.APPLIED
+    request = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(2),
+    )
+    result = ControlStateGate(value).commit(request, independent_lease(value))
+    assert result.code is GateResultCode.COMMITTED
+
+
+def materialize(value):
+    base, commit = GitSha("a" * 40), GitSha("b" * 40)
+    base_tree = ()
+    candidate_tree = (GitTreeEntry(
+        CanonicalGitPath("src/new.py"), GitObjectKind.BLOB, "100644",
+        GitSha("c" * 40),
+    ),)
+    base_tree_id = value.platform.tree_identity(base_tree)
+    result_tree_id = value.platform.tree_identity(candidate_tree)
+    value.platform.seed_commit(base, (), base_tree, base_tree_id)
+    value.platform.seed_commit(commit, (base,), candidate_tree, result_tree_id)
+    value.platform.seed_ref(REPO, REF, base)
+    return build_candidate_materialization(
+        repository_id=REPO, task_id=TASK, candidate_id=CandidateId("candidate"),
+        contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, target_registration_id=TARGET,
+        policy_epoch_identity=EPOCH, base=base, base_tree_id=base_tree_id,
+        commit=commit, result_tree_id=result_tree_id, parent_commits=(base,),
+        base_tree=base_tree, candidate_tree=candidate_tree,
+        materialization_profile_id=ImmutableConfigId("materialization"),
+    )
+
+
+def adopt_materialization(value, materialization):
+    current = value.backend.read_task_working_set(TASK)
+    request = value.boundary.create_candidate_and_adopt(
+        task_id=TASK, materialization=materialization,
+        admission_event_id=ADMISSION,
+        decision_event_id=DecisionEventId("candidate-applicability"),
+    )
+    assert ControlStateGate(value).commit(
+        request, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+
+
+def reserve_protected(value, name, candidate_id):
+    classification = mint(
+        TrustedOperationClassification,
+        effect_class=OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT,
+        purpose=OperationPurpose.NORMAL,
+    )
+    intent = construct_trusted_operation_intent(
+        classification=classification, operation_id=OperationId(name),
+        idempotency_key=OperationIdempotencyKey("key-" + name), task_id=TASK,
+        action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
+        candidate_id=candidate_id, contract_id=CONTRACT,
+        contract_raw_sha256=RAW, authorization_id=AUTH,
+        admission_event_id=ADMISSION, target_registration_id=TARGET,
+        policy_epoch_identity=EPOCH,
+        authoritative_state_binding_id=AuthoritativeStateBindingId("state-" + name),
+        required_evidence_ids=(), integration_binding=NotIntegrationBound(),
+        is_repair_attempt=False,
+    )
+    request = value.boundary.reserve_operation(TASK, intent)
+    assert ControlStateGate(value).commit(
+        request, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+    return next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == intent.operation_id
+    )
+
+
+def start_protected(value, operation, subject, fence, materialization, *,
+                    target=None, base_ref=None, provenance_operation_id=None):
+    control = independent_lease(value)
+    capability = (
+        value.merge_capability
+        if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
+        else value.publication_capability
+    )
+    prepared = value.prepare_protected_start(
+        operation, subject, fence, control, capability,
+        all_scope(), MutationScope(()),
+        materialization=materialization,
+        target_registration=target or registration(), base_ref=base_ref,
+        provenance_operation_id=provenance_operation_id,
+    )
+    request = value.boundary.start_operation(
+        TASK, operation.intent.operation_id,
+        prepared.prepared_start.prepared_start_id,
+    )
+    return value.commit_protected_start(prepared, request, operation, subject)
 
 
 def test_gate_principals_must_be_pairwise_distinct():
     with pytest.raises(ValueError):
-        GateRuntimeBinding(RootContextId("r"), FixtureRuntimeGeneration(1),
+        GateRuntimeBinding(RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
                            ServicePrincipalId("same"), ServicePrincipalId("same"), ServicePrincipalId("merge"))
 
 
@@ -181,7 +407,7 @@ def test_fast_forward_requires_exact_current_and_parent():
 def test_effect_marker_requires_same_operation_provenance():
     platform = FixtureGitPlatform()
     platform.record_marker(marker())
-    assert platform.marker("two", "publication") is None
+    assert platform.marker(OperationId("two"), "publication") is None
 
 
 def test_effect_marker_cannot_change_result():
@@ -193,10 +419,10 @@ def test_effect_marker_cannot_change_result():
 
 def test_prepared_effect_cannot_return_from_consumed():
     platform = FixtureGitPlatform()
-    platform.prepare_effect("one", "publication")
+    platform.prepare_effect(OperationId("one"), "publication")
     platform.record_marker(marker())
     with pytest.raises(ValueError):
-        platform.prepare_effect("one", "publication")
+        platform.prepare_effect(OperationId("one"), "publication")
 
 
 def test_restart_preserves_fixture_authority_but_rotates_capabilities():
@@ -210,18 +436,30 @@ def test_restart_preserves_fixture_authority_but_rotates_capabilities():
 
 def test_audit_is_append_only_snapshot():
     audit = FixtureGateAudit()
-    assert audit.append("gate", "op", GateAuditOutcome.ATTEMPTED)
+    assert audit.append_event(audit_event()) is AuditAppendStatus.APPENDED
     snapshot = audit.snapshot()
     assert snapshot[0].sequence == 1
     with pytest.raises(FrozenInstanceError):
-        snapshot[0].detail = "changed"
+        snapshot[0].sequence = 2
 
 
 def test_injected_audit_failure_does_not_append_record():
     audit = FixtureGateAudit()
     audit.fail_next_append_for_test()
-    assert not audit.append("gate", "op", GateAuditOutcome.ATTEMPTED)
+    assert audit.append_event(audit_event()) is AuditAppendStatus.INTEGRITY_FAILURE
     assert audit.snapshot() == ()
+
+
+def test_audit_identity_is_canonical_idempotent_and_conflict_detecting():
+    audit = FixtureGateAudit()
+    event = audit_event()
+    assert audit.append_event(event) is AuditAppendStatus.APPENDED
+    assert audit.append_event(event) is AuditAppendStatus.ALREADY_PRESENT
+    conflicting = object.__new__(type(event))
+    object.__setattr__(conflicting, "event_id", event.event_id)
+    object.__setattr__(conflicting, "preimage", audit_event(GateAuditOutcome.DENIED).preimage)
+    assert audit.append_event(conflicting) is AuditAppendStatus.IDENTITY_CONFLICT
+    assert len(audit.snapshot()) == 1
 
 
 @pytest.mark.parametrize("subject", list(ProtectedEffectSubject))
@@ -245,6 +483,566 @@ def test_closed_gate_result_domain(code):
 
 
 def test_start_binding_changes_with_action_fence():
-    one = ActionTargetFence(REPO, REF, SHA, 1)
-    two = ActionTargetFence(REPO, REF, SHA, 2)
-    assert operation_start_binding_id(OperationId("op"), one, ProtectedEffectSubject.FAST_FORWARD_MERGE) != operation_start_binding_id(OperationId("op"), two, ProtectedEffectSubject.FAST_FORWARD_MERGE)
+    prepared = PreparedProtectedStartId(RawSha256("a" * 64))
+    binding = operation_start_binding_id(prepared)
+    assert binding.raw_sha256 == prepared.raw_sha256
+    assert type(binding) is not type(prepared)
+
+
+def test_controller_exposes_no_transaction_taking_decision_method():
+    for name, member in inspect.getmembers(DeterministicTrustedController, inspect.isfunction):
+        if name.startswith("__"):
+            continue
+        assert "CanonicalTransaction" not in str(inspect.signature(member))
+
+
+def test_semantic_create_task_flows_through_lease_and_g6_commit():
+    value = runtime()
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+    )).status is CanonicalWriteStatus.APPLIED
+    request = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(2),
+    )
+    with pytest.raises(FrozenInstanceError):
+        request.transaction = CanonicalTransaction(value.backend.occurrence, (), ())
+    assert ControlStateGate(value).commit(
+        request, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+    assert value.backend.read_task_working_set(TASK).task.task_id == TASK
+
+
+def test_dependency_mutation_cannot_linearize_while_control_lease_is_live():
+    value = runtime()
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+    )).status is CanonicalWriteStatus.APPLIED
+    request = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(1),
+    )
+    profile, reader = source()
+    expected = reader.read_authoritative(REPO, profile).binding_id
+    value.register_authoritative_source(profile, reader)
+    lease = value.acquire_control_lease(
+        value.control_capability,
+        ControlStateAuthoritativeDependencySet((ControlStateAuthoritativeDependency(
+            REPO, profile.profile_id, reader._binding.config_id, expected,
+        ),)),
+    )
+    completed = threading.Event()
+    failures = []
+
+    def mutate():
+        try:
+            value.platform.seed_ref(REPO, REF, SHA)
+        except FixtureFenceConflict as error:
+            failures.append(error)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=mutate)
+    thread.start()
+    assert completed.wait(1)
+    assert len(failures) == 1
+    assert value.platform.read_ref(REPO, REF) is None
+    assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+    thread.join()
+
+
+def test_same_thread_fenced_fixture_mutation_is_rejected_deterministically():
+    value = runtime()
+    dependency_facts = frozenset({("repository", REPO)})
+    token = value.registry.acquire(value, dependency_facts)
+    with pytest.raises(FixtureFenceConflict):
+        value.platform.seed_ref(REPO, REF, SHA)
+    value.registry.release(token)
+
+
+def test_runtime_replacement_waits_for_live_lease_and_retires_old_runtime():
+    value = runtime()
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+    )).status is CanonicalWriteStatus.APPLIED
+    request = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(1),
+    )
+    lease = independent_lease(value)
+    with pytest.raises(RuntimeError):
+        FixtureProtectedGateRuntime(
+            value.binding, value.backend, value.platform, value.audit, value.registry
+        )
+    assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+    restarted = value.restart()
+    assert restarted.binding.runtime_generation == value.binding.runtime_generation
+    assert independent_lease(value) is None
+    assert independent_lease(restarted) is not None
+
+
+def test_new_generation_retires_old_runtime_for_normal_work():
+    old = runtime()
+    replacement = FixtureProtectedGateRuntime(
+        GateRuntimeBinding(
+            RootContextId(RawSha256("9" * 64)), FixtureRuntimeGeneration(2),
+            ServicePrincipalId("control"), ServicePrincipalId("publication"),
+            ServicePrincipalId("merge"),
+        ), old.backend, old.platform, old.audit, old.registry,
+    )
+    assert independent_lease(old) is None
+    assert type(independent_lease(replacement)) is ControlStateCommitLease
+
+
+def test_prepared_start_to_publication_and_one_use_continuation():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    assert started.code is GateResultCode.START_COMMITTED
+    assert started.continuation.start_binding_id.raw_sha256 == started.continuation.prepared_start_id.raw_sha256
+    published = TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    )
+    assert published.code is GateResultCode.EFFECT_SUCCEEDED
+    assert value.platform.read_ref(REPO, materialization.candidate_branch) == materialization.commit
+    assert TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    ).code is GateResultCode.LEASE_CONSUMED
+
+
+def test_target_mutation_cannot_linearize_across_prepared_start_and_effect():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish-fenced", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        independent_lease(value), value.publication_capability,
+        all_scope(), MutationScope(()), materialization=materialization,
+        target_registration=registration(),
+    )
+    completed = threading.Event()
+    failures = []
+
+    def mutate_target():
+        try:
+            value.platform.create_ref_if_absent(
+                REPO, materialization.candidate_branch, materialization.commit
+            )
+        except FixtureFenceConflict as error:
+            failures.append(error)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=mutate_target)
+    thread.start()
+    assert completed.wait(1)
+    assert len(failures) == 1
+    request = value.boundary.start_operation(
+        TASK, operation.intent.operation_id,
+        prepared.prepared_start.prepared_start_id,
+    )
+    started = value.commit_protected_start(
+        prepared, request, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    thread.join()
+
+
+def test_same_operation_exact_marker_and_postcondition_is_already_applied():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish-replay", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    continuation = started.continuation
+    effect_subject = PublishedCandidateRefEffectSubject(
+        REPO, materialization.candidate_branch,
+        GitRef(materialization.candidate_branch.value), materialization.commit,
+    )
+    pre_identity = RawSha256(hashlib.sha256(
+        canonical_json_bytes(("pre", fence))
+    ).hexdigest())
+    post_identity = RawSha256(hashlib.sha256(
+        canonical_json_bytes(("post", effect_subject))
+    ).hexdigest())
+    action_digest = RawSha256(hashlib.sha256(canonical_json_bytes((
+        continuation.subject, continuation.action_id,
+        materialization.materialization_id,
+        materialization.inventory.inventory_id, effect_subject,
+    ))).hexdigest())
+    exact = build_protected_effect_marker(ProtectedEffectMarkerPreimage(
+        "autodev.protected-effect-marker/v1", continuation.subject.value,
+        continuation.operation_id, continuation.idempotency_key,
+        continuation.action_id, action_digest, materialization.materialization_id,
+        materialization.inventory.inventory_id, continuation.prepared_start_id,
+        value.binding.root_context_id, value.binding.runtime_generation.value,
+        value.publication_capability.service_identity, effect_subject,
+        pre_identity, post_identity,
+    ))
+    assert value.platform.publish_and_mark(
+        REPO, materialization.candidate_branch, materialization.commit, exact,
+        _fence_token=continuation.target_fence_token,
+    )
+    assert TargetPublicationGate(value).perform(
+        continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    ).code is GateResultCode.ALREADY_APPLIED
+
+
+def test_manual_same_sha_candidate_branch_conflicts_before_start():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish", materialization.candidate_id)
+    value.platform.create_ref_if_absent(
+        REPO, materialization.candidate_branch, materialization.commit
+    )
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    assert started.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
+    canonical = value.backend.read_task_working_set(TASK)
+    stored = next(item for item in canonical.operations if item.intent.operation_id == operation.intent.operation_id)
+    assert stored.state is OperationState.CONFLICT
+
+
+def test_start_audit_failure_mints_no_continuation_and_reconciles_failed():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    value.audit.fail_append_after_for_test(2)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    assert started.code is GateResultCode.AUDIT_FAILURE_AFTER_COMMIT
+    assert started.continuation is None
+    canonical = value.backend.read_task_working_set(TASK)
+    stored = next(item for item in canonical.operations if item.intent.operation_id == operation.intent.operation_id)
+    assert stored.state is OperationState.FAILED
+
+
+def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+
+    publish = reserve_protected(value, "publish-chain", materialization.candidate_id)
+    publish_fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    publish_start = start_protected(
+        value, publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        publish_fence, materialization,
+    )
+    assert TargetPublicationGate(value).perform(
+        publish_start.continuation, materialization=materialization,
+        base_ref=None, target_registration=registration(),
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    publication_marker = value.platform.marker(
+        publish.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    )
+    assert type(publication_marker.preimage.effect_subject) is PublishedCandidateRefEffectSubject
+
+    create_pr = reserve_protected(value, "create-pr", materialization.candidate_id)
+    pr_fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, materialization.commit,
+        value.platform.snapshot().generation, REF, materialization.base,
+    )
+    pr_start = start_protected(
+        value, create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION, pr_fence,
+        materialization, base_ref=REF,
+        provenance_operation_id=publish.intent.operation_id,
+    )
+    assert TargetPublicationGate(value).perform(
+        pr_start.continuation, materialization=materialization, base_ref=REF,
+        target_registration=registration(),
+        provenance_operation_id=publish.intent.operation_id,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    pr_marker = value.platform.marker(
+        create_pr.intent.operation_id,
+        ProtectedEffectSubject.PULL_REQUEST_CREATION.value,
+    )
+    assert type(pr_marker.preimage.effect_subject) is CreatedCandidatePrEffectSubject
+    assert pr_marker.preimage.effect_subject.base_ref == GitRef(REF.value)
+
+    merge = reserve_protected(value, "merge", materialization.candidate_id)
+    merge_fence = ActionTargetFence(
+        REPO, REF, materialization.base, value.platform.snapshot().generation
+    )
+    merge_start = start_protected(
+        value, merge, ProtectedEffectSubject.FAST_FORWARD_MERGE, merge_fence,
+        materialization, provenance_operation_id=create_pr.intent.operation_id,
+    )
+    assert MergeGate(value).perform(
+        merge_start.continuation, materialization=materialization,
+        target_registration=registration(),
+        provenance_operation_id=create_pr.intent.operation_id,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    merge_marker = value.platform.marker(
+        merge.intent.operation_id,
+        ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+    )
+    assert type(merge_marker.preimage.effect_subject) is FastForwardMergeEffectSubject
+    assert value.platform.read_ref(REPO, REF) == materialization.commit
+    assert value.platform.pull_request(
+        pr_marker.preimage.effect_subject.pull_request_number
+    ).merged
+
+
+def test_pr_marker_for_different_base_ref_same_sha_cannot_authorize_merge():
+    alternate = CanonicalBranchRef("refs/heads/release")
+    target = registration((REF, alternate))
+    value = runtime(target)
+    initialize_task(value)
+    materialization = materialize(value)
+    value.platform.seed_ref(REPO, alternate, materialization.base)
+    adopt_materialization(value, materialization)
+
+    publish = reserve_protected(value, "publish-wrong-base", materialization.candidate_id)
+    publish_start = start_protected(value, publish,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation), materialization,
+        target=target)
+    assert TargetPublicationGate(value).perform(
+        publish_start.continuation, materialization=materialization,
+        base_ref=None, target_registration=target,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    create_pr = reserve_protected(value, "pr-wrong-base", materialization.candidate_id)
+    pr_start = start_protected(value, create_pr,
+        ProtectedEffectSubject.PULL_REQUEST_CREATION,
+        ActionTargetFence(REPO, materialization.candidate_branch,
+                          materialization.commit, value.platform.snapshot().generation,
+                          alternate, materialization.base), materialization,
+        target=target, base_ref=alternate,
+        provenance_operation_id=publish.intent.operation_id)
+    assert TargetPublicationGate(value).perform(
+        pr_start.continuation, materialization=materialization,
+        base_ref=alternate, target_registration=target,
+        provenance_operation_id=publish.intent.operation_id,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    merge = reserve_protected(value, "merge-wrong-base", materialization.candidate_id)
+    with pytest.raises(ValueError):
+        start_protected(value, merge,
+            ProtectedEffectSubject.FAST_FORWARD_MERGE,
+            ActionTargetFence(REPO, REF, materialization.base,
+                              value.platform.snapshot().generation), materialization,
+            target=target, provenance_operation_id=create_pr.intent.operation_id)
+    assert value.platform.read_ref(REPO, REF) == materialization.base
+
+
+def test_manual_equivalent_pr_cannot_substitute_for_exact_pr_marker():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    publish = reserve_protected(value, "publish-manual-pr", materialization.candidate_id)
+    publish_start = start_protected(value, publish,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation), materialization)
+    assert TargetPublicationGate(value).perform(
+        publish_start.continuation, materialization=materialization,
+        base_ref=None, target_registration=registration(),
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    value.platform.create_pull_request(
+        REPO, materialization.candidate_branch, REF, materialization.commit
+    )
+    merge = reserve_protected(value, "merge-manual-pr", materialization.candidate_id)
+    with pytest.raises(ValueError):
+        start_protected(value, merge,
+            ProtectedEffectSubject.FAST_FORWARD_MERGE,
+            ActionTargetFence(REPO, REF, materialization.base,
+                              value.platform.snapshot().generation), materialization,
+            provenance_operation_id=OperationId("manual-pr"))
+    assert value.platform.read_ref(REPO, REF) == materialization.base
+
+
+def test_target_effect_audit_failure_preserves_marker_and_restart_reconciles_without_replay():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish-audit", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    value.audit.fail_next_append_for_test()
+    result = TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    )
+    assert result.code is GateResultCode.AUDIT_FAILURE_AFTER_COMMIT
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is not None
+    restarted = value.restart()
+    performing = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert restarted.reconcile_recovered_effect(
+        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ControlStateAuthoritativeDependencySet(()),
+        restarted.attest_external_state_independence(),
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    assert value.reconcile_recovered_effect(
+        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ControlStateAuthoritativeDependencySet(()),
+        value.attest_external_state_independence(),
+    ).code is GateResultCode.LEASE_INVALID
+
+
+def test_post_start_target_conflict_proves_absence_releases_and_reconciles_failed():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "publish-conflict", materialization.candidate_id)
+    started = start_protected(value, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation), materialization)
+    value.platform.fail_next_effect_for_test()
+    result = TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    )
+    assert result.code is GateResultCode.PRECONDITION_CONFLICT
+    assert value.platform.read_ref(REPO, materialization.candidate_branch) is None
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.FAILED
+
+
+def test_recovered_performing_with_prepared_and_no_marker_releases_and_fails():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "prepared-recovery", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        materialization,
+    )
+    # Restart itself models process loss and discards all ephemeral authority.
+    restarted = value.restart()
+    assert not started.continuation.target_fence_token.active
+    performing = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert restarted.reconcile_recovered_effect(
+        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ControlStateAuthoritativeDependencySet(()),
+        restarted.attest_external_state_independence(),
+    ).code is GateResultCode.EFFECT_FAILED
+    assert restarted.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+    canonical = restarted.backend.read_task_working_set(TASK)
+    stored = next(item for item in canonical.operations if item.intent.operation_id == operation.intent.operation_id)
+    assert stored.state is OperationState.FAILED
+
+
+def test_contradictory_consumed_marker_postcondition_reconciles_indeterminate():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "contradictory", materialization.candidate_id)
+    started = start_protected(value, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation), materialization)
+    assert TargetPublicationGate(value).perform(
+        started.continuation, materialization=materialization, base_ref=None,
+        target_registration=registration(),
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    value.platform.seed_ref(REPO, materialization.candidate_branch, GitSha("d" * 40))
+    restarted = value.restart()
+    performing = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert restarted.reconcile_recovered_effect(
+        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ControlStateAuthoritativeDependencySet(()),
+        restarted.attest_external_state_independence(),
+    ).code is GateResultCode.INDETERMINATE
+    stored = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.INDETERMINATE

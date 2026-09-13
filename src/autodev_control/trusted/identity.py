@@ -63,31 +63,62 @@ class RawSha256:
 
 @dataclass(frozen=True, slots=True)
 class CandidateMaterializationId:
-    value: str
+    raw_sha256: RawSha256
 
     def __post_init__(self) -> None:
-        _lower_hex(self.value, (64,))
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
 
 
 @dataclass(frozen=True, slots=True)
 class MutationInventoryId:
-    value: str
+    raw_sha256: RawSha256
 
     def __post_init__(self) -> None:
-        _lower_hex(self.value, (64,))
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
 
 
 @dataclass(frozen=True, slots=True)
 class OperationStartBindingId:
-    value: str
+    raw_sha256: RawSha256
 
     def __post_init__(self) -> None:
-        _lower_hex(self.value, (64,))
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
 
 
 @dataclass(frozen=True, slots=True)
 class RootContextId:
-    value: str
+    raw_sha256: RawSha256
 
     def __post_init__(self) -> None:
-        _unicode_string(self.value, 512)
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProtectedStartId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedEffectMarkerId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class GateAuditEventId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")

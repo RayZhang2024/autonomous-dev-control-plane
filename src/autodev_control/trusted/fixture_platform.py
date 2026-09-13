@@ -6,9 +6,16 @@ from dataclasses import dataclass, replace
 import hashlib
 from threading import RLock
 
-from .identity import GitSha
+from .backend import canonical_json_bytes
+from .identity import (
+    CandidateMaterializationId, GitRef, GitSha, MutationInventoryId,
+    PreparedProtectedStartId, ProtectedEffectMarkerId, RawSha256, RootContextId,
+)
 from .materialization import CandidateMaterialization, GitTreeEntry, derive_mutation_inventory
+from .operation import OperationActionId, OperationId, OperationIdempotencyKey
 from .scope import CanonicalBranchRef, GitHubRepositoryId
+from .scope import ServicePrincipalId
+from .state_reader import GitHubPullRequestNumber
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,41 +30,129 @@ class FixturePullRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ProtectedEffectMarker:
-    operation_id: str
-    idempotency_key: str
-    action_id: str
-    action_digest: str
-    materialization_id: str
-    mutation_inventory_id: str
-    prepared_start_binding_id: str
-    root_context_id: str
-    runtime_generation: int
-    service_identity: str
-    effect_subject: str
+class PublishedCandidateRefEffectSubject:
     repository_id: GitHubRepositoryId
-    pre_state_identity: str
-    post_state_identity: str
-    result_identity: str
+    destination_branch: CanonicalBranchRef
+    platform_ref: GitRef
+    published_commit: GitSha
 
     def __post_init__(self) -> None:
-        strings = (
-            self.operation_id, self.idempotency_key, self.action_id, self.action_digest,
-            self.materialization_id, self.mutation_inventory_id,
-            self.prepared_start_binding_id, self.root_context_id, self.service_identity,
-            self.effect_subject, self.pre_state_identity, self.post_state_identity,
-            self.result_identity,
+        if (type(self.repository_id) is not GitHubRepositoryId
+                or type(self.destination_branch) is not CanonicalBranchRef
+                or type(self.platform_ref) is not GitRef
+                or type(self.published_commit) is not GitSha):
+            raise TypeError("published candidate-ref subject has wrong exact type")
+        if self.platform_ref != GitRef(self.destination_branch.value):
+            raise ValueError("canonical destination and platform ref differ")
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedCandidatePrEffectSubject:
+    repository_id: GitHubRepositoryId
+    pull_request_number: GitHubPullRequestNumber
+    head_ref: GitRef
+    head_sha: GitSha
+    base_ref: GitRef
+    base_sha: GitSha
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.repository_id, GitHubRepositoryId),
+            (self.pull_request_number, GitHubPullRequestNumber),
+            (self.head_ref, GitRef), (self.head_sha, GitSha),
+            (self.base_ref, GitRef), (self.base_sha, GitSha),
         )
-        if any(type(item) is not str or not item for item in strings):
-            raise ValueError("marker identities must be non-empty exact strings")
-        if any(len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
-               for value in (self.action_digest, self.materialization_id,
-                             self.mutation_inventory_id, self.prepared_start_binding_id)):
-            raise ValueError("marker digest identities must be lowercase SHA-256")
-        if type(self.runtime_generation) is not int or self.runtime_generation < 1:
-            raise ValueError("marker runtime generation must be positive")
-        if type(self.repository_id) is not GitHubRepositoryId:
-            raise TypeError("marker repository identity has wrong exact type")
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("created candidate-PR subject has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
+class FastForwardMergeEffectSubject:
+    repository_id: GitHubRepositoryId
+    pull_request_number: GitHubPullRequestNumber
+    integration_ref: GitRef
+    before_sha: GitSha
+    after_sha: GitSha
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.repository_id, GitHubRepositoryId),
+            (self.pull_request_number, GitHubPullRequestNumber),
+            (self.integration_ref, GitRef), (self.before_sha, GitSha),
+            (self.after_sha, GitSha),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("fast-forward merge subject has wrong exact type")
+
+
+EffectSubject = PublishedCandidateRefEffectSubject | CreatedCandidatePrEffectSubject | FastForwardMergeEffectSubject
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedEffectMarkerPreimage:
+    format: str
+    gate_action: str
+    operation_id: OperationId
+    idempotency_key: OperationIdempotencyKey
+    action_id: OperationActionId
+    action_digest: RawSha256
+    materialization_id: CandidateMaterializationId
+    mutation_inventory_id: MutationInventoryId
+    prepared_start_id: PreparedProtectedStartId
+    root_context_id: RootContextId
+    runtime_generation: int
+    service_identity: ServicePrincipalId
+    effect_subject: EffectSubject
+    pre_state_identity: RawSha256
+    post_state_identity: RawSha256
+    prerequisite_marker_id: ProtectedEffectMarkerId | None = None
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.gate_action, str), (self.operation_id, OperationId),
+            (self.idempotency_key, OperationIdempotencyKey),
+            (self.action_id, OperationActionId), (self.action_digest, RawSha256),
+            (self.materialization_id, CandidateMaterializationId),
+            (self.mutation_inventory_id, MutationInventoryId),
+            (self.prepared_start_id, PreparedProtectedStartId),
+            (self.root_context_id, RootContextId),
+            (self.runtime_generation, int),
+            (self.service_identity, ServicePrincipalId),
+            (self.pre_state_identity, RawSha256),
+            (self.post_state_identity, RawSha256),
+        )
+        if self.format != "autodev.protected-effect-marker/v1":
+            raise ValueError("unsupported protected effect marker format")
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("protected effect marker preimage has wrong exact type")
+        if type(self.effect_subject) not in (
+            PublishedCandidateRefEffectSubject, CreatedCandidatePrEffectSubject,
+            FastForwardMergeEffectSubject,
+        ):
+            raise TypeError("marker effect subject is outside the closed domain")
+        if (self.prerequisite_marker_id is not None
+                and type(self.prerequisite_marker_id) is not ProtectedEffectMarkerId):
+            raise TypeError("prerequisite marker identity has wrong exact type")
+        if self.runtime_generation < 1:
+            raise ValueError("runtime generation must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedEffectMarker:
+    marker_id: ProtectedEffectMarkerId
+    preimage: ProtectedEffectMarkerPreimage
+
+    def __post_init__(self) -> None:
+        if type(self.marker_id) is not ProtectedEffectMarkerId or type(self.preimage) is not ProtectedEffectMarkerPreimage:
+            raise TypeError("marker fields have wrong exact type")
+        expected = ProtectedEffectMarkerId(RawSha256(hashlib.sha256(canonical_json_bytes(self.preimage)).hexdigest()))
+        if self.marker_id != expected:
+            raise ValueError("marker identity does not match canonical content")
+
+
+def build_protected_effect_marker(preimage: ProtectedEffectMarkerPreimage) -> ProtectedEffectMarker:
+    identity = ProtectedEffectMarkerId(RawSha256(hashlib.sha256(canonical_json_bytes(preimage)).hexdigest()))
+    return ProtectedEffectMarker(identity, preimage)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,42 +164,141 @@ class FixturePlatformSnapshot:
     prepared_effects: tuple[tuple[str, str, str], ...]
 
 
+class FixtureFenceConflict(RuntimeError):
+    pass
+
+
+class FixtureFenceToken:
+    __slots__ = ("owner", "facts", "active")
+
+    def __init__(self, owner: object, facts: frozenset[tuple]) -> None:
+        self.owner, self.facts, self.active = owner, facts, True
+
+
+class ActiveFixtureRuntimeRegistry:
+    """Shared root/runtime authority and cross-store synchronization substrate."""
+
+    __slots__ = ("lock", "_active", "_live")
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self._active: tuple[RootContextId, int, object, object, object] | None = None
+        self._live: set[FixtureFenceToken] = set()
+
+    def activate(self, root: RootContextId, generation: int, control: object,
+                 publication: object, merge: object) -> bool:
+        if type(root) is not RootContextId or type(generation) is not int or generation < 1:
+            raise TypeError("active root/runtime identity has wrong exact type")
+        if len({id(control), id(publication), id(merge)}) != 3:
+            raise ValueError("active gate runtimes must be pairwise distinct")
+        with self.lock:
+            if self._live:
+                return False
+            self._active = root, generation, control, publication, merge
+            return True
+
+    def is_active(self, root: RootContextId, generation: int, control: object,
+                  publication: object, merge: object) -> bool:
+        with self.lock:
+            return self._active == (root, generation, control, publication, merge)
+
+    @property
+    def has_active_runtime(self) -> bool:
+        with self.lock:
+            return self._active is not None
+
+    def acquire(self, owner: object, facts: frozenset[tuple]) -> FixtureFenceToken | None:
+        with self.lock:
+            if self._active is None:
+                return None
+            token = FixtureFenceToken(owner, facts)
+            self._live.add(token)
+            return token
+
+    def release(self, token: FixtureFenceToken) -> None:
+        with self.lock:
+            if token in self._live and token.active:
+                token.active = False
+                self._live.remove(token)
+
+    def retire_owner_for_restart(self, owner: object) -> None:
+        """Model process loss: ephemeral authorities owned by that runtime vanish."""
+        with self.lock:
+            for token in tuple(self._live):
+                if token.owner is owner:
+                    token.active = False
+                    self._live.remove(token)
+
+    def assert_mutation_allowed(self, fact: tuple, token: FixtureFenceToken | None = None) -> None:
+        for live in self._live:
+            if live is not token and fact in live.facts:
+                raise FixtureFenceConflict("authoritative fixture fact is fenced by a live lease")
+
+
 class FixtureGitPlatform:
     """Authoritative fixture state. It performs no network or provider calls."""
 
-    __slots__ = ("_lock", "_generation", "_refs", "_prs", "_markers", "_prepared", "_commits")
+    __slots__ = ("_lock", "_registry", "_generation", "_refs", "_prs", "_markers", "_prepared", "_commits", "_fail_next_effect")
 
     def __init__(self) -> None:
+        self._registry: ActiveFixtureRuntimeRegistry | None = None
         self._lock = RLock()
         self._generation = 1
         self._refs: dict[tuple[GitHubRepositoryId, CanonicalBranchRef], GitSha] = {}
         self._prs: list[FixturePullRequest] = []
-        self._markers: dict[tuple[str, str], ProtectedEffectMarker] = {}
-        self._prepared: dict[tuple[str, str], str] = {}
-        self._commits: dict[GitSha, tuple[tuple[GitSha, ...], tuple[GitTreeEntry, ...]]] = {}
+        self._markers: dict[tuple[OperationId, str], ProtectedEffectMarker] = {}
+        self._prepared: dict[tuple[OperationId, str], str] = {}
+        self._commits: dict[GitSha, tuple[tuple[GitSha, ...], GitSha, tuple[GitTreeEntry, ...]]] = {}
+        self._fail_next_effect = False
+
+    def fail_next_effect_for_test(self) -> None:
+        with self._lock:
+            self._fail_next_effect = True
+
+    def _consume_effect_failure(self) -> bool:
+        if self._fail_next_effect:
+            self._fail_next_effect = False
+            return True
+        return False
+
+    def attach_registry(self, registry: ActiveFixtureRuntimeRegistry) -> None:
+        if type(registry) is not ActiveFixtureRuntimeRegistry:
+            raise TypeError("exact ActiveFixtureRuntimeRegistry required")
+        if self._registry is not None and self._registry is not registry:
+            raise ValueError("fixture platform is already attached to another runtime registry")
+        self._registry, self._lock = registry, registry.lock
+
+    def _guard(self, fact: tuple, token: FixtureFenceToken | None = None) -> None:
+        if self._registry is not None:
+            self._registry.assert_mutation_allowed(fact, token)
 
     def snapshot(self) -> FixturePlatformSnapshot:
         with self._lock:
             refs = tuple(sorted(((r, b, s) for (r, b), s in self._refs.items()), key=lambda x: (x[0].value, x[1].value)))
-            prepared = tuple((key[0], key[1], value) for key, value in sorted(self._prepared.items()))
+            prepared = tuple(
+                (key[0].value, key[1], value)
+                for key, value in sorted(self._prepared.items(), key=lambda item: (item[0][0].value, item[0][1]))
+            )
             return FixturePlatformSnapshot(self._generation, refs, tuple(self._prs), tuple(self._markers.values()), prepared)
 
-    def prepare_effect(self, operation_id: str, subject: str) -> None:
+    def prepare_effect(self, operation_id: OperationId, gate_action: str, *, _fence_token: FixtureFenceToken | None = None) -> None:
         with self._lock:
-            key = operation_id, subject
+            self._guard(("prepared", operation_id, gate_action), _fence_token)
+            key = operation_id, gate_action
             if key in self._markers:
                 raise ValueError("completed effect cannot return to PREPARED")
             if self._prepared.setdefault(key, "PREPARED") != "PREPARED":
                 raise ValueError("terminal prepared state cannot return to PREPARED")
             self._generation += 1
 
-    def prepared_effect_state(self, operation_id: str, subject: str) -> str | None:
+    def prepared_effect_state(self, operation_id: OperationId, gate_action: str) -> str | None:
         with self._lock:
-            return self._prepared.get((operation_id, subject))
+            return self._prepared.get((operation_id, gate_action))
 
-    def release_prepared_effect(self, operation_id: str, subject: str) -> bool:
+    def release_prepared_effect(self, operation_id: OperationId, gate_action: str, *, _fence_token: FixtureFenceToken | None = None) -> bool:
         with self._lock:
-            key = operation_id, subject
+            self._guard(("prepared", operation_id, gate_action), _fence_token)
+            key = operation_id, gate_action
             if self._prepared.get(key) != "PREPARED" or key in self._markers:
                 return False
             self._prepared[key] = "RELEASED"
@@ -113,17 +307,30 @@ class FixtureGitPlatform:
 
     def seed_ref(self, repository_id: GitHubRepositoryId, ref: CanonicalBranchRef, sha: GitSha) -> None:
         with self._lock:
+            self._guard(("repository", repository_id))
+            self._guard(("ref", repository_id, ref))
             self._refs[(repository_id, ref)] = sha
             self._generation += 1
 
+    @staticmethod
+    def tree_identity(tree: tuple[GitTreeEntry, ...]) -> GitSha:
+        if type(tree) is not tuple or any(type(item) is not GitTreeEntry for item in tree):
+            raise TypeError("tree must be an exact tuple of GitTreeEntry")
+        return GitSha(hashlib.sha256(canonical_json_bytes(("fixture-git-tree/v1", tree))).hexdigest())
+
     def seed_commit(self, sha: GitSha, parents: tuple[GitSha, ...],
-                    tree: tuple[GitTreeEntry, ...]) -> None:
+                    tree: tuple[GitTreeEntry, ...], tree_id: GitSha | None = None) -> None:
         if type(sha) is not GitSha or type(parents) is not tuple or type(tree) is not tuple:
             raise TypeError("commit fixture fields have wrong exact type")
         if any(type(item) is not GitSha for item in parents) or any(type(item) is not GitTreeEntry for item in tree):
             raise TypeError("commit fixture member has wrong exact type")
+        if tree_id is None:
+            tree_id = self.tree_identity(tree)
+        if type(tree_id) is not GitSha:
+            raise TypeError("tree_id must be exact GitSha")
         with self._lock:
-            value = parents, tree
+            self._guard(("commit", sha))
+            value = parents, tree_id, tree
             if sha in self._commits and self._commits[sha] != value:
                 raise ValueError("immutable commit identity conflict")
             self._commits[sha] = value
@@ -135,10 +342,13 @@ class FixtureGitPlatform:
         with self._lock:
             base = self._commits.get(materialization.base)
             candidate = self._commits.get(materialization.commit)
-            if base is None or candidate is None or candidate[0] != (materialization.base,):
+            if (base is None or candidate is None
+                    or candidate[0] != (materialization.base,)
+                    or base[1] != materialization.base_tree
+                    or candidate[1] != materialization.result_tree):
                 return False
             try:
-                inventory = derive_mutation_inventory(base[1], candidate[1])
+                inventory = derive_mutation_inventory(base[2], candidate[2])
             except (TypeError, ValueError):
                 return False
             return inventory == materialization.inventory
@@ -149,6 +359,8 @@ class FixtureGitPlatform:
 
     def create_ref_if_absent(self, repository_id: GitHubRepositoryId, ref: CanonicalBranchRef, sha: GitSha) -> bool:
         with self._lock:
+            self._guard(("repository", repository_id))
+            self._guard(("ref", repository_id, ref))
             key = (repository_id, ref)
             if key in self._refs:
                 return False
@@ -159,6 +371,8 @@ class FixtureGitPlatform:
     def create_pull_request(self, repository_id: GitHubRepositoryId, head: CanonicalBranchRef,
                             base: CanonicalBranchRef, head_sha: GitSha) -> FixturePullRequest:
         with self._lock:
+            self._guard(("repository", repository_id))
+            self._guard(("prs", repository_id))
             if self._refs.get((repository_id, head)) != head_sha:
                 raise ValueError("pull request head does not match authoritative ref")
             base_sha = self._refs.get((repository_id, base))
@@ -173,11 +387,29 @@ class FixtureGitPlatform:
         with self._lock:
             return len(self._prs) + 1
 
-    def publish_and_mark(self, repository_id: GitHubRepositoryId, ref: CanonicalBranchRef,
-                         sha: GitSha, marker: ProtectedEffectMarker) -> bool:
+    def pull_request(self, number: GitHubPullRequestNumber) -> FixturePullRequest | None:
+        if type(number) is not GitHubPullRequestNumber:
+            raise TypeError("exact GitHubPullRequestNumber required")
         with self._lock:
-            key, marker_key = (repository_id, ref), (marker.operation_id, marker.effect_subject)
-            if key in self._refs or marker_key in self._markers or marker.repository_id != repository_id:
+            return next((item for item in self._prs if item.number == number.value), None)
+
+    def publish_and_mark(self, repository_id: GitHubRepositoryId, ref: CanonicalBranchRef,
+                         sha: GitSha, marker: ProtectedEffectMarker, *,
+                         _fence_token: FixtureFenceToken | None = None) -> bool:
+        with self._lock:
+            self._guard(("repository", repository_id), _fence_token)
+            self._guard(("ref", repository_id, ref), _fence_token)
+            marker_key = marker.preimage.operation_id, marker.preimage.gate_action
+            self._guard(("prepared", *marker_key), _fence_token)
+            key = repository_id, ref
+            subject = marker.preimage.effect_subject
+            if self._consume_effect_failure():
+                return False
+            if (key in self._refs or marker_key in self._markers
+                    or type(subject) is not PublishedCandidateRefEffectSubject
+                    or subject.repository_id != repository_id
+                    or subject.destination_branch != ref or subject.platform_ref != GitRef(ref.value)
+                    or subject.published_commit != sha):
                 return False
             self._refs[key] = sha
             self._markers[marker_key] = marker
@@ -187,13 +419,25 @@ class FixtureGitPlatform:
 
     def create_pull_request_and_mark(self, repository_id: GitHubRepositoryId,
                                      head: CanonicalBranchRef, base: CanonicalBranchRef,
-                                     head_sha: GitSha, marker: ProtectedEffectMarker) -> FixturePullRequest | None:
+                                     head_sha: GitSha, marker: ProtectedEffectMarker, *,
+                                     _fence_token: FixtureFenceToken | None = None) -> FixturePullRequest | None:
         with self._lock:
+            self._guard(("repository", repository_id), _fence_token)
+            self._guard(("prs", repository_id), _fence_token)
             base_sha = self._refs.get((repository_id, base))
-            marker_key = marker.operation_id, marker.effect_subject
+            marker_key = marker.preimage.operation_id, marker.preimage.gate_action
+            self._guard(("prepared", *marker_key), _fence_token)
             number = len(self._prs) + 1
+            subject = marker.preimage.effect_subject
+            if self._consume_effect_failure():
+                return None
             if (self._refs.get((repository_id, head)) != head_sha or base_sha is None
-                    or marker_key in self._markers or marker.result_identity != str(number)):
+                    or marker_key in self._markers
+                    or type(subject) is not CreatedCandidatePrEffectSubject
+                    or subject.repository_id != repository_id
+                    or subject.pull_request_number.value != number
+                    or subject.head_ref != GitRef(head.value) or subject.head_sha != head_sha
+                    or subject.base_ref != GitRef(base.value) or subject.base_sha != base_sha):
                 return None
             pr = FixturePullRequest(number, repository_id, head, base, head_sha, base_sha)
             self._prs.append(pr)
@@ -204,13 +448,26 @@ class FixtureGitPlatform:
 
     def fast_forward_and_mark(self, repository_id: GitHubRepositoryId, target: CanonicalBranchRef,
                               expected: GitSha, candidate: GitSha, candidate_parent: GitSha,
-                              pull_request_number: int, marker: ProtectedEffectMarker) -> bool:
+                              pull_request_number: int, marker: ProtectedEffectMarker, *,
+                              _fence_token: FixtureFenceToken | None = None) -> bool:
         with self._lock:
-            marker_key = marker.operation_id, marker.effect_subject
+            self._guard(("repository", repository_id), _fence_token)
+            self._guard(("ref", repository_id, target), _fence_token)
+            self._guard(("prs", repository_id), _fence_token)
+            marker_key = marker.preimage.operation_id, marker.preimage.gate_action
+            self._guard(("prepared", *marker_key), _fence_token)
             pr = next((item for item in self._prs if item.number == pull_request_number), None)
+            subject = marker.preimage.effect_subject
+            if self._consume_effect_failure():
+                return False
             if (self._refs.get((repository_id, target)) != expected or candidate_parent != expected
                     or pr is None or pr.merged or pr.repository_id != repository_id
                     or pr.head_sha != candidate or pr.base_sha != expected
+                    or type(subject) is not FastForwardMergeEffectSubject
+                    or subject.repository_id != repository_id
+                    or subject.pull_request_number.value != pull_request_number
+                    or subject.integration_ref != GitRef(target.value)
+                    or subject.before_sha != expected or subject.after_sha != candidate
                     or marker_key in self._markers):
                 return False
             self._refs[(repository_id, target)] = candidate
@@ -223,6 +480,8 @@ class FixtureGitPlatform:
     def fast_forward(self, repository_id: GitHubRepositoryId, target: CanonicalBranchRef,
                      expected: GitSha, candidate: GitSha, candidate_parent: GitSha) -> bool:
         with self._lock:
+            self._guard(("repository", repository_id))
+            self._guard(("ref", repository_id, target))
             key = (repository_id, target)
             if self._refs.get(key) != expected or candidate_parent != expected:
                 return False
@@ -230,15 +489,25 @@ class FixtureGitPlatform:
             self._generation += 1
             return True
 
-    def marker(self, operation_id: str, subject: str) -> ProtectedEffectMarker | None:
+    def marker(self, operation_id: OperationId, gate_action: str) -> ProtectedEffectMarker | None:
         with self._lock:
-            return self._markers.get((operation_id, subject))
+            return self._markers.get((operation_id, gate_action))
 
     def record_marker(self, marker: ProtectedEffectMarker) -> ProtectedEffectMarker:
         with self._lock:
             if type(marker) is not ProtectedEffectMarker:
                 raise TypeError("exact ProtectedEffectMarker required")
-            key = (marker.operation_id, marker.effect_subject)
+            key = marker.preimage.operation_id, marker.preimage.gate_action
+            subject = marker.preimage.effect_subject
+            self._guard(("prepared", *key))
+            self._guard(("repository", subject.repository_id))
+            if type(subject) is PublishedCandidateRefEffectSubject:
+                self._guard(("ref", subject.repository_id, subject.destination_branch))
+            elif type(subject) is CreatedCandidatePrEffectSubject:
+                self._guard(("prs", subject.repository_id))
+            elif type(subject) is FastForwardMergeEffectSubject:
+                self._guard(("prs", subject.repository_id))
+                self._guard(("ref", subject.repository_id, CanonicalBranchRef(subject.integration_ref.value)))
             current = self._markers.get(key)
             if current is not None and current != marker:
                 raise ValueError("effect marker provenance conflict")
@@ -250,7 +519,11 @@ class FixtureGitPlatform:
 
     @staticmethod
     def deterministic_sha(*parts: str) -> GitSha:
-        return GitSha(hashlib.sha256("\0".join(parts).encode()).hexdigest())
+        if any(type(part) is not str for part in parts):
+            raise TypeError("fixture SHA parts must be exact strings")
+        return GitSha(hashlib.sha256(canonical_json_bytes(
+            ("autodev.fixture-git-sha/v1", parts)
+        )).hexdigest())
 
 
 # Earlier fixture name remains an alias; there is only one authoritative marker model.
