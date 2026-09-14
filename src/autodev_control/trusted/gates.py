@@ -157,22 +157,20 @@ class OperationReservationCommand:
 
 @dataclass(frozen=True, slots=True)
 class TaskEvaluationCommand:
-    """Request-level evaluation posture; trusted completion is composed internally."""
+    """Request-level posture referring to a root-managed completion context."""
 
     task_id: TaskId
-    completion_rule_set_id: CompletionRuleSetId
+    completion_context_id: ImmutableConfigId
     blocking_condition_ids: tuple[BlockingConditionId, ...]
     awaiting_input_requirement_ids: tuple[AwaitingInputRequirementId, ...]
     next_integration_operation_id: OperationId | None
-    required_protected_operation_ids: tuple[OperationId, ...]
 
     def __post_init__(self) -> None:
-        if type(self.task_id) is not TaskId or type(self.completion_rule_set_id) is not CompletionRuleSetId:
+        if type(self.task_id) is not TaskId or type(self.completion_context_id) is not ImmutableConfigId:
             raise TypeError("task evaluation request has wrong exact identity")
         for values, expected in (
             (self.blocking_condition_ids, BlockingConditionId),
             (self.awaiting_input_requirement_ids, AwaitingInputRequirementId),
-            (self.required_protected_operation_ids, OperationId),
         ):
             if (type(values) is not tuple or any(type(item) is not expected for item in values)
                     or len(set(values)) != len(values)):
@@ -180,6 +178,29 @@ class TaskEvaluationCommand:
         if (self.next_integration_operation_id is not None
                 and type(self.next_integration_operation_id) is not OperationId):
             raise TypeError("next operation must be exact OperationId or None")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class TrustedCompletionEvaluationContext:
+    """Root-managed exact inputs for the frozen G4 completion predicate."""
+
+    context_id: ImmutableConfigId
+    task_id: TaskId
+    completion_rule_set_id: CompletionRuleSetId
+    contract_id: ContractId
+    contract_raw_sha256: RawSha256
+    authorization_id: AuthorizationId
+    admission_event_id: AdmissionEventId
+    target_registration_id: TargetRegistrationId
+    policy_epoch_identity: PolicyEpochIdentity
+    candidate_id: CandidateId | None
+    contract_acceptance_status: ConditionStatus
+    additional_trusted_completion_conditions_status: ConditionStatus
+    required_protected_operation_ids: tuple[OperationId, ...]
+    current_applicability_and_authority_status: ConditionStatus
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("completion contexts are installed only by root-managed fixture setup")
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,7 +474,7 @@ class _DeterministicStartDenied(ValueError):
 class DeterministicTrustedController:
     """Closed command-to-proposal boundary; caller G4 objects are never accepted."""
 
-    __slots__ = ("_key", "_backend")
+    __slots__ = ("_key", "_backend", "_completion_contexts")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("trusted controller is installed only by the active gate runtime")
@@ -793,26 +814,45 @@ class DeterministicTrustedController:
         if current is None:
             raise ValueError("task is not canonical")
         task = current.task
-        evidence_ids = {item.evidence_id for item in task.supporting_evidence_refs}
-        accepted_evidence = all(
-            operation_id in {item.intent.operation_id for item in current.operations}
-            for operation_id in command.required_protected_operation_ids
+        context = self._completion_contexts.get(command.completion_context_id)
+        if type(context) is not TrustedCompletionEvaluationContext:
+            raise ValueError("trusted completion context is unavailable")
+        exact = (
+            (context.context_id, command.completion_context_id),
+            (context.task_id, task.task_id),
+            (context.contract_id, task.contract_id),
+            (context.contract_raw_sha256, task.contract_raw_sha256),
+            (context.authorization_id, task.authorization_id),
+            (context.admission_event_id, task.admission_event_id),
+            (context.target_registration_id, task.target_registration_id),
+            (context.policy_epoch_identity, task.last_evaluated_policy_epoch_identity),
+            (context.candidate_id, task.current_candidate_id),
         )
+        if any(actual != expected for actual, expected in exact):
+            raise ValueError("trusted completion context does not match canonical task")
+        if (
+            type(context.completion_rule_set_id) is not CompletionRuleSetId
+            or type(context.contract_acceptance_status) is not ConditionStatus
+            or type(context.additional_trusted_completion_conditions_status) is not ConditionStatus
+            or type(context.current_applicability_and_authority_status) is not ConditionStatus
+            or type(context.required_protected_operation_ids) is not tuple
+            or any(type(item) is not OperationId
+                   for item in context.required_protected_operation_ids)
+            or len(set(context.required_protected_operation_ids))
+            != len(context.required_protected_operation_ids)
+        ):
+            raise ValueError("trusted completion context is malformed")
         completion = _compose_completion_aggregate(
-            task=task, completion_rule_set_id=command.completion_rule_set_id,
+            task=task, completion_rule_set_id=context.completion_rule_set_id,
             policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
-            contract_acceptance_status=(
-                ConditionStatus.SATISFIED if evidence_ids else ConditionStatus.UNSATISFIED
+            contract_acceptance_status=context.contract_acceptance_status,
+            additional_conditions_status=(
+                context.additional_trusted_completion_conditions_status
             ),
-            additional_conditions_status=ConditionStatus.SATISFIED,
-            required_operation_ids=command.required_protected_operation_ids,
-            applicability_status=(
-                ConditionStatus.SATISFIED
-                if task.current_candidate_id is not None and accepted_evidence
-                else ConditionStatus.UNSATISFIED
-            ),
+            required_operation_ids=context.required_protected_operation_ids,
+            applicability_status=context.current_applicability_and_authority_status,
         )
-        relevant_ids = set(command.required_protected_operation_ids)
+        relevant_ids = set(context.required_protected_operation_ids)
         relevant_ids.update(
             item.intent.operation_id for item in current.operations
             if item.intent.effect_class is OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT
@@ -930,9 +970,11 @@ class DeterministicTrustedController:
         object.__setattr__(response, "_key", self._key)
         return response
 
-def _new_controller(key: object, backend: InMemoryCanonicalStateBackend) -> DeterministicTrustedController:
+def _new_controller(key: object, backend: InMemoryCanonicalStateBackend,
+                    completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext],
+                    ) -> DeterministicTrustedController:
     value = object.__new__(DeterministicTrustedController)
-    value._key, value._backend = key, backend
+    value._key, value._backend, value._completion_contexts = key, backend, completion_contexts
     return value
 
 
@@ -1018,7 +1060,7 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
@@ -1037,6 +1079,7 @@ class FixtureProtectedGateRuntime:
         self._fixture_transports: dict[ImmutableConfigId, TrustedGitHubReadTransportBinding] = {}
         self._authorization_contexts: dict[str, tuple] = {}
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
+        self._completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext] = {}
         self._fail_after_start = False
         self._recovery_fence_hook = None
         self._post_start_audit_failure_hook = None
@@ -1058,7 +1101,9 @@ class FixtureProtectedGateRuntime:
         )
         if not activated:
             raise RuntimeError("cannot replace active runtime while a gate lease is live")
-        self.controller = _new_controller(self._controller_key, self.backend)
+        self.controller = _new_controller(
+            self._controller_key, self.backend, self._completion_contexts
+        )
         self.boundary = TrustedControlCommandBoundary(self.controller, self)
 
     @property
@@ -1211,6 +1256,18 @@ class FixtureProtectedGateRuntime:
         if context_id in self._evidence_contexts and self._evidence_contexts[context_id] != request:
             raise ValueError("semantic evidence context identity conflict")
         self._evidence_contexts[context_id] = request
+
+    def register_completion_evaluation_context(
+        self, context: TrustedCompletionEvaluationContext,
+    ) -> None:
+        """Install immutable root-managed G4 completion inputs for fixture evaluation."""
+        if type(context) is not TrustedCompletionEvaluationContext:
+            raise TypeError("exact trusted completion context required")
+        with self._lock:
+            current = self._completion_contexts.get(context.context_id)
+            if current is not None and current != context:
+                raise ValueError("completion context identity conflict")
+            self._completion_contexts[context.context_id] = context
 
     def _compose_semantic_evidence_request(
         self, command: SemanticEvidenceCommand,
@@ -2256,6 +2313,7 @@ class FixtureProtectedGateRuntime:
         restarted._fixture_transports.update(self._fixture_transports)
         restarted._authorization_contexts.update(self._authorization_contexts)
         restarted._evidence_contexts.update(self._evidence_contexts)
+        restarted._completion_contexts.update(self._completion_contexts)
         return restarted
 
     def fail_after_start_commit_for_test(self) -> None:
