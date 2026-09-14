@@ -237,6 +237,18 @@ class OperationIntent:
         raise TypeError("operation intent must come from a trusted classification boundary")
 
 
+def _compose_trusted_operation_classification(
+    effect_class: OperationEffectClass, purpose: OperationPurpose,
+) -> TrustedOperationClassification:
+    """Trusted-controller composition boundary for the closed classification pair."""
+    if type(effect_class) is not OperationEffectClass or type(purpose) is not OperationPurpose:
+        raise TypeError("exact closed operation classification inputs required")
+    result = object.__new__(TrustedOperationClassification)
+    object.__setattr__(result, "effect_class", effect_class)
+    object.__setattr__(result, "purpose", purpose)
+    return result
+
+
 def construct_trusted_operation_intent(
     *,
     classification: TrustedOperationClassification,

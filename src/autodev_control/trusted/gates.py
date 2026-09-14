@@ -6,13 +6,14 @@ provider, network, credential, workflow, or controlled-runtime integration.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
+import secrets
 
 from .audit import (
-    AuditAppendStatus, FixtureGateAudit, GateAuditEventPreimage, GateAuditOutcome,
-    build_gate_audit_event,
+    AuditAppendStatus, FixtureGateAudit, GateAuditAuthoritativeDependency,
+    GateAuditEventPreimage, GateAuditOutcome, build_gate_audit_event,
 )
 from .backend import (
     AuthorizationExistsAndMatches, CanonicalNamespace, CanonicalTransaction,
@@ -42,18 +43,22 @@ from .fixture_platform import (
     PublishedCandidateRefEffectSubject, build_protected_effect_marker,
 )
 from .identity import (
-    GitRef, GitSha, ImmutableConfigId, OperationStartBindingId,
-    PreparedProtectedStartId, RawSha256, RootContextId,
+    GateRuntimeBindingId, GitRef, GitSha, ImmutableConfigId,
+    OperationStartBindingId, PreparedProtectedStartId, RawSha256, RootContextId,
 )
 from .materialization import (
     CandidateMaterialization, create_materialized_candidate_record,
     inventory_is_authorized,
 )
 from .operation import (
+    AwaitingInputRequirementId,
     AuthoritativeStateBindingId, IntegrationBound, NotIntegrationBound,
-    OperationId, OperationIntent,
+    BlockingConditionId, CompletionRuleSetId, EvidenceId,
+    OperationActionId, OperationEffectClass, OperationId, OperationIdempotencyKey,
+    OperationIntent, OperationPurpose, OperationSubjectId,
     OperationRecord, OperationState, ReconciliationFinding,
-    TrustedReconciliationFinding,
+    TrustedReconciliationFinding, _compose_trusted_operation_classification,
+    construct_trusted_operation_intent,
     reconcile_operation as decide_reconciliation, transition_operation,
 )
 from .scope import (
@@ -61,16 +66,18 @@ from .scope import (
     MutationScope, ServicePrincipalId, TargetRegistrationId, TaskId,
 )
 from .state import (
-    CandidateApplicabilityDetermination, CancellationRequestId, CancellationStatus,
-    EvidenceBindingRef, OperationRevisionBinding, RepairBudget, TaskEvaluationInput,
+    CancellationRequestId, CancellationStatus, ConditionStatus, EvidenceBindingRef,
+    OperationRevisionBinding, RepairBudget, TaskEvaluationInput,
+    _compose_candidate_applicability, _compose_completion_aggregate,
     adopt_candidate, evaluate_task, initial_task_proposal, reserve_task_operation,
     revise_supporting_evidence, set_cancellation, start_operation as decide_start_operation,
 )
 from .manifest import PolicyEpochIdentity
 from .operation import AdmissionEventId, CandidateId, DecisionEventId
 from .state_reader import (
-    AuthoritativeObservationProfile, AuthoritativeStateReadStatus, GitHubPullRequestNumber,
-    GitHubStateReader,
+    AuthoritativeObservationProfile, AuthoritativeStateSnapshot,
+    GitHubPullRequestNumber, GitHubStateReader, RegisteredStateFactDescriptor,
+    TrustedGitHubReadTransportBinding,
 )
 from .target_registration import AdmittedTargetRegistration
 
@@ -118,6 +125,78 @@ class PreparedProtectedStartState(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class OperationReservationCommand:
+    """Closed untrusted request; trusted classification and authority fields are derived."""
+
+    operation_id: OperationId
+    idempotency_key: OperationIdempotencyKey
+    action_id: OperationActionId
+    subject_id: OperationSubjectId
+    required_evidence_ids: tuple[EvidenceId, ...]
+    integration_binding: IntegrationBound | NotIntegrationBound
+    is_repair_attempt: bool = False
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.operation_id, OperationId),
+            (self.idempotency_key, OperationIdempotencyKey),
+            (self.action_id, OperationActionId),
+            (self.subject_id, OperationSubjectId),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("operation reservation request has wrong exact type")
+        if (type(self.required_evidence_ids) is not tuple
+                or any(type(item) is not EvidenceId for item in self.required_evidence_ids)
+                or len(set(self.required_evidence_ids)) != len(self.required_evidence_ids)):
+            raise TypeError("required evidence must be an exact duplicate-free tuple")
+        if type(self.integration_binding) not in (IntegrationBound, NotIntegrationBound):
+            raise TypeError("integration binding has wrong exact variant")
+        if type(self.is_repair_attempt) is not bool:
+            raise TypeError("is_repair_attempt must be exactly bool")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskEvaluationCommand:
+    """Request-level evaluation posture; trusted completion is composed internally."""
+
+    task_id: TaskId
+    completion_rule_set_id: CompletionRuleSetId
+    blocking_condition_ids: tuple[BlockingConditionId, ...]
+    awaiting_input_requirement_ids: tuple[AwaitingInputRequirementId, ...]
+    next_integration_operation_id: OperationId | None
+    required_protected_operation_ids: tuple[OperationId, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.task_id) is not TaskId or type(self.completion_rule_set_id) is not CompletionRuleSetId:
+            raise TypeError("task evaluation request has wrong exact identity")
+        for values, expected in (
+            (self.blocking_condition_ids, BlockingConditionId),
+            (self.awaiting_input_requirement_ids, AwaitingInputRequirementId),
+            (self.required_protected_operation_ids, OperationId),
+        ):
+            if (type(values) is not tuple or any(type(item) is not expected for item in values)
+                    or len(set(values)) != len(values)):
+                raise TypeError("task evaluation collections must be exact duplicate-free tuples")
+        if (self.next_integration_operation_id is not None
+                and type(self.next_integration_operation_id) is not OperationId):
+            raise TypeError("next operation must be exact OperationId or None")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEvidenceCommand:
+    """Raw provider response routed to a pre-registered trusted G5 context."""
+
+    admission_context_id: ImmutableConfigId
+    raw_response: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.admission_context_id) is not ImmutableConfigId:
+            raise TypeError("admission context id must be exact ImmutableConfigId")
+        if type(self.raw_response) is not bytes:
+            raise TypeError("raw response must be exact bytes")
+
+
+@dataclass(frozen=True, slots=True)
 class FixtureRuntimeGeneration:
     value: int
 
@@ -133,6 +212,8 @@ class GateRuntimeBinding:
     control_state_principal: ServicePrincipalId
     publication_principal: ServicePrincipalId
     merge_principal: ServicePrincipalId
+    runtime_instance_nonce: RawSha256 = field(default_factory=lambda: RawSha256(secrets.token_hex(32)))
+    runtime_binding_id: GateRuntimeBindingId = field(init=False)
 
     def __post_init__(self) -> None:
         values = (self.control_state_principal, self.publication_principal, self.merge_principal)
@@ -142,6 +223,13 @@ class GateRuntimeBinding:
             raise TypeError("gate principal has wrong exact type")
         if len(set(values)) != 3:
             raise ValueError("control, publication, and merge principals must be pairwise distinct")
+        if type(self.runtime_instance_nonce) is not RawSha256:
+            raise TypeError("runtime instance nonce must be exact RawSha256")
+        digest = hashlib.sha256(canonical_json_bytes((
+            "autodev.gate-runtime-binding/v1", self.root_context_id,
+            self.runtime_generation.value, values, self.runtime_instance_nonce,
+        ))).hexdigest()
+        object.__setattr__(self, "runtime_binding_id", GateRuntimeBindingId(RawSha256(digest)))
 
 
 TrustedGateRuntimeBinding = GateRuntimeBinding
@@ -248,7 +336,7 @@ class PreparedStartCommitLease(_OneUse):
 
 
 class LiveProtectedEffectContinuation(_OneUse):
-    __slots__ = ("operation_id", "idempotency_key", "action_id", "intent", "start_binding_id", "prepared_start_id", "subject", "action_target_fence", "integration_binding", "authorized_scope", "root_forbidden_scope", "dependencies", "target_fence_token")
+    __slots__ = ("operation_id", "idempotency_key", "action_id", "intent", "start_binding_id", "prepared_start_id", "subject", "action_target_fence", "integration_binding", "authorized_scope", "root_forbidden_scope", "dependencies", "target_fence_token", "materialization", "target_registration", "base_ref", "provenance_operation_id")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("effect continuations are minted only by a freshly audited start")
@@ -287,31 +375,36 @@ class PreparedProtectedStartPreimage:
     target_fence: ActionTargetFence
     root_context_id: RootContextId
     runtime_generation: FixtureRuntimeGeneration
+    runtime_binding_id: GateRuntimeBindingId
     service_identity: ServicePrincipalId
     dependencies: ControlStateAuthoritativeDependencySet
+    materialization: CandidateMaterialization
+    target_registration: AdmittedTargetRegistration
+    base_ref: CanonicalBranchRef | None
+    provenance_operation_id: OperationId | None
+    authorized_scope: MutationScope
+    root_forbidden_scope: MutationScope
 
 
 class PreparedProtectedStart:
-    __slots__ = ("prepared_start_id", "operation", "subject", "fence", "_state", "_owner", "_nonce")
+    __slots__ = ("prepared_start_id", "operation", "subject", "fence", "preimage", "_platform", "_sealed")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("prepared protected starts are gate-private")
 
     @property
     def state(self) -> PreparedProtectedStartState:
-        return self._state
+        current = self._platform.prepared_effect_state(
+            self.operation.intent.operation_id, self.subject.value
+        )
+        if current is None:
+            raise RuntimeError("durable prepared record is unavailable")
+        return PreparedProtectedStartState(current)
 
-    def _consume(self, owner: object, nonce: object) -> bool:
-        if self._owner is not owner or self._nonce is not nonce or self._state is not PreparedProtectedStartState.PREPARED:
-            return False
-        self._state = PreparedProtectedStartState.CONSUMED
-        return True
-
-    def _release(self, owner: object, nonce: object) -> bool:
-        if self._owner is not owner or self._nonce is not nonce or self._state is not PreparedProtectedStartState.PREPARED:
-            return False
-        self._state = PreparedProtectedStartState.RELEASED
-        return True
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("prepared protected start is immutable")
+        object.__setattr__(self, name, value)
 
     def __reduce__(self) -> object:
         raise TypeError("prepared gate state cannot be serialized")
@@ -448,21 +541,9 @@ class DeterministicTrustedController:
             parent_candidate_ids=parent_candidate_ids,
             creation_operation_id=creation_operation_id,
         )
-        if type(decision_event_id) is not DecisionEventId:
-            raise TypeError("exact decision event identity required")
-        determination = object.__new__(CandidateApplicabilityDetermination)
-        for name, value in (
-            ("decision_event_id", decision_event_id),
-            ("candidate_id", candidate.candidate_id), ("task_id", task.task_id),
-            ("expected_task_revision", task.revision),
-            ("contract_id", task.contract_id),
-            ("contract_raw_sha256", task.contract_raw_sha256),
-            ("authorization_id", task.authorization_id),
-            ("admission_event_id", task.admission_event_id),
-            ("target_registration_id", task.target_registration_id),
-            ("policy_epoch_identity", task.last_evaluated_policy_epoch_identity),
-        ):
-            object.__setattr__(determination, name, value)
+        determination = _compose_candidate_applicability(
+            task, candidate, decision_event_id
+        )
         result = adopt_candidate(
             task, candidate, determination, expected_task_revision=task.revision,
             snapshot=current.task_operation_snapshot(),
@@ -515,10 +596,39 @@ class DeterministicTrustedController:
         return request
 
     def reserve_operation(self, task_id: TaskId,
-                          intent: OperationIntent) -> ControlStateCommitRequest:
+                          command: OperationReservationCommand,
+                          authoritative_binding: AuthoritativeStateBindingId) -> ControlStateCommitRequest:
+        if type(command) is not OperationReservationCommand:
+            raise TypeError("exact OperationReservationCommand required")
+        if type(authoritative_binding) is not AuthoritativeStateBindingId:
+            raise TypeError("trusted authoritative binding required")
         current = self._backend.read_task_working_set(task_id)
         if current is None:
             raise ValueError("task is not canonical")
+        task = current.task
+        classification = _compose_trusted_operation_classification(
+            OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT,
+            OperationPurpose.NORMAL,
+        )
+        intent = construct_trusted_operation_intent(
+            classification=classification,
+            operation_id=command.operation_id,
+            idempotency_key=command.idempotency_key,
+            task_id=task.task_id,
+            action_id=command.action_id,
+            subject_id=command.subject_id,
+            candidate_id=task.current_candidate_id,
+            contract_id=task.contract_id,
+            contract_raw_sha256=task.contract_raw_sha256,
+            authorization_id=task.authorization_id,
+            admission_event_id=task.admission_event_id,
+            target_registration_id=task.target_registration_id,
+            policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+            authoritative_state_binding_id=authoritative_binding,
+            required_evidence_ids=command.required_evidence_ids,
+            integration_binding=command.integration_binding,
+            is_repair_attempt=command.is_repair_attempt,
+        )
         result = reserve_task_operation(
             current.task, intent, current.task_operation_snapshot(),
             expected_task_revision=current.task.revision,
@@ -663,11 +773,60 @@ class DeterministicTrustedController:
         object.__setattr__(request, "_key", self._key)
         return request
 
-    def evaluate_task(self, task_id: TaskId,
-                      evaluation: TaskEvaluationInput) -> ControlStateCommitRequest:
-        current = self._backend.read_task_working_set(task_id)
+    def evaluate_task(self, command: TaskEvaluationCommand) -> ControlStateCommitRequest:
+        if type(command) is not TaskEvaluationCommand:
+            raise TypeError("exact TaskEvaluationCommand required")
+        task_id = command.task_id
+        current = self._backend.read_task_working_set(command.task_id)
         if current is None:
             raise ValueError("task is not canonical")
+        task = current.task
+        evidence_ids = {item.evidence_id for item in task.supporting_evidence_refs}
+        accepted_evidence = all(
+            operation_id in {item.intent.operation_id for item in current.operations}
+            for operation_id in command.required_protected_operation_ids
+        )
+        completion = _compose_completion_aggregate(
+            task=task, completion_rule_set_id=command.completion_rule_set_id,
+            policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+            contract_acceptance_status=(
+                ConditionStatus.SATISFIED if evidence_ids else ConditionStatus.UNSATISFIED
+            ),
+            additional_conditions_status=ConditionStatus.SATISFIED,
+            required_operation_ids=command.required_protected_operation_ids,
+            applicability_status=(
+                ConditionStatus.SATISFIED
+                if task.current_candidate_id is not None and accepted_evidence
+                else ConditionStatus.UNSATISFIED
+            ),
+        )
+        relevant_ids = set(command.required_protected_operation_ids)
+        relevant_ids.update(
+            item.intent.operation_id for item in current.operations
+            if item.intent.effect_class is OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT
+            and item.state in (OperationState.RESERVED, OperationState.PERFORMING,
+                               OperationState.INDETERMINATE)
+        )
+        evaluation = TaskEvaluationInput(
+            task_id=task.task_id, expected_task_revision=task.revision,
+            contract_id=task.contract_id,
+            contract_raw_sha256=task.contract_raw_sha256,
+            authorization_id=task.authorization_id,
+            admission_event_id=task.admission_event_id,
+            target_registration_id=task.target_registration_id,
+            current_policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+            evaluated_candidate_id=task.current_candidate_id,
+            blocking_condition_ids=command.blocking_condition_ids,
+            awaiting_input_requirement_ids=command.awaiting_input_requirement_ids,
+            next_integration_operation_id=command.next_integration_operation_id,
+            completion=completion,
+            operation_snapshot=current.task_operation_snapshot(),
+            expected_membership_binding_id=current.task_operation_membership.membership_binding_id,
+            expected_operation_revisions=tuple(
+                OperationRevisionBinding(item.intent.operation_id, item.revision)
+                for item in current.operations if item.intent.operation_id in relevant_ids
+            ),
+        )
         result = evaluate_task(current.task, evaluation)
         if result.proposal is None:
             raise ValueError(result.failure.code.value)
@@ -777,8 +936,21 @@ class TrustedControlCommandBoundary:
     def submit(self, *_: object, **__: object) -> ControlStateCommitRequest:
         raise TypeError("use one explicit closed semantic command method")
 
-    def admit_authorization(self, *args, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.admit_authorization(*args, **kwargs)
+    def admit_authorization(
+        self, proposal: CandidateAuthorizationProposal,
+    ) -> ControlStateCommitRequest:
+        if type(proposal) is not CandidateAuthorizationProposal:
+            raise TypeError("exact candidate authorization proposal required")
+        context = self._runtime._authorization_contexts.get(
+            hashlib.sha256(canonical_json_bytes(proposal)).hexdigest()
+        )
+        if context is None:
+            raise ValueError("exact root-managed authorization context is unavailable")
+        target, contract, policy, root, approval, issuer = context
+        return self._controller.admit_authorization(
+            proposal, target, contract, policy, root,
+            approval=approval, issuer=issuer,
+        )
 
     def create_task(self, **kwargs) -> ControlStateCommitRequest:
         return self._controller.create_task(**kwargs)
@@ -789,11 +961,18 @@ class TrustedControlCommandBoundary:
     def revise_supporting_evidence(self, *args, **kwargs) -> ControlStateCommitRequest:
         return self._controller.revise_supporting_evidence(*args, **kwargs)
 
-    def reserve_operation(self, *args, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.reserve_operation(*args, **kwargs)
+    def reserve_operation(
+        self, task_id: TaskId, command: OperationReservationCommand,
+    ) -> ControlStateCommitRequest:
+        if type(command) is OperationIntent:
+            raise TypeError("callers cannot submit trusted OperationIntent")
+        return self._controller.reserve_operation(
+            task_id, command,
+            self._runtime._derive_operation_authoritative_binding(task_id, command),
+        )
 
-    def start_operation(self, *args, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.start_operation(*args, **kwargs)
+    def start_operation(self, *_: object, **__: object) -> ControlStateCommitRequest:
+        raise TypeError("protected start is orchestrated only by the live gate runtime")
 
     def reconcile_operation(
         self, task_id: TaskId, operation_id: OperationId,
@@ -813,25 +992,36 @@ class TrustedControlCommandBoundary:
             operation, subject, dependencies, independence
         )
 
-    def evaluate_task(self, *args, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.evaluate_task(*args, **kwargs)
+    def evaluate_task(
+        self, command: TaskEvaluationCommand,
+    ) -> ControlStateCommitRequest:
+        if type(command) is TaskEvaluationInput:
+            raise TypeError("callers cannot submit trusted TaskEvaluationInput")
+        return self._controller.evaluate_task(command)
 
     def set_cancellation(self, *args, **kwargs) -> ControlStateCommitRequest:
         return self._controller.set_cancellation(*args, **kwargs)
 
-    def admit_semantic_evidence(self, *args, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.admit_semantic_evidence(*args, **kwargs)
+    def admit_semantic_evidence(
+        self, command: SemanticEvidenceCommand,
+    ) -> ControlStateCommitRequest:
+        if type(command) is SemanticEvidenceAdmissionRequest:
+            raise TypeError("callers cannot submit trusted G5 admission context")
+        return self._controller.admit_semantic_evidence(
+            self._runtime._compose_semantic_evidence_request(command)
+        )
 
 
 class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
-                 registry: ActiveFixtureRuntimeRegistry | None = None) -> None:
+                 registry: ActiveFixtureRuntimeRegistry | None = None, *,
+                 _restart_from: tuple[object, object, object] | None = None) -> None:
         if type(binding) is not GateRuntimeBinding or type(backend) is not InMemoryCanonicalStateBackend:
             raise TypeError("runtime binding/backend has wrong exact type")
         if type(platform) is not FixtureGitPlatform or type(audit) is not FixtureGateAudit:
@@ -842,14 +1032,27 @@ class FixtureProtectedGateRuntime:
         self._lock, self._nonce, self._controller_key = self.registry.lock, object(), object()
         self._profiles: dict[ImmutableConfigId, AuthoritativeObservationProfile] = {}
         self._readers: dict[ImmutableConfigId, GitHubStateReader] = {}
+        self._fixture_transports: dict[ImmutableConfigId, TrustedGitHubReadTransportBinding] = {}
+        self._authorization_contexts: dict[str, tuple] = {}
+        self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
+        self._fail_after_start = False
         self._control = _mint_capability(ControlStateCapability, self._nonce, binding.control_state_principal)
         self._publication = _mint_capability(TargetPublicationCapability, self._nonce, binding.publication_principal)
         self._merge = _mint_capability(MergeCapability, self._nonce, binding.merge_principal)
         self._control_runtime, self._publication_runtime, self._merge_runtime = object(), object(), object()
-        if not self.registry.activate(
-            binding.root_context_id, binding.runtime_generation.value,
-            self._control_runtime, self._publication_runtime, self._merge_runtime,
-        ):
+        activated = (
+            self.registry.activate(
+                binding.root_context_id, binding.runtime_generation.value,
+                self._control_runtime, self._publication_runtime, self._merge_runtime,
+            )
+            if _restart_from is None else
+            self.registry.restart(
+                binding.root_context_id, binding.runtime_generation.value,
+                _restart_from, self._control_runtime,
+                self._publication_runtime, self._merge_runtime,
+            )
+        )
+        if not activated:
             raise RuntimeError("cannot replace active runtime while a gate lease is live")
         self.controller = _new_controller(self._controller_key, self.backend)
         self.boundary = TrustedControlCommandBoundary(self.controller, self)
@@ -884,11 +1087,22 @@ class FixtureProtectedGateRuntime:
                      action_digest: RawSha256 | None = None,
                      result_identity: str = "", detail: str = "",
                      intent: OperationIntent | None = None,
-                     materialization: CandidateMaterialization | None = None) -> AuditAppendStatus:
+                     materialization: CandidateMaterialization | None = None,
+                     occurrence=None) -> AuditAppendStatus:
+        exact_dependencies = tuple(
+            GateAuditAuthoritativeDependency(
+                item.repository_id, item.observation_profile_id,
+                item.transport_config_id, item.expected_binding_id,
+            )
+            for item in dependencies.dependencies
+        )
         preimage = GateAuditEventPreimage(
             "autodev.gate-audit-event/v1", gate, action, outcome,
             self.binding.root_context_id, self.binding.runtime_generation.value,
-            service, self._dependency_digest(dependencies), operation_id, start_id,
+            self.binding.runtime_binding_id, service, exact_dependencies,
+            self._dependency_digest(dependencies),
+            self.backend.occurrence if occurrence is None else occurrence,
+            operation_id, start_id,
             None if marker is None else marker.marker_id, action_digest,
             result_identity, detail,
             None if intent is None else intent.task_id,
@@ -907,7 +1121,7 @@ class FixtureProtectedGateRuntime:
 
     def register_authoritative_source(self, profile: AuthoritativeObservationProfile,
                                       reader: GitHubStateReader) -> None:
-        """Install root-managed fixture read capability, never an opaque remembered digest."""
+        """Register a G6 reader for compatibility; it is intentionally not fenceable."""
         if type(profile) is not AuthoritativeObservationProfile or type(reader) is not GitHubStateReader:
             raise TypeError("exact trusted profile and reader required")
         config_id = reader._binding.config_id
@@ -919,10 +1133,148 @@ class FixtureProtectedGateRuntime:
             self._profiles[profile.profile_id] = profile
             self._readers[config_id] = reader
 
+    def register_fixture_authoritative_source(
+        self, profile: AuthoritativeObservationProfile,
+        transport: TrustedGitHubReadTransportBinding,
+        snapshot: AuthoritativeStateSnapshot,
+    ) -> None:
+        """Install the exact root-managed fixture read path used by G7 leases."""
+        if (type(profile) is not AuthoritativeObservationProfile
+                or type(transport) is not TrustedGitHubReadTransportBinding
+                or type(snapshot) is not AuthoritativeStateSnapshot):
+            raise TypeError("exact fixture authoritative source inputs required")
+        if (type(profile.registered_fact_descriptors) is not tuple
+                or not profile.registered_fact_descriptors
+                or any(type(item) is not RegisteredStateFactDescriptor
+                       for item in profile.registered_fact_descriptors)):
+            raise ValueError("fixture observation profile is malformed")
+        transport_fields = (
+            (transport.config_id, ImmutableConfigId),
+            (transport.expected_api_host_identity, ImmutableConfigId),
+            (transport.authentication_mode_identity, ImmutableConfigId),
+            (transport.service_identity, ServicePrincipalId),
+            (transport.transport_profile_id, ImmutableConfigId),
+        )
+        if any(type(value) is not expected for value, expected in transport_fields):
+            raise TypeError("fixture transport binding is malformed")
+        if (type(transport.permitted_repository_ids) is not tuple
+                or any(type(item) is not GitHubRepositoryId
+                       for item in transport.permitted_repository_ids)
+                or len(set(transport.permitted_repository_ids))
+                != len(transport.permitted_repository_ids)):
+            raise TypeError("fixture transport repository set is malformed")
+        if (snapshot.observation_profile_id != profile.profile_id
+                or snapshot.transport_config_id != transport.config_id
+                or snapshot.repository_id not in transport.permitted_repository_ids):
+            raise ValueError("fixture authoritative source identities do not match")
+        with self._lock:
+            current_profile = self._profiles.get(profile.profile_id)
+            current_transport = self._fixture_transports.get(transport.config_id)
+            if current_profile is not None and current_profile is not profile:
+                raise ValueError("observation profile identity conflict")
+            if current_transport is not None and current_transport != transport:
+                raise ValueError("transport config identity conflict")
+            self._profiles[profile.profile_id] = profile
+            self._fixture_transports[transport.config_id] = transport
+            self.platform.install_authoritative_snapshot(snapshot)
+
+    def register_authorization_context(
+        self, proposal: CandidateAuthorizationProposal,
+        target: AdmittedTargetRegistration | None,
+        contract: ContractAuthorityCeiling | None,
+        policy: AuthorizationPolicyContext | None,
+        root: OrdinaryRootProtectionContext | None, *,
+        approval: AuthenticatedHumanAuthorizationApproval | None = None,
+        issuer: DirectIssuerAuthorityEnvelope | None = None,
+    ) -> None:
+        """Fixture root/admin setup; these authority facts never cross the command boundary."""
+        if type(proposal) is not CandidateAuthorizationProposal:
+            raise TypeError("exact candidate authorization proposal required")
+        key = hashlib.sha256(canonical_json_bytes(proposal)).hexdigest()
+        self._authorization_contexts[key] = (
+            target, contract, policy, root, approval, issuer,
+        )
+
+    def register_semantic_evidence_context(
+        self, context_id: ImmutableConfigId,
+        request: SemanticEvidenceAdmissionRequest,
+    ) -> None:
+        """Install trusted G5 composition inputs outside the untrusted command surface."""
+        if type(context_id) is not ImmutableConfigId:
+            raise TypeError("context id must be exact ImmutableConfigId")
+        if type(request) is not SemanticEvidenceAdmissionRequest:
+            raise TypeError("exact trusted semantic admission request required")
+        if context_id in self._evidence_contexts and self._evidence_contexts[context_id] != request:
+            raise ValueError("semantic evidence context identity conflict")
+        self._evidence_contexts[context_id] = request
+
+    def _compose_semantic_evidence_request(
+        self, command: SemanticEvidenceCommand,
+    ) -> SemanticEvidenceAdmissionRequest:
+        if type(command) is not SemanticEvidenceCommand:
+            raise TypeError("exact SemanticEvidenceCommand required")
+        template = self._evidence_contexts.get(command.admission_context_id)
+        if template is None:
+            raise ValueError("trusted semantic evidence context is unavailable")
+        snapshot = self.backend.read_review_eligibility_snapshot(
+            template.effective_subject.subject_id
+        )
+        if snapshot is None or snapshot.effective_subject != template.effective_subject:
+            raise ValueError("canonical review eligibility context is unavailable")
+        operation = template.operation
+        if template.operation_binding is not None:
+            operation = next((
+                item for item in snapshot.review_attempt_operations
+                if item.intent.operation_id == template.operation_binding.operation_id
+            ), None)
+        return replace(
+            template, raw_response=command.raw_response,
+            operation=operation,
+            evidence_history=snapshot.g5_evidence_snapshot(),
+            slot_attempt_history=snapshot.g5_attempt_snapshot(),
+        )
+
     def attest_external_state_independence(self) -> ExternalStateIndependence:
         value = object.__new__(ExternalStateIndependence)
         value._nonce = self._nonce
         return value
+
+    def _derive_operation_authoritative_binding(
+        self, task_id: TaskId, command: OperationReservationCommand,
+    ) -> AuthoritativeStateBindingId:
+        """Fresh trusted projection; callers cannot nominate a remembered binding."""
+        if type(task_id) is not TaskId or type(command) is not OperationReservationCommand:
+            raise TypeError("exact operation request inputs required")
+        with self._lock:
+            working = self.backend.read_task_working_set(task_id)
+            if working is None:
+                raise ValueError("task is not canonical")
+            resolved = self.backend.read_resolved_target_registration(
+                working.task.target_registration_id
+            )
+            if resolved is None:
+                raise ValueError("target registration is not root-resolved")
+            fixture_bindings = tuple(sorted((
+                (
+                    profile_id.value, transport_id.value,
+                    binding.value,
+                )
+                for profile_id in self._profiles
+                for transport_id in self._fixture_transports
+                for binding in (
+                    self.platform.authoritative_binding(
+                        resolved.registration.repository_id,
+                        profile_id, transport_id,
+                    ),
+                )
+                if binding is not None
+            )))
+            digest = hashlib.sha256(canonical_json_bytes((
+                "autodev.g7-operation-authoritative-binding/v1",
+                self.backend.occurrence, task_id, command.action_id,
+                command.subject_id, fixture_bindings,
+            ))).hexdigest()
+            return AuthoritativeStateBindingId(digest)
 
     def acquire_control_lease(self, capability: ControlStateCapability,
                               dependencies: ControlStateAuthoritativeDependencySet,
@@ -935,7 +1287,13 @@ class FixtureProtectedGateRuntime:
                 return None
         elif independence is not None:
             return None
-        facts = frozenset(("repository", item.repository_id) for item in dependencies.dependencies)
+        fact_values: set[tuple] = set()
+        for item in dependencies.dependencies:
+            source_facts = self.platform.authoritative_facts(*item.locator)
+            if source_facts is None:
+                return None
+            fact_values.update(source_facts)
+        facts = frozenset(fact_values)
         token = self.registry.acquire(self, facts)
         if token is None:
             return None
@@ -958,16 +1316,16 @@ class FixtureProtectedGateRuntime:
     def _dependencies_fresh_set(self, dependencies: ControlStateAuthoritativeDependencySet) -> bool:
         for item in dependencies.dependencies:
             profile = self._profiles.get(item.observation_profile_id)
-            reader = self._readers.get(item.transport_config_id)
-            if profile is None or reader is None:
+            transport = self._fixture_transports.get(item.transport_config_id)
+            snapshot = self.platform.authoritative_snapshot(*item.locator)
+            if profile is None or transport is None or snapshot is None:
                 return False
-            result = reader.read_authoritative(item.repository_id, profile)
-            if result.status is not AuthoritativeStateReadStatus.SUCCESS or result.binding_id != item.expected_binding_id:
+            if (snapshot.repository_id, snapshot.observation_profile_id,
+                    snapshot.transport_config_id) != item.locator:
                 return False
-            snapshot = result.snapshot
-            if (snapshot.repository_id, snapshot.observation_profile_id, snapshot.transport_config_id) != (
-                item.repository_id, item.observation_profile_id, item.transport_config_id
-            ):
+            if item.repository_id not in transport.permitted_repository_ids:
+                return False
+            if self.platform.authoritative_binding(*item.locator) != item.expected_binding_id:
                 return False
         return True
 
@@ -1065,7 +1423,19 @@ class FixtureProtectedGateRuntime:
         prepared = self.prepare_action(
             operation, subject, fence, control_lease.dependencies,
             target_capability.service_identity,
+            materialization=materialization,
+            target_registration=target_registration,
+            base_ref=base_ref,
+            provenance_operation_id=provenance_operation_id,
+            authorized_scope=authorized_scope,
+            root_forbidden_scope=root_forbidden_scope,
+            target_fence_token=target_token,
         )
+        if not self.platform.verify_prepared_effect(
+            operation.intent.operation_id, subject.value, prepared
+        ):
+            self.registry.release(target_token)
+            raise RuntimeError("durable PREPARED verification failed")
         value = object.__new__(PreparedStartCommitLease)
         value._owner, value._nonce, value._used = self, self._nonce, False
         value.control_lease, value.action_target_fence = control_lease, fence
@@ -1168,27 +1538,56 @@ class FixtureProtectedGateRuntime:
     def prepare_action(self, operation: OperationRecord, subject: ProtectedEffectSubject,
                        fence: ActionTargetFence,
                        dependencies: ControlStateAuthoritativeDependencySet,
-                       service_identity: ServicePrincipalId) -> PreparedProtectedStart:
+                       service_identity: ServicePrincipalId, *,
+                       materialization: CandidateMaterialization,
+                       target_registration: AdmittedTargetRegistration,
+                       base_ref: CanonicalBranchRef | None,
+                       provenance_operation_id: OperationId | None,
+                       authorized_scope: MutationScope,
+                       root_forbidden_scope: MutationScope,
+                       target_fence_token: FixtureFenceToken) -> PreparedProtectedStart:
         if type(operation) is not OperationRecord or operation.state is not OperationState.RESERVED:
             raise ValueError("only RESERVED operation may be prepared")
         value = object.__new__(PreparedProtectedStart)
         preimage = PreparedProtectedStartPreimage(
             "autodev.prepared-protected-start/v1", operation.intent.operation_id,
             subject, fence, self.binding.root_context_id, self.binding.runtime_generation,
-            service_identity, dependencies,
+            self.binding.runtime_binding_id, service_identity, dependencies,
+            materialization, target_registration, base_ref,
+            provenance_operation_id, authorized_scope, root_forbidden_scope,
         )
         value.prepared_start_id = PreparedProtectedStartId(
             RawSha256(hashlib.sha256(canonical_json_bytes(preimage)).hexdigest())
         )
         value.operation, value.subject, value.fence = operation, subject, fence
-        value._state, value._owner, value._nonce = PreparedProtectedStartState.PREPARED, self, self._nonce
+        value.preimage, value._platform = preimage, self.platform
+        value._sealed = True
+        self.platform.persist_prepared_effect(
+            operation.intent.operation_id, subject.value, value,
+            _fence_token=target_fence_token,
+        )
         return value
 
     def release_prepared_action(self, prepared: PreparedProtectedStart) -> bool:
-        return type(prepared) is PreparedProtectedStart and prepared._release(self, self._nonce)
+        if type(prepared) is not PreparedProtectedStart:
+            return False
+        released = self.platform.release_prepared_effect(
+            prepared.operation.intent.operation_id, prepared.subject.value
+        )
+        return released and prepared.state is PreparedProtectedStartState.RELEASED
+
+    def _release_durable_prepared(
+        self, prepared: PreparedProtectedStart,
+        token: FixtureFenceToken,
+    ) -> bool:
+        released = self.platform.release_prepared_effect(
+            prepared.operation.intent.operation_id, prepared.subject.value,
+            _fence_token=token,
+        )
+        return released and prepared.state is PreparedProtectedStartState.RELEASED
 
     def commit_protected_start(self, prepared: PreparedStartCommitLease,
-                               request: ControlStateCommitRequest, operation: OperationRecord,
+                               operation: OperationRecord,
                                subject: ProtectedEffectSubject) -> GateResult:
         with self._lock:
             if type(prepared) is not PreparedStartCommitLease or not prepared._consume(self, self._nonce):
@@ -1197,9 +1596,28 @@ class FixtureProtectedGateRuntime:
             if (prepared.runtime_binding is not self.binding or prepared.target_capability is not expected_capability
                     or not prepared.target_fence_token.active or not self._is_active()):
                 return GateResult(GateResultCode.LEASE_INVALID)
-            if (request.command_kind is not TrustedControlCommandKind.START_OPERATION
-                    or operation != prepared.prepared_start.operation
+            if (operation != prepared.prepared_start.operation
                     or subject is not prepared.prepared_start.subject):
+                self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                )
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(GateResultCode.REJECTED)
+            if not self.platform.verify_prepared_effect(
+                operation.intent.operation_id, subject.value,
+                prepared.prepared_start,
+            ):
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(GateResultCode.LEASE_INVALID)
+            try:
+                request = self.controller.start_operation(
+                    operation.intent.task_id, operation.intent.operation_id,
+                    prepared.prepared_start.prepared_start_id,
+                )
+            except (TypeError, ValueError):
+                self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                )
                 self.registry.release(prepared.target_fence_token)
                 return GateResult(GateResultCode.REJECTED)
             proposed = next((mutation.operation for mutation in request.transaction.mutations
@@ -1210,16 +1628,21 @@ class FixtureProtectedGateRuntime:
             )
             if (proposed is None or proposed.state is not OperationState.PERFORMING
                     or proposed.start_binding_id != expected_start_id):
-                prepared.prepared_start._release(self, self._nonce)
+                self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                )
                 self.registry.release(prepared.target_fence_token)
                 return GateResult(GateResultCode.REJECTED)
             fence = prepared.action_target_fence
-            if (self.platform.snapshot().generation != fence.platform_generation
-                    or self.platform.read_ref(fence.repository_id, fence.ref) != fence.expected_sha
+            if (self.platform.read_ref(fence.repository_id, fence.ref) != fence.expected_sha
                     or (fence.base_ref is not None and self.platform.read_ref(
                         fence.repository_id, fence.base_ref
                     ) != fence.base_expected_sha)):
-                prepared.prepared_start._release(self, self._nonce)
+                if not self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                ):
+                    self.registry.release(prepared.target_fence_token)
+                    return GateResult(GateResultCode.INDETERMINATE)
                 conflict_request = self.controller._transition_unstarted_conflict(
                     operation.intent.task_id, operation.intent.operation_id
                 )
@@ -1233,13 +1656,17 @@ class FixtureProtectedGateRuntime:
                                   failure_code=G4FailureCode.ACTION_PRECONDITION_CONFLICT)
             committed = self.commit(request, prepared.control_lease)
             if committed.code is not GateResultCode.COMMITTED:
-                prepared.prepared_start._release(self, self._nonce)
+                if not self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                ):
+                    self.registry.release(prepared.target_fence_token)
+                    return GateResult(GateResultCode.INDETERMINATE,
+                                      committed.canonical_result)
                 self.registry.release(prepared.target_fence_token)
                 return committed
-            self.platform.prepare_effect(
-                proposed.intent.operation_id, subject.value,
-                _fence_token=prepared.target_fence_token,
-            )
+            if self._fail_after_start:
+                self._fail_after_start = False
+                return GateResult(GateResultCode.INDETERMINATE, committed.canonical_result)
             if not self._audit_ok(self._audit_event(
                 "PROTECTED_START", subject.value, GateAuditOutcome.APPLIED,
                 service=prepared.target_capability.service_identity,
@@ -1249,11 +1676,12 @@ class FixtureProtectedGateRuntime:
                 action_digest=prepared.prepared_start.prepared_start_id.raw_sha256,
                 intent=proposed.intent,
             )):
-                prepared.prepared_start._consume(self, self._nonce)
-                self.platform.release_prepared_effect(
-                    proposed.intent.operation_id, subject.value,
-                    _fence_token=prepared.target_fence_token,
-                )
+                if not self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                ):
+                    self.registry.release(prepared.target_fence_token)
+                    return GateResult(GateResultCode.INDETERMINATE,
+                                      committed.canonical_result)
                 self.registry.release(prepared.target_fence_token)
                 recovery_lease = self.acquire_control_lease(
                     self._control, ControlStateAuthoritativeDependencySet(()),
@@ -1265,7 +1693,6 @@ class FixtureProtectedGateRuntime:
                     )
                     self.commit(recovery, recovery_lease)
                 return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
-            prepared.prepared_start._consume(self, self._nonce)
             continuation = object.__new__(LiveProtectedEffectContinuation)
             continuation._owner, continuation._nonce, continuation._used = self, self._nonce, False
             continuation.operation_id = proposed.intent.operation_id
@@ -1281,21 +1708,35 @@ class FixtureProtectedGateRuntime:
             continuation.root_forbidden_scope = prepared.root_forbidden_scope
             continuation.dependencies = prepared.control_lease.dependencies
             continuation.target_fence_token = prepared.target_fence_token
+            continuation.materialization = prepared.prepared_start.preimage.materialization
+            continuation.target_registration = prepared.prepared_start.preimage.target_registration
+            continuation.base_ref = prepared.prepared_start.preimage.base_ref
+            continuation.provenance_operation_id = prepared.prepared_start.preimage.provenance_operation_id
             return GateResult(GateResultCode.START_COMMITTED, committed.canonical_result, continuation)
 
     def perform_effect(self, continuation: LiveProtectedEffectContinuation,
-                       capability: TargetPublicationCapability | MergeCapability,
-                       *, materialization: CandidateMaterialization | None = None,
-                       base_ref: CanonicalBranchRef | None = None,
-                       target_registration: AdmittedTargetRegistration | None = None,
-                       provenance_operation_id: OperationId | None = None) -> GateResult:
+                       capability: TargetPublicationCapability | MergeCapability) -> GateResult:
         with self._lock:
             if type(continuation) is not LiveProtectedEffectContinuation or not continuation._consume(self, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             fence, subject = continuation.action_target_fence, continuation.subject
             try:
+                materialization = continuation.materialization
+                base_ref = continuation.base_ref
+                target_registration = continuation.target_registration
+                provenance_operation_id = continuation.provenance_operation_id
                 if not continuation.target_fence_token.active or not self._is_active():
                     return GateResult(GateResultCode.LEASE_INVALID)
+                durable = self.platform.prepared_effect_record(
+                    continuation.operation_id, subject.value
+                )
+                if (type(durable) is not PreparedProtectedStart
+                        or durable.prepared_start_id != continuation.prepared_start_id
+                        or durable.state not in (
+                            PreparedProtectedStartState.PREPARED,
+                            PreparedProtectedStartState.CONSUMED,
+                        )):
+                    return GateResult(GateResultCode.INDETERMINATE)
                 if not self._dependencies_fresh_set(continuation.dependencies):
                     return GateResult(GateResultCode.INDETERMINATE)
                 if type(materialization) is not CandidateMaterialization:
@@ -1612,14 +2053,28 @@ class FixtureProtectedGateRuntime:
         return GateResult(code, committed.canonical_result)
 
     def restart(self) -> "FixtureProtectedGateRuntime":
+        previous = (
+            self._control_runtime, self._publication_runtime, self._merge_runtime
+        )
         self.registry.retire_owner_for_restart(self)
-        return FixtureProtectedGateRuntime(
+        restarted = FixtureProtectedGateRuntime(
             GateRuntimeBinding(self.binding.root_context_id,
                                self.binding.runtime_generation,
                                self.binding.control_state_principal, self.binding.publication_principal,
                                self.binding.merge_principal),
             self.backend, self.platform, self.audit, self.registry,
+            _restart_from=previous,
         )
+        restarted._profiles.update(self._profiles)
+        restarted._readers.update(self._readers)
+        restarted._fixture_transports.update(self._fixture_transports)
+        restarted._authorization_contexts.update(self._authorization_contexts)
+        restarted._evidence_contexts.update(self._evidence_contexts)
+        return restarted
+
+    def fail_after_start_commit_for_test(self) -> None:
+        """Inject process loss immediately after the canonical start linearization."""
+        self._fail_after_start = True
 
 
 class ControlStateGate:
@@ -1646,15 +2101,9 @@ class TargetPublicationGate:
             raise TypeError("exact fixture runtime required")
         self._runtime = runtime
 
-    def perform(self, continuation: LiveProtectedEffectContinuation, *,
-                materialization: CandidateMaterialization, base_ref: CanonicalBranchRef | None,
-                target_registration: AdmittedTargetRegistration,
-                provenance_operation_id: OperationId | None = None) -> GateResult:
+    def perform(self, continuation: LiveProtectedEffectContinuation) -> GateResult:
         return self._runtime.perform_effect(
             continuation, self._runtime.publication_capability,
-            materialization=materialization, base_ref=base_ref,
-            target_registration=target_registration,
-            provenance_operation_id=provenance_operation_id,
         )
 
 
@@ -1668,14 +2117,9 @@ class MergeGate:
             raise TypeError("exact fixture runtime required")
         self._runtime = runtime
 
-    def perform(self, continuation: LiveProtectedEffectContinuation, *,
-                materialization: CandidateMaterialization,
-                target_registration: AdmittedTargetRegistration,
-                provenance_operation_id: OperationId) -> GateResult:
+    def perform(self, continuation: LiveProtectedEffectContinuation) -> GateResult:
         return self._runtime.perform_effect(
             continuation, self._runtime.merge_capability,
-            materialization=materialization, target_registration=target_registration,
-            provenance_operation_id=provenance_operation_id,
         )
 
 

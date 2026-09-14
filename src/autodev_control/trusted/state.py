@@ -337,6 +337,72 @@ class TaskEvaluationInput:
             raise ValueError("duplicate bound OperationId")
 
 
+def _compose_candidate_applicability(
+    task: TaskRecord, candidate: CandidateRecord,
+    decision_event_id: DecisionEventId,
+) -> CandidateApplicabilityDetermination:
+    """Produce the trusted applicability result from exact canonical inputs."""
+    if type(task) is not TaskRecord or type(candidate) is not CandidateRecord:
+        raise TypeError("exact canonical task and candidate required")
+    if type(decision_event_id) is not DecisionEventId:
+        raise TypeError("exact decision event identity required")
+    if not _identity_matches(task, candidate):
+        raise ValueError("candidate does not match canonical task authority")
+    result = object.__new__(CandidateApplicabilityDetermination)
+    for name, value in (
+        ("decision_event_id", decision_event_id),
+        ("candidate_id", candidate.candidate_id), ("task_id", task.task_id),
+        ("expected_task_revision", task.revision),
+        ("contract_id", task.contract_id),
+        ("contract_raw_sha256", task.contract_raw_sha256),
+        ("authorization_id", task.authorization_id),
+        ("admission_event_id", task.admission_event_id),
+        ("target_registration_id", task.target_registration_id),
+        ("policy_epoch_identity", task.last_evaluated_policy_epoch_identity),
+    ):
+        object.__setattr__(result, name, value)
+    return result
+
+
+def _compose_completion_aggregate(
+    *, task: TaskRecord, completion_rule_set_id: CompletionRuleSetId,
+    policy_epoch_identity: PolicyEpochIdentity,
+    contract_acceptance_status: ConditionStatus,
+    additional_conditions_status: ConditionStatus,
+    required_operation_ids: tuple[OperationId, ...],
+    applicability_status: ConditionStatus,
+) -> CompletionAggregate:
+    """Trusted-controller composition boundary for an exact completion aggregate."""
+    exact = (
+        (task, TaskRecord), (completion_rule_set_id, CompletionRuleSetId),
+        (policy_epoch_identity, PolicyEpochIdentity),
+        (contract_acceptance_status, ConditionStatus),
+        (additional_conditions_status, ConditionStatus),
+        (applicability_status, ConditionStatus),
+    )
+    if any(type(value) is not expected for value, expected in exact):
+        raise TypeError("completion composition input has wrong exact type")
+    _unique_exact(required_operation_ids, OperationId, "required operation ids")
+    result = object.__new__(CompletionAggregate)
+    values = {
+        "completion_rule_set_id": completion_rule_set_id,
+        "task_id": task.task_id, "contract_id": task.contract_id,
+        "contract_raw_sha256": task.contract_raw_sha256,
+        "authorization_id": task.authorization_id,
+        "admission_event_id": task.admission_event_id,
+        "target_registration_id": task.target_registration_id,
+        "policy_epoch_identity": policy_epoch_identity,
+        "candidate_id": task.current_candidate_id,
+        "contract_acceptance_status": contract_acceptance_status,
+        "additional_trusted_completion_conditions_status": additional_conditions_status,
+        "required_protected_operation_ids": required_operation_ids,
+        "current_applicability_and_authority_status": applicability_status,
+    }
+    for name, value in values.items():
+        object.__setattr__(result, name, value)
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class TaskCreateProposal:
     expected_absent: bool

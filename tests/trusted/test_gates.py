@@ -7,7 +7,8 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from autodev_control.trusted.audit import (
-    AuditAppendStatus, FixtureGateAudit, GateAuditEventPreimage,
+    AuditAppendStatus, FixtureGateAudit, GateAuditAuthoritativeDependency,
+    GateAuditEventPreimage,
     GateAuditOutcome, build_gate_audit_event,
 )
 from autodev_control.trusted.authorization import (
@@ -15,7 +16,8 @@ from autodev_control.trusted.authorization import (
     DirectAuthoritySource,
 )
 from autodev_control.trusted.backend import (
-    CanonicalTransaction, CanonicalWriteStatus, CreateAuthorization,
+    BackendGeneration, CanonicalStateOccurrenceBinding, CanonicalTransaction,
+    CanonicalWriteStatus, CreateAuthorization,
     InMemoryCanonicalStateBackend, ResolvedTargetRegistration,
     canonical_json_bytes,
 )
@@ -32,7 +34,7 @@ from autodev_control.trusted.identity import (
 )
 from autodev_control.trusted.operation import (
     AdmissionEventId, AuthoritativeStateBindingId, CandidateId,
-    NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
+    CompletionRuleSetId, NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
     OperationIdempotencyKey, OperationPurpose, OperationState, OperationSubjectId,
     TrustedOperationClassification, construct_trusted_operation_intent,
 )
@@ -46,10 +48,15 @@ from autodev_control.trusted.scope import (
     HumanPrincipalId, MutationScope, MutationScopeRule, RepositorySelector,
     RiskTier, ServicePrincipalId, TargetRegistrationId, TaskCapability, TaskId,
 )
-from autodev_control.trusted.state import DecisionEventId, RepairBudget
+from autodev_control.trusted.state import (
+    CandidateApplicabilityDetermination, CompletionAggregate, DecisionEventId,
+    RepairBudget, TaskEvaluationInput,
+)
 from autodev_control.trusted.state_reader import (
-    AuthenticatedGitHubReadTransport, AuthoritativeObservationProfile, GitHubStateReader,
-    ReadRepositoryIdentity, RegisteredStateFactDescriptor, TrustedGitHubReadTransportBinding,
+    AuthenticatedGitHubReadTransport, AuthoritativeObservationProfile,
+    AuthoritativeStateSnapshot, GitHubStateReader, NormalizedGitHubObservation,
+    ReadRepositoryIdentity, RegisteredStateFactDescriptor,
+    TrustedGitHubReadTransportBinding, authoritative_state_binding,
 )
 from autodev_control.trusted.target_registration import (
     AdmittedTargetRegistration, MergeConfiguration, TargetPublication,
@@ -160,6 +167,17 @@ def source():
     return profile, reader
 
 
+def fixture_source(owner="o"):
+    profile, reader = source()
+    snapshot = AuthoritativeStateSnapshot(
+        REPO, profile.profile_id, reader._binding.config_id,
+        (NormalizedGitHubObservation(
+            "repository", (REPO.value, owner, "r"),
+        ),),
+    )
+    return profile, reader._binding, snapshot
+
+
 def marker(operation="one", result="result"):
     subject = PublishedCandidateRefEffectSubject(REPO, REF, GitRef(REF.value), SHA)
     preimage = ProtectedEffectMarkerPreimage(
@@ -177,10 +195,16 @@ def marker(operation="one", result="result"):
 
 
 def audit_event(outcome=GateAuditOutcome.ATTEMPTED):
+    binding = GateRuntimeBinding(
+        RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
+        ServicePrincipalId("control"), ServicePrincipalId("publication"),
+        ServicePrincipalId("merge"),
+    )
     return build_gate_audit_event(GateAuditEventPreimage(
         "autodev.gate-audit-event/v1", "gate", "op", outcome,
         RootContextId(RawSha256("1" * 64)), 1,
-        ServicePrincipalId("control"), RawSha256("2" * 64),
+        binding.runtime_binding_id, ServicePrincipalId("control"), (),
+        RawSha256("2" * 64), CanonicalStateOccurrenceBinding(BackendGeneration(1)),
         None, None, None, None, "", "",
     ))
 
@@ -242,30 +266,20 @@ def adopt_materialization(value, materialization):
 
 
 def reserve_protected(value, name, candidate_id):
-    classification = mint(
-        TrustedOperationClassification,
-        effect_class=OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT,
-        purpose=OperationPurpose.NORMAL,
-    )
-    intent = construct_trusted_operation_intent(
-        classification=classification, operation_id=OperationId(name),
-        idempotency_key=OperationIdempotencyKey("key-" + name), task_id=TASK,
+    command = OperationReservationCommand(
+        operation_id=OperationId(name),
+        idempotency_key=OperationIdempotencyKey("key-" + name),
         action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
-        candidate_id=candidate_id, contract_id=CONTRACT,
-        contract_raw_sha256=RAW, authorization_id=AUTH,
-        admission_event_id=ADMISSION, target_registration_id=TARGET,
-        policy_epoch_identity=EPOCH,
-        authoritative_state_binding_id=AuthoritativeStateBindingId("state-" + name),
         required_evidence_ids=(), integration_binding=NotIntegrationBound(),
         is_repair_attempt=False,
     )
-    request = value.boundary.reserve_operation(TASK, intent)
+    request = value.boundary.reserve_operation(TASK, command)
     assert ControlStateGate(value).commit(
         request, independent_lease(value)
     ).code is GateResultCode.COMMITTED
     return next(
         item for item in value.backend.read_task_working_set(TASK).operations
-        if item.intent.operation_id == intent.operation_id
+        if item.intent.operation_id == command.operation_id
     )
 
 
@@ -284,11 +298,7 @@ def start_protected(value, operation, subject, fence, materialization, *,
         target_registration=target or registration(), base_ref=base_ref,
         provenance_operation_id=provenance_operation_id,
     )
-    request = value.boundary.start_operation(
-        TASK, operation.intent.operation_id,
-        prepared.prepared_start.prepared_start_id,
-    )
-    return value.commit_protected_start(prepared, request, operation, subject)
+    return value.commit_protected_start(prepared, operation, subject)
 
 
 def test_gate_principals_must_be_pairwise_distinct():
@@ -333,19 +343,34 @@ def test_unresolved_dependency_denies_lease():
 
 def test_exact_fresh_dependency_issues_lease():
     value = runtime()
+    profile, transport, snapshot = fixture_source()
+    expected = authoritative_state_binding(snapshot)
+    item = ControlStateAuthoritativeDependency(REPO, profile.profile_id, transport.config_id, expected)
+    value.register_fixture_authoritative_source(profile, transport, snapshot)
+    assert type(value.acquire_control_lease(value.control_capability, ControlStateAuthoritativeDependencySet((item,)))) is ControlStateCommitLease
+
+
+def test_unrelated_mutable_reader_is_not_a_fenceable_g7_source():
+    value = runtime()
     profile, reader = source()
     expected = reader.read_authoritative(REPO, profile).binding_id
-    item = ControlStateAuthoritativeDependency(REPO, profile.profile_id, reader._binding.config_id, expected)
     value.register_authoritative_source(profile, reader)
-    assert type(value.acquire_control_lease(value.control_capability, ControlStateAuthoritativeDependencySet((item,)))) is ControlStateCommitLease
+    dependency_set = ControlStateAuthoritativeDependencySet((
+        ControlStateAuthoritativeDependency(
+            REPO, profile.profile_id, reader._binding.config_id, expected,
+        ),
+    ))
+    assert value.acquire_control_lease(
+        value.control_capability, dependency_set
+    ) is None
 
 
 def test_wrong_capability_denies_control_lease():
     value = runtime()
-    profile, reader = source()
-    expected = reader.read_authoritative(REPO, profile).binding_id
-    item = ControlStateAuthoritativeDependency(REPO, profile.profile_id, reader._binding.config_id, expected)
-    value.register_authoritative_source(profile, reader)
+    profile, transport, snapshot = fixture_source()
+    expected = authoritative_state_binding(snapshot)
+    item = ControlStateAuthoritativeDependency(REPO, profile.profile_id, transport.config_id, expected)
+    value.register_fixture_authoritative_source(profile, transport, snapshot)
     assert value.acquire_control_lease(value.publication_capability, ControlStateAuthoritativeDependencySet((item,))) is None
 
 
@@ -526,13 +551,13 @@ def test_dependency_mutation_cannot_linearize_while_control_lease_is_live():
         target_registration_id=TARGET, policy_epoch_identity=EPOCH,
         repair_budget=RepairBudget(1),
     )
-    profile, reader = source()
-    expected = reader.read_authoritative(REPO, profile).binding_id
-    value.register_authoritative_source(profile, reader)
+    profile, transport, snapshot = fixture_source()
+    expected = authoritative_state_binding(snapshot)
+    value.register_fixture_authoritative_source(profile, transport, snapshot)
     lease = value.acquire_control_lease(
         value.control_capability,
         ControlStateAuthoritativeDependencySet((ControlStateAuthoritativeDependency(
-            REPO, profile.profile_id, reader._binding.config_id, expected,
+            REPO, profile.profile_id, transport.config_id, expected,
         ),)),
     )
     completed = threading.Event()
@@ -540,7 +565,7 @@ def test_dependency_mutation_cannot_linearize_while_control_lease_is_live():
 
     def mutate():
         try:
-            value.platform.seed_ref(REPO, REF, SHA)
+            value.platform.replace_authoritative_snapshot(fixture_source("changed")[2])
         except FixtureFenceConflict as error:
             failures.append(error)
         finally:
@@ -550,7 +575,9 @@ def test_dependency_mutation_cannot_linearize_while_control_lease_is_live():
     thread.start()
     assert completed.wait(1)
     assert len(failures) == 1
-    assert value.platform.read_ref(REPO, REF) is None
+    assert value.platform.authoritative_snapshot(
+        REPO, profile.profile_id, transport.config_id
+    ) == snapshot
     assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
     thread.join()
 
@@ -616,15 +643,11 @@ def test_prepared_start_to_publication_and_one_use_continuation():
     )
     assert started.code is GateResultCode.START_COMMITTED
     assert started.continuation.start_binding_id.raw_sha256 == started.continuation.prepared_start_id.raw_sha256
-    published = TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
-    )
+    published = TargetPublicationGate(value).perform(started.continuation)
     assert published.code is GateResultCode.EFFECT_SUCCEEDED
     assert value.platform.read_ref(REPO, materialization.candidate_branch) == materialization.commit
     assert TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
+        started.continuation
     ).code is GateResultCode.LEASE_CONSUMED
 
 
@@ -661,17 +684,12 @@ def test_target_mutation_cannot_linearize_across_prepared_start_and_effect():
     thread.start()
     assert completed.wait(1)
     assert len(failures) == 1
-    request = value.boundary.start_operation(
-        TASK, operation.intent.operation_id,
-        prepared.prepared_start.prepared_start_id,
-    )
     started = value.commit_protected_start(
-        prepared, request, operation,
+        prepared, operation,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     )
     assert TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
+        started.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     thread.join()
 
@@ -720,8 +738,7 @@ def test_same_operation_exact_marker_and_postcondition_is_already_applied():
         _fence_token=continuation.target_fence_token,
     )
     assert TargetPublicationGate(value).perform(
-        continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
+        continuation
     ).code is GateResultCode.ALREADY_APPLIED
 
 
@@ -786,8 +803,7 @@ def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
         publish_fence, materialization,
     )
     assert TargetPublicationGate(value).perform(
-        publish_start.continuation, materialization=materialization,
-        base_ref=None, target_registration=registration(),
+        publish_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     publication_marker = value.platform.marker(
         publish.intent.operation_id,
@@ -806,9 +822,7 @@ def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
         provenance_operation_id=publish.intent.operation_id,
     )
     assert TargetPublicationGate(value).perform(
-        pr_start.continuation, materialization=materialization, base_ref=REF,
-        target_registration=registration(),
-        provenance_operation_id=publish.intent.operation_id,
+        pr_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     pr_marker = value.platform.marker(
         create_pr.intent.operation_id,
@@ -826,9 +840,7 @@ def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
         materialization, provenance_operation_id=create_pr.intent.operation_id,
     )
     assert MergeGate(value).perform(
-        merge_start.continuation, materialization=materialization,
-        target_registration=registration(),
-        provenance_operation_id=create_pr.intent.operation_id,
+        merge_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     merge_marker = value.platform.marker(
         merge.intent.operation_id,
@@ -857,8 +869,7 @@ def test_pr_marker_for_different_base_ref_same_sha_cannot_authorize_merge():
                           value.platform.snapshot().generation), materialization,
         target=target)
     assert TargetPublicationGate(value).perform(
-        publish_start.continuation, materialization=materialization,
-        base_ref=None, target_registration=target,
+        publish_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
 
     create_pr = reserve_protected(value, "pr-wrong-base", materialization.candidate_id)
@@ -870,9 +881,7 @@ def test_pr_marker_for_different_base_ref_same_sha_cannot_authorize_merge():
         target=target, base_ref=alternate,
         provenance_operation_id=publish.intent.operation_id)
     assert TargetPublicationGate(value).perform(
-        pr_start.continuation, materialization=materialization,
-        base_ref=alternate, target_registration=target,
-        provenance_operation_id=publish.intent.operation_id,
+        pr_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
 
     merge = reserve_protected(value, "merge-wrong-base", materialization.candidate_id)
@@ -896,8 +905,7 @@ def test_manual_equivalent_pr_cannot_substitute_for_exact_pr_marker():
         ActionTargetFence(REPO, materialization.candidate_branch, None,
                           value.platform.snapshot().generation), materialization)
     assert TargetPublicationGate(value).perform(
-        publish_start.continuation, materialization=materialization,
-        base_ref=None, target_registration=registration(),
+        publish_start.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     value.platform.create_pull_request(
         REPO, materialization.candidate_branch, REF, materialization.commit
@@ -927,10 +935,7 @@ def test_target_effect_audit_failure_preserves_marker_and_restart_reconciles_wit
         materialization,
     )
     value.audit.fail_next_append_for_test()
-    result = TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
-    )
+    result = TargetPublicationGate(value).perform(started.continuation)
     assert result.code is GateResultCode.AUDIT_FAILURE_AFTER_COMMIT
     assert value.platform.marker(
         operation.intent.operation_id,
@@ -964,10 +969,7 @@ def test_post_start_target_conflict_proves_absence_releases_and_reconciles_faile
         ActionTargetFence(REPO, materialization.candidate_branch, None,
                           value.platform.snapshot().generation), materialization)
     value.platform.fail_next_effect_for_test()
-    result = TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
-    )
+    result = TargetPublicationGate(value).perform(started.continuation)
     assert result.code is GateResultCode.PRECONDITION_CONFLICT
     assert value.platform.read_ref(REPO, materialization.candidate_branch) is None
     assert value.platform.prepared_effect_state(
@@ -1027,8 +1029,7 @@ def test_contradictory_consumed_marker_postcondition_reconciles_indeterminate():
         ActionTargetFence(REPO, materialization.candidate_branch, None,
                           value.platform.snapshot().generation), materialization)
     assert TargetPublicationGate(value).perform(
-        started.continuation, materialization=materialization, base_ref=None,
-        target_registration=registration(),
+        started.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
     value.platform.seed_ref(REPO, materialization.candidate_branch, GitSha("d" * 40))
     restarted = value.restart()
@@ -1046,3 +1047,262 @@ def test_contradictory_consumed_marker_postcondition_reconciles_indeterminate():
         if item.intent.operation_id == operation.intent.operation_id
     )
     assert stored.state is OperationState.INDETERMINATE
+
+
+def test_durable_prepared_record_exists_before_canonical_start():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "prepared-first", materialization.candidate_id)
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation),
+        independent_lease(value), value.publication_capability,
+        all_scope(), MutationScope(()), materialization=materialization,
+        target_registration=registration(),
+    )
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "PREPARED"
+    assert value.platform.prepared_effect_record(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is prepared.prepared_start
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.RESERVED
+
+
+def test_failed_g6_start_releases_and_verifies_exact_prepared_record():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "start-cas-failure", materialization.candidate_id)
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation),
+        independent_lease(value), value.publication_capability,
+        all_scope(), MutationScope(()), materialization=materialization,
+        target_registration=registration(),
+    )
+    value.audit.fail_next_append_for_test()
+    result = value.commit_protected_start(
+        prepared, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert result.code is GateResultCode.AUDIT_FAILURE_BEFORE_COMMIT
+    assert prepared.prepared_start.state is PreparedProtectedStartState.RELEASED
+
+
+def test_process_loss_after_performing_recovers_prepared_to_failed_without_effect():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "crash-after-start", materialization.candidate_id)
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation),
+        independent_lease(value), value.publication_capability,
+        all_scope(), MutationScope(()), materialization=materialization,
+        target_registration=registration(),
+    )
+    value.fail_after_start_commit_for_test()
+    crashed = value.commit_protected_start(
+        prepared, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert crashed.code is GateResultCode.INDETERMINATE
+    assert crashed.continuation is None
+    assert prepared.prepared_start.state is PreparedProtectedStartState.PREPARED
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    performing = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert performing.state is OperationState.PERFORMING
+    restarted = value.restart()
+    assert restarted.reconcile_recovered_effect(
+        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ControlStateAuthoritativeDependencySet(()),
+        restarted.attest_external_state_independence(),
+    ).code is GateResultCode.EFFECT_FAILED
+    assert restarted.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+    failed = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert failed.state is OperationState.FAILED
+
+
+def test_public_boundary_rejects_fabricated_trusted_products_and_authority_contexts():
+    value = runtime()
+    fake_intent = object.__new__(OperationIntent)
+    fake_evaluation = object.__new__(TaskEvaluationInput)
+    fake_completion = object.__new__(CompletionAggregate)
+    fake_applicability = object.__new__(CandidateApplicabilityDetermination)
+    fake_evidence_request = object.__new__(SemanticEvidenceAdmissionRequest)
+    with pytest.raises(TypeError):
+        value.boundary.reserve_operation(TASK, fake_intent)
+    with pytest.raises(TypeError):
+        value.boundary.evaluate_task(fake_evaluation)
+    with pytest.raises(TypeError):
+        value.boundary.evaluate_task(fake_completion)
+    with pytest.raises(TypeError):
+        value.boundary.create_candidate_and_adopt(determination=fake_applicability)
+    with pytest.raises(TypeError):
+        value.boundary.admit_authorization(object(), policy=object())
+    with pytest.raises(TypeError):
+        value.boundary.admit_semantic_evidence(fake_evidence_request)
+    assert tuple(inspect.signature(value.boundary.admit_authorization).parameters) == ("proposal",)
+    candidate_source = inspect.getsource(DeterministicTrustedController.create_candidate_and_adopt)
+    assert "_compose_candidate_applicability" in candidate_source
+    assert "object.__new__(CandidateApplicabilityDetermination)" not in candidate_source
+
+
+def test_task_evaluation_request_composes_trusted_input_inside_controller():
+    value = runtime()
+    initialize_task(value)
+    command = TaskEvaluationCommand(
+        TASK, CompletionRuleSetId("completion"),
+        (BlockingConditionId("not-ready"),), (), None, (),
+    )
+    request = value.boundary.evaluate_task(command)
+    assert request.command_kind is TrustedControlCommandKind.EVALUATE_TASK
+    assert all(type(item) is not TaskEvaluationInput
+               for item in request.transaction.mutations)
+
+
+def test_audit_binds_exact_dependency_members_and_runtime_binding():
+    value = runtime()
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+    )).status is CanonicalWriteStatus.APPLIED
+    request = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(1),
+    )
+    profile, transport, snapshot = fixture_source()
+    value.register_fixture_authoritative_source(profile, transport, snapshot)
+    item = ControlStateAuthoritativeDependency(
+        REPO, profile.profile_id, transport.config_id,
+        authoritative_state_binding(snapshot),
+    )
+    dependencies = ControlStateAuthoritativeDependencySet((item,))
+    lease = value.acquire_control_lease(value.control_capability, dependencies)
+    assert value.commit(request, lease).code is GateResultCode.COMMITTED
+    events = tuple(record.event.preimage for record in value.audit.snapshot())
+    event = next(item for item in reversed(events) if item.authoritative_dependencies)
+    assert event.runtime_binding_id == value.binding.runtime_binding_id
+    assert event.authoritative_dependencies == (
+        GateAuditAuthoritativeDependency(
+            item.repository_id, item.observation_profile_id,
+            item.transport_config_id, item.expected_binding_id,
+        ),
+    )
+    assert event.canonical_state_occurrence_binding is not None
+
+
+def test_restart_same_generation_rotates_runtime_identity_in_audit():
+    value = runtime()
+    initialize_task(value)
+    old_id = value.binding.runtime_binding_id
+    restarted = value.restart()
+    assert restarted.binding.runtime_generation == value.binding.runtime_generation
+    assert restarted.binding.runtime_binding_id != old_id
+    request = restarted.boundary.set_cancellation(
+        TASK, CancellationStatus.REQUESTED, CancellationRequestId("restart-request")
+    )
+    assert restarted.commit(
+        request, independent_lease(restarted)
+    ).code is GateResultCode.COMMITTED
+    first_restart_id = restarted.binding.runtime_binding_id
+    restarted_again = restarted.restart()
+    request = restarted_again.boundary.set_cancellation(
+        TASK, CancellationStatus.NONE, None
+    )
+    assert restarted_again.commit(
+        request, independent_lease(restarted_again)
+    ).code is GateResultCode.COMMITTED
+    audit_ids = {record.event.preimage.runtime_binding_id
+                 for record in restarted_again.audit.snapshot()}
+    assert {
+        old_id, first_restart_id, restarted_again.binding.runtime_binding_id,
+    } <= audit_ids
+    assert len({old_id, first_restart_id,
+                restarted_again.binding.runtime_binding_id}) == 3
+
+
+def test_admin_runtime_replacement_requires_strictly_higher_generation():
+    value = runtime()
+    with pytest.raises(RuntimeError):
+        FixtureProtectedGateRuntime(
+            GateRuntimeBinding(
+                value.binding.root_context_id, FixtureRuntimeGeneration(1),
+                value.binding.control_state_principal,
+                value.binding.publication_principal,
+                value.binding.merge_principal,
+            ), value.backend, value.platform, value.audit, value.registry,
+        )
+    replacement = FixtureProtectedGateRuntime(
+        GateRuntimeBinding(
+            value.binding.root_context_id, FixtureRuntimeGeneration(2),
+            value.binding.control_state_principal,
+            value.binding.publication_principal,
+            value.binding.merge_principal,
+        ), value.backend, value.platform, value.audit, value.registry,
+    )
+    assert replacement._is_active()
+    assert not value._is_active()
+    assert value.acquire_control_lease(
+        value.control_capability, ControlStateAuthoritativeDependencySet(()),
+        value.attest_external_state_independence(),
+    ) is None
+    for generation in (1, 2):
+        with pytest.raises(RuntimeError):
+            FixtureProtectedGateRuntime(
+                GateRuntimeBinding(
+                    value.binding.root_context_id,
+                    FixtureRuntimeGeneration(generation),
+                    value.binding.control_state_principal,
+                    value.binding.publication_principal,
+                    value.binding.merge_principal,
+                ), value.backend, value.platform, value.audit, value.registry,
+            )
+
+
+def test_effect_action_package_is_frozen_before_performing():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "frozen-effect", materialization.candidate_id)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation),
+        materialization,
+    )
+    with pytest.raises(TypeError):
+        TargetPublicationGate(value).perform(
+            started.continuation, materialization=object()
+        )
+    assert TargetPublicationGate(value).perform(
+        started.continuation
+    ).code is GateResultCode.EFFECT_SUCCEEDED

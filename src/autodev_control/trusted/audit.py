@@ -5,14 +5,18 @@ from enum import Enum
 import hashlib
 from threading import RLock
 
-from .backend import canonical_json_bytes
+from .backend import CanonicalStateOccurrenceBinding, canonical_json_bytes
 from .identity import (
     CandidateMaterializationId, GateAuditEventId, MutationInventoryId,
-    OperationStartBindingId, ProtectedEffectMarkerId, RawSha256, RootContextId,
+    GateRuntimeBindingId, ImmutableConfigId, OperationStartBindingId,
+    ProtectedEffectMarkerId, RawSha256, RootContextId,
 )
 from .manifest import PolicyEpochIdentity
-from .operation import CandidateId, OperationId
-from .scope import AuthorizationId, ServicePrincipalId, TargetRegistrationId, TaskId
+from .operation import AuthoritativeStateBindingId, CandidateId, OperationId
+from .scope import (
+    AuthorizationId, GitHubRepositoryId, ServicePrincipalId,
+    TargetRegistrationId, TaskId,
+)
 
 
 class GateAuditOutcome(Enum):
@@ -39,6 +43,26 @@ class AuditAppendStatus(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class GateAuditAuthoritativeDependency:
+    """Exact audit projection of one authoritative dependency member."""
+
+    repository_id: GitHubRepositoryId
+    observation_profile_id: ImmutableConfigId
+    transport_config_id: ImmutableConfigId
+    expected_binding_id: AuthoritativeStateBindingId
+
+    def __post_init__(self) -> None:
+        exact = (
+            (self.repository_id, GitHubRepositoryId),
+            (self.observation_profile_id, ImmutableConfigId),
+            (self.transport_config_id, ImmutableConfigId),
+            (self.expected_binding_id, AuthoritativeStateBindingId),
+        )
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("audit dependency has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
 class GateAuditEventPreimage:
     format: str
     gate: str
@@ -46,8 +70,11 @@ class GateAuditEventPreimage:
     outcome: GateAuditOutcome
     root_context_id: RootContextId
     runtime_generation: int
+    runtime_binding_id: GateRuntimeBindingId
     service_identity: ServicePrincipalId
+    authoritative_dependencies: tuple[GateAuditAuthoritativeDependency, ...]
     dependency_set_identity: RawSha256
+    canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding | None
     operation_id: OperationId | None
     operation_start_binding_id: OperationStartBindingId | None
     protected_effect_marker_id: ProtectedEffectMarkerId | None
@@ -68,6 +95,7 @@ class GateAuditEventPreimage:
             (self.outcome, GateAuditOutcome),
             (self.root_context_id, RootContextId),
             (self.runtime_generation, int),
+            (self.runtime_binding_id, GateRuntimeBindingId),
             (self.service_identity, ServicePrincipalId),
             (self.dependency_set_identity, RawSha256),
             (self.result_identity, str), (self.detail, str),
@@ -76,6 +104,21 @@ class GateAuditEventPreimage:
             raise ValueError("unsupported gate audit event format")
         if any(type(value) is not expected for value, expected in exact):
             raise TypeError("gate audit preimage has wrong exact type")
+        if (type(self.authoritative_dependencies) is not tuple
+                or any(type(item) is not GateAuditAuthoritativeDependency
+                       for item in self.authoritative_dependencies)):
+            raise TypeError("authoritative dependencies must be an exact tuple")
+        dependency_keys = tuple(
+            (item.repository_id.value, item.observation_profile_id.value,
+             item.transport_config_id.value)
+            for item in self.authoritative_dependencies
+        )
+        if dependency_keys != tuple(sorted(dependency_keys)) or len(set(dependency_keys)) != len(dependency_keys):
+            raise ValueError("audit dependencies require canonical unique order")
+        if (self.canonical_state_occurrence_binding is not None
+                and type(self.canonical_state_occurrence_binding)
+                is not CanonicalStateOccurrenceBinding):
+            raise TypeError("canonical occurrence has wrong exact type")
         optional = (
             (self.operation_id, OperationId),
             (self.operation_start_binding_id, OperationStartBindingId),

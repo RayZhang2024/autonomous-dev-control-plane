@@ -12,10 +12,16 @@ from .identity import (
     PreparedProtectedStartId, ProtectedEffectMarkerId, RawSha256, RootContextId,
 )
 from .materialization import CandidateMaterialization, GitTreeEntry, derive_mutation_inventory
-from .operation import OperationActionId, OperationId, OperationIdempotencyKey
+from .operation import (
+    AuthoritativeStateBindingId, OperationActionId, OperationId,
+    OperationIdempotencyKey,
+)
 from .scope import CanonicalBranchRef, GitHubRepositoryId
 from .scope import ServicePrincipalId
-from .state_reader import GitHubPullRequestNumber
+from .state_reader import (
+    AuthoritativeStateSnapshot, GitHubPullRequestNumber,
+    authoritative_state_binding,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +200,18 @@ class ActiveFixtureRuntimeRegistry:
         with self.lock:
             if self._live:
                 return False
+            if self._active is not None and generation <= self._active[1]:
+                return False
+            self._active = root, generation, control, publication, merge
+            return True
+
+    def restart(self, root: RootContextId, generation: int,
+                previous: tuple[object, object, object], control: object,
+                publication: object, merge: object) -> bool:
+        """Rotate process bindings without changing root or fixture generation."""
+        with self.lock:
+            if self._live or self._active != (root, generation, *previous):
+                return False
             self._active = root, generation, control, publication, merge
             return True
 
@@ -238,7 +256,7 @@ class ActiveFixtureRuntimeRegistry:
 class FixtureGitPlatform:
     """Authoritative fixture state. It performs no network or provider calls."""
 
-    __slots__ = ("_lock", "_registry", "_generation", "_refs", "_prs", "_markers", "_prepared", "_commits", "_fail_next_effect")
+    __slots__ = ("_lock", "_registry", "_generation", "_refs", "_prs", "_markers", "_prepared", "_commits", "_authoritative", "_fail_next_effect")
 
     def __init__(self) -> None:
         self._registry: ActiveFixtureRuntimeRegistry | None = None
@@ -247,8 +265,9 @@ class FixtureGitPlatform:
         self._refs: dict[tuple[GitHubRepositoryId, CanonicalBranchRef], GitSha] = {}
         self._prs: list[FixturePullRequest] = []
         self._markers: dict[tuple[OperationId, str], ProtectedEffectMarker] = {}
-        self._prepared: dict[tuple[OperationId, str], str] = {}
+        self._prepared: dict[tuple[OperationId, str], tuple[object | None, str]] = {}
         self._commits: dict[GitSha, tuple[tuple[GitSha, ...], GitSha, tuple[GitTreeEntry, ...]]] = {}
+        self._authoritative: dict[tuple[GitHubRepositoryId, object, object], AuthoritativeStateSnapshot] = {}
         self._fail_next_effect = False
 
     def fail_next_effect_for_test(self) -> None:
@@ -276,7 +295,7 @@ class FixtureGitPlatform:
         with self._lock:
             refs = tuple(sorted(((r, b, s) for (r, b), s in self._refs.items()), key=lambda x: (x[0].value, x[1].value)))
             prepared = tuple(
-                (key[0].value, key[1], value)
+                (key[0].value, key[1], value[1])
                 for key, value in sorted(self._prepared.items(), key=lambda item: (item[0][0].value, item[0][1]))
             )
             return FixturePlatformSnapshot(self._generation, refs, tuple(self._prs), tuple(self._markers.values()), prepared)
@@ -287,23 +306,107 @@ class FixtureGitPlatform:
             key = operation_id, gate_action
             if key in self._markers:
                 raise ValueError("completed effect cannot return to PREPARED")
-            if self._prepared.setdefault(key, "PREPARED") != "PREPARED":
+            current = self._prepared.setdefault(key, (None, "PREPARED"))
+            if current[1] != "PREPARED":
                 raise ValueError("terminal prepared state cannot return to PREPARED")
             self._generation += 1
 
+    def persist_prepared_effect(self, operation_id: OperationId, gate_action: str,
+                                prepared: object, *,
+                                _fence_token: FixtureFenceToken) -> None:
+        """Durably persist the exact gate-private prepared record before G6 start."""
+        with self._lock:
+            self._guard(("prepared", operation_id, gate_action), _fence_token)
+            key = operation_id, gate_action
+            current = self._prepared.get(key)
+            if current is not None and current != (prepared, "PREPARED"):
+                raise ValueError("prepared start identity conflict")
+            if key in self._markers:
+                raise ValueError("completed effect cannot return to PREPARED")
+            if current is None:
+                self._prepared[key] = (prepared, "PREPARED")
+                self._generation += 1
+
+    def verify_prepared_effect(self, operation_id: OperationId, gate_action: str,
+                               prepared: object) -> bool:
+        with self._lock:
+            return self._prepared.get((operation_id, gate_action)) == (prepared, "PREPARED")
+
+    def prepared_effect_record(self, operation_id: OperationId,
+                               gate_action: str) -> object | None:
+        with self._lock:
+            current = self._prepared.get((operation_id, gate_action))
+            return None if current is None else current[0]
+
     def prepared_effect_state(self, operation_id: OperationId, gate_action: str) -> str | None:
         with self._lock:
-            return self._prepared.get((operation_id, gate_action))
+            current = self._prepared.get((operation_id, gate_action))
+            return None if current is None else current[1]
 
     def release_prepared_effect(self, operation_id: OperationId, gate_action: str, *, _fence_token: FixtureFenceToken | None = None) -> bool:
         with self._lock:
             self._guard(("prepared", operation_id, gate_action), _fence_token)
             key = operation_id, gate_action
-            if self._prepared.get(key) != "PREPARED" or key in self._markers:
+            current = self._prepared.get(key)
+            if current is None or current[1] != "PREPARED" or key in self._markers:
                 return False
-            self._prepared[key] = "RELEASED"
+            self._prepared[key] = (current[0], "RELEASED")
             self._generation += 1
             return True
+
+    def install_authoritative_snapshot(self, snapshot: AuthoritativeStateSnapshot) -> None:
+        """Install one exact root-managed fixture observation source."""
+        if type(snapshot) is not AuthoritativeStateSnapshot:
+            raise TypeError("exact AuthoritativeStateSnapshot required")
+        locator = (snapshot.repository_id, snapshot.observation_profile_id,
+                   snapshot.transport_config_id)
+        with self._lock:
+            if locator in self._authoritative and self._authoritative[locator] != snapshot:
+                raise ValueError("authoritative fixture locator identity conflict")
+            self._guard(("authoritative-profile", *locator))
+            for observation in snapshot.observations:
+                self._guard(("authoritative", *locator, observation.fact_key))
+            self._authoritative[locator] = snapshot
+            self._generation += 1
+
+    def replace_authoritative_snapshot(self, snapshot: AuthoritativeStateSnapshot) -> None:
+        """Fixture mutation hook; live leases fence every contributing observation."""
+        if type(snapshot) is not AuthoritativeStateSnapshot:
+            raise TypeError("exact AuthoritativeStateSnapshot required")
+        locator = (snapshot.repository_id, snapshot.observation_profile_id,
+                   snapshot.transport_config_id)
+        with self._lock:
+            current = self._authoritative.get(locator)
+            if current is None:
+                raise ValueError("authoritative fixture source is not installed")
+            self._guard(("authoritative-profile", *locator))
+            for fact_key in {item.fact_key for item in (*current.observations, *snapshot.observations)}:
+                self._guard(("authoritative", *locator, fact_key))
+            self._authoritative[locator] = snapshot
+            self._generation += 1
+
+    def authoritative_snapshot(self, repository_id: GitHubRepositoryId,
+                               profile_id: object, transport_id: object) -> AuthoritativeStateSnapshot | None:
+        with self._lock:
+            return self._authoritative.get((repository_id, profile_id, transport_id))
+
+    def authoritative_facts(self, repository_id: GitHubRepositoryId,
+                            profile_id: object, transport_id: object) -> frozenset[tuple] | None:
+        with self._lock:
+            locator = (repository_id, profile_id, transport_id)
+            snapshot = self._authoritative.get(locator)
+            if snapshot is None:
+                return None
+            return frozenset({
+                ("authoritative-profile", *locator),
+                *(("authoritative", *locator, item.fact_key) for item in snapshot.observations),
+            })
+
+    def authoritative_binding(self, repository_id: GitHubRepositoryId,
+                              profile_id: object,
+                              transport_id: object) -> AuthoritativeStateBindingId | None:
+        snapshot = self.authoritative_snapshot(repository_id, profile_id, transport_id)
+        return None if snapshot is None else authoritative_state_binding(snapshot)
 
     def seed_ref(self, repository_id: GitHubRepositoryId, ref: CanonicalBranchRef, sha: GitSha) -> None:
         with self._lock:
@@ -413,7 +516,8 @@ class FixtureGitPlatform:
                 return False
             self._refs[key] = sha
             self._markers[marker_key] = marker
-            self._prepared[marker_key] = "CONSUMED"
+            prepared = self._prepared.get(marker_key)
+            self._prepared[marker_key] = (None if prepared is None else prepared[0], "CONSUMED")
             self._generation += 1
             return True
 
@@ -442,7 +546,8 @@ class FixtureGitPlatform:
             pr = FixturePullRequest(number, repository_id, head, base, head_sha, base_sha)
             self._prs.append(pr)
             self._markers[marker_key] = marker
-            self._prepared[marker_key] = "CONSUMED"
+            prepared = self._prepared.get(marker_key)
+            self._prepared[marker_key] = (None if prepared is None else prepared[0], "CONSUMED")
             self._generation += 1
             return pr
 
@@ -473,7 +578,8 @@ class FixtureGitPlatform:
             self._refs[(repository_id, target)] = candidate
             self._prs[self._prs.index(pr)] = replace(pr, merged=True)
             self._markers[marker_key] = marker
-            self._prepared[marker_key] = "CONSUMED"
+            prepared = self._prepared.get(marker_key)
+            self._prepared[marker_key] = (None if prepared is None else prepared[0], "CONSUMED")
             self._generation += 1
             return True
 
@@ -513,7 +619,8 @@ class FixtureGitPlatform:
                 raise ValueError("effect marker provenance conflict")
             if current is None:
                 self._markers[key] = marker
-                self._prepared[key] = "CONSUMED"
+                prepared = self._prepared.get(key)
+                self._prepared[key] = (None if prepared is None else prepared[0], "CONSUMED")
                 self._generation += 1
             return marker
 
