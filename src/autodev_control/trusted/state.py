@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 from .errors import G4Failure, G4FailureCode
-from .identity import GitSha, RawSha256
+from .identity import CandidateMaterializationId, GitSha, OperationStartBindingId, RawSha256
 from .manifest import PolicyEpochIdentity
 from .operation import (
     AdmissionEventId,
@@ -89,6 +89,7 @@ class CandidateRecord:
     admission_event_id: AdmissionEventId
     target_registration_id: TargetRegistrationId
     policy_epoch_identity: PolicyEpochIdentity
+    materialization_id: CandidateMaterializationId
     parent_candidate_ids: tuple[CandidateId, ...]
     creation_operation_id: OperationId | None = None
 
@@ -99,6 +100,7 @@ class CandidateRecord:
             (self.authorization_id, AuthorizationId), (self.admission_event_id, AdmissionEventId),
             (self.target_registration_id, TargetRegistrationId),
             (self.policy_epoch_identity, PolicyEpochIdentity),
+            (self.materialization_id, CandidateMaterializationId),
         )
         if any(type(value) is not expected for value, expected in exact):
             raise TypeError("candidate identity field has wrong exact type")
@@ -335,6 +337,72 @@ class TaskEvaluationInput:
             raise ValueError("duplicate bound OperationId")
 
 
+def _compose_candidate_applicability(
+    task: TaskRecord, candidate: CandidateRecord,
+    decision_event_id: DecisionEventId,
+) -> CandidateApplicabilityDetermination:
+    """Produce the trusted applicability result from exact canonical inputs."""
+    if type(task) is not TaskRecord or type(candidate) is not CandidateRecord:
+        raise TypeError("exact canonical task and candidate required")
+    if type(decision_event_id) is not DecisionEventId:
+        raise TypeError("exact decision event identity required")
+    if not _identity_matches(task, candidate):
+        raise ValueError("candidate does not match canonical task authority")
+    result = object.__new__(CandidateApplicabilityDetermination)
+    for name, value in (
+        ("decision_event_id", decision_event_id),
+        ("candidate_id", candidate.candidate_id), ("task_id", task.task_id),
+        ("expected_task_revision", task.revision),
+        ("contract_id", task.contract_id),
+        ("contract_raw_sha256", task.contract_raw_sha256),
+        ("authorization_id", task.authorization_id),
+        ("admission_event_id", task.admission_event_id),
+        ("target_registration_id", task.target_registration_id),
+        ("policy_epoch_identity", task.last_evaluated_policy_epoch_identity),
+    ):
+        object.__setattr__(result, name, value)
+    return result
+
+
+def _compose_completion_aggregate(
+    *, task: TaskRecord, completion_rule_set_id: CompletionRuleSetId,
+    policy_epoch_identity: PolicyEpochIdentity,
+    contract_acceptance_status: ConditionStatus,
+    additional_conditions_status: ConditionStatus,
+    required_operation_ids: tuple[OperationId, ...],
+    applicability_status: ConditionStatus,
+) -> CompletionAggregate:
+    """Trusted-controller composition boundary for an exact completion aggregate."""
+    exact = (
+        (task, TaskRecord), (completion_rule_set_id, CompletionRuleSetId),
+        (policy_epoch_identity, PolicyEpochIdentity),
+        (contract_acceptance_status, ConditionStatus),
+        (additional_conditions_status, ConditionStatus),
+        (applicability_status, ConditionStatus),
+    )
+    if any(type(value) is not expected for value, expected in exact):
+        raise TypeError("completion composition input has wrong exact type")
+    _unique_exact(required_operation_ids, OperationId, "required operation ids")
+    result = object.__new__(CompletionAggregate)
+    values = {
+        "completion_rule_set_id": completion_rule_set_id,
+        "task_id": task.task_id, "contract_id": task.contract_id,
+        "contract_raw_sha256": task.contract_raw_sha256,
+        "authorization_id": task.authorization_id,
+        "admission_event_id": task.admission_event_id,
+        "target_registration_id": task.target_registration_id,
+        "policy_epoch_identity": policy_epoch_identity,
+        "candidate_id": task.current_candidate_id,
+        "contract_acceptance_status": contract_acceptance_status,
+        "additional_trusted_completion_conditions_status": additional_conditions_status,
+        "required_protected_operation_ids": required_operation_ids,
+        "current_applicability_and_authority_status": applicability_status,
+    }
+    for name, value in values.items():
+        object.__setattr__(result, name, value)
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class TaskCreateProposal:
     expected_absent: bool
@@ -387,6 +455,7 @@ class OperationStartProposal:
     expected_cancellation_status: CancellationStatus
     expected_candidate_id: CandidateId | None
     expected_authoritative_state_binding_id: AuthoritativeStateBindingId
+    operation_start_binding_id: OperationStartBindingId
     proposed_task: TaskRecord | None
     proposed_operation: OperationRecord
 
@@ -399,6 +468,8 @@ class OperationStartProposal:
             raise TypeError("candidate binding has wrong exact type")
         if type(self.expected_authoritative_state_binding_id) is not AuthoritativeStateBindingId:
             raise TypeError("authoritative-state binding has wrong exact type")
+        if type(self.operation_start_binding_id) is not OperationStartBindingId:
+            raise TypeError("operation-start binding has wrong exact type")
         if self.proposed_task is not None and type(self.proposed_task) is not TaskRecord:
             raise TypeError("proposed task has wrong exact type")
         if type(self.proposed_operation) is not OperationRecord:
@@ -407,6 +478,8 @@ class OperationStartProposal:
             raise ValueError("start must increment operation revision exactly once")
         if self.proposed_operation.state is not OperationState.PERFORMING:
             raise ValueError("start proposal must establish PERFORMING")
+        if self.proposed_operation.start_binding_id != self.operation_start_binding_id:
+            raise ValueError("start proposal must preserve its exact start binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,6 +897,7 @@ def start_operation(
     task: TaskRecord, operation: OperationRecord, *, expected_task_revision: TaskRevision,
     expected_operation_revision: OperationRevision,
     expected_cancellation_status: CancellationStatus,
+    operation_start_binding_id: OperationStartBindingId,
 ) -> TaskResult:
     """Return a conditional start proposal; no effect may begin before durable commit."""
     _revision(expected_task_revision, "expected task revision")
@@ -874,18 +948,22 @@ def start_operation(
             consumed_operation_ids=(*task.repair_budget.consumed_operation_ids, intent.operation_id),
         )
         updated_task = replace(task, revision=task.revision + 1, repair_budget=budget)
-    transition = transition_operation(operation, expected_operation_revision, OperationState.PERFORMING)
-    if transition.failure is not None:
-        return TaskResult(failure=transition.failure)
+    if type(operation_start_binding_id) is not OperationStartBindingId:
+        raise TypeError("operation_start_binding_id has wrong exact type")
+    performing = OperationRecord(
+        operation.intent, operation.revision + 1, OperationState.PERFORMING,
+        start_binding_id=operation_start_binding_id,
+    )
     start = OperationStartProposal(
         expected_task_revision=expected_task_revision,
         expected_operation_revision=expected_operation_revision,
         expected_cancellation_status=expected_cancellation_status,
         expected_candidate_id=intent.candidate_id,
         expected_authoritative_state_binding_id=intent.authoritative_state_binding_id,
+        operation_start_binding_id=operation_start_binding_id,
         proposed_task=updated_task if intent.is_repair_attempt else None,
-        proposed_operation=transition.operation,
+        proposed_operation=performing,
     )
     return TaskResult(
-        task=updated_task, operation=transition.operation, operation_start_proposal=start
+        task=updated_task, operation=performing, operation_start_proposal=start
     )

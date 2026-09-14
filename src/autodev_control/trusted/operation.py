@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .errors import G4Failure, G4FailureCode
-from .identity import GitRef, RawSha256
+from .identity import GitRef, OperationStartBindingId, RawSha256
 from .manifest import PolicyEpochIdentity
 from .scope import AuthorizationId, ContractId, TargetRegistrationId, TaskId
 
@@ -237,6 +237,18 @@ class OperationIntent:
         raise TypeError("operation intent must come from a trusted classification boundary")
 
 
+def _compose_trusted_operation_classification(
+    effect_class: OperationEffectClass, purpose: OperationPurpose,
+) -> TrustedOperationClassification:
+    """Trusted-controller composition boundary for the closed classification pair."""
+    if type(effect_class) is not OperationEffectClass or type(purpose) is not OperationPurpose:
+        raise TypeError("exact closed operation classification inputs required")
+    result = object.__new__(TrustedOperationClassification)
+    object.__setattr__(result, "effect_class", effect_class)
+    object.__setattr__(result, "purpose", purpose)
+    return result
+
+
 def construct_trusted_operation_intent(
     *,
     classification: TrustedOperationClassification,
@@ -314,6 +326,7 @@ class OperationRecord:
     revision: OperationRevision
     state: OperationState
     reason_code: G4FailureCode | None = None
+    start_binding_id: OperationStartBindingId | None = None
 
     def __post_init__(self) -> None:
         if type(self.intent) is not OperationIntent:
@@ -323,6 +336,13 @@ class OperationRecord:
             raise TypeError("state must be exactly OperationState")
         if self.reason_code is not None and type(self.reason_code) is not G4FailureCode:
             raise TypeError("reason_code must be exact G4FailureCode or None")
+        if self.start_binding_id is not None and type(self.start_binding_id) is not OperationStartBindingId:
+            raise TypeError("start_binding_id must be exact OperationStartBindingId or None")
+        if self.state in (OperationState.RESERVED, OperationState.CONFLICT):
+            if self.start_binding_id is not None:
+                raise ValueError("non-started operation cannot carry a start binding")
+        elif self.start_binding_id is None:
+            raise ValueError("started operation must preserve its start binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +417,7 @@ def reserve_operation(
 
 
 _TRANSITIONS = {
-    OperationState.RESERVED: frozenset((OperationState.PERFORMING, OperationState.CONFLICT)),
+    OperationState.RESERVED: frozenset((OperationState.CONFLICT,)),
     OperationState.PERFORMING: frozenset(
         (OperationState.SUCCEEDED, OperationState.FAILED, OperationState.INDETERMINATE)
     ),
@@ -421,7 +441,10 @@ def transition_operation(
         return OperationRevisionResult(failure=G4Failure(G4FailureCode.REVISION_CONFLICT))
     if target_state not in _TRANSITIONS.get(operation.state, frozenset()):
         return OperationRevisionResult(failure=G4Failure(G4FailureCode.INVALID_OPERATION_TRANSITION))
-    proposed = OperationRecord(operation.intent, operation.revision + 1, target_state, reason_code)
+    proposed = OperationRecord(
+        operation.intent, operation.revision + 1, target_state, reason_code,
+        operation.start_binding_id,
+    )
     return OperationRevisionResult(OperationRevisionProposal(operation.revision, proposed))
 
 

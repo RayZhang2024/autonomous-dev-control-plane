@@ -1007,6 +1007,21 @@ class InMemoryCanonicalStateBackend:
                 tuple(self._state.evidence[item.evidence_id] for item in task.supporting_evidence_refs),
             )
 
+    def read_authorization(self, authorization_id: AuthorizationId) -> AdmittedAuthorization | None:
+        """Return the exact immutable canonical authorization for trusted orchestration."""
+        if type(authorization_id) is not AuthorizationId:
+            raise TypeError("exact AuthorizationId required")
+        with self._lock:
+            return self._state.authorizations.get(authorization_id)
+
+    def read_resolved_target_registration(
+        self, target_registration_id: TargetRegistrationId,
+    ) -> ResolvedTargetRegistration | None:
+        if type(target_registration_id) is not TargetRegistrationId:
+            raise TypeError("exact TargetRegistrationId required")
+        with self._lock:
+            return self._resolved_targets.get(target_registration_id)
+
     def read_review_eligibility_snapshot(
         self, subject_id: SemanticReviewEffectiveSubjectId
     ) -> CanonicalReviewEligibilitySnapshot | None:

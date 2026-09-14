@@ -59,3 +59,77 @@ class RawSha256:
 
     def __post_init__(self) -> None:
         _lower_hex(self.value, (64,))
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMaterializationId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class MutationInventoryId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class OperationStartBindingId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class RootContextId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProtectedStartId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedEffectMarkerId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class GateAuditEventId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
+class GateRuntimeBindingId:
+    """Content address of one exact process-local fixture gate runtime binding."""
+
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")

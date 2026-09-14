@@ -6,7 +6,7 @@ import pytest
 
 from autodev_control.trusted.backend import BackendGeneration, CanonicalStateOccurrenceBinding
 from autodev_control.trusted.evidence import *
-from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha256
+from autodev_control.trusted.identity import GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import AdmissionEventId, CandidateId, EvidenceId, OperationId, OperationIntent, OperationRecord, OperationState
 from autodev_control.trusted.parsing import ParseLimits
@@ -117,7 +117,8 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         admission_event_id=subject.task_admission_event_id, target_registration_id=subject.target_registration_id,
         policy_epoch_identity=subject.policy_epoch_identity,
     )
-    operation = OperationRecord(intent, 2, operation_state)
+    start_binding = None if operation_state in (OperationState.RESERVED, OperationState.CONFLICT) else OperationStartBindingId(RawSha256("7" * 64))
+    operation = OperationRecord(intent, 2, operation_state, start_binding_id=start_binding)
     binding = mint(
         TrustedReviewOperationBinding, invocation_id=subject.invocation_id, slot_id=slot.slot_id,
         operation_id=intent.operation_id, operation_revision=operation.revision,

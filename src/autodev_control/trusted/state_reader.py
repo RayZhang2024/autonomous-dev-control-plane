@@ -629,7 +629,9 @@ class GitHubStateReader:
             return GitHubNormalizationResult(failure=StateReadFailure.UNAVAILABLE)
 
 
-def _authoritative_binding(snapshot: AuthoritativeStateSnapshot) -> AuthoritativeStateBindingId:
+def authoritative_state_binding(snapshot: AuthoritativeStateSnapshot) -> AuthoritativeStateBindingId:
+    if type(snapshot) is not AuthoritativeStateSnapshot:
+        raise TypeError("exact AuthoritativeStateSnapshot required")
     payload = (
         "autodev.authoritative-state-binding/v1",
         snapshot.repository_id.value,
@@ -639,6 +641,9 @@ def _authoritative_binding(snapshot: AuthoritativeStateSnapshot) -> Authoritativ
     )
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return AuthoritativeStateBindingId(hashlib.sha256(raw).hexdigest())
+
+
+_authoritative_binding = authoritative_state_binding
 
 
 def authoritative_state_binding_from_result(
