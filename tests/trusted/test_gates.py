@@ -146,9 +146,9 @@ def dependency(binding="binding"):
     )
 
 
-def source():
+def source(profile_name="observation", transport_name="transport", owner="o"):
     transport_binding = object.__new__(TrustedGitHubReadTransportBinding)
-    fields = dict(config_id=ImmutableConfigId("transport"), expected_api_host_identity=ImmutableConfigId("host"),
+    fields = dict(config_id=ImmutableConfigId(transport_name), expected_api_host_identity=ImmutableConfigId("host"),
                   authentication_mode_identity=ImmutableConfigId("auth"), service_identity=ServicePrincipalId("reader"),
                   permitted_repository_ids=(REPO,), transport_profile_id=ImmutableConfigId("read"))
     for name, value in fields.items():
@@ -158,17 +158,17 @@ def source():
     object.__setattr__(descriptor, "descriptor_id", LogicalIdentifier("repository"))
     object.__setattr__(descriptor, "request", request)
     profile = object.__new__(AuthoritativeObservationProfile)
-    object.__setattr__(profile, "profile_id", ImmutableConfigId("observation"))
+    object.__setattr__(profile, "profile_id", ImmutableConfigId(profile_name))
     object.__setattr__(profile, "registered_fact_descriptors", (descriptor,))
     transport = object.__new__(AuthenticatedGitHubReadTransport)
     object.__setattr__(transport, "_binding", transport_binding)
-    object.__setattr__(transport, "_executor", lambda request, cursor: {"repository_id": REPO.value, "owner": "o", "name": "r"})
+    object.__setattr__(transport, "_executor", lambda request, cursor: {"repository_id": REPO.value, "owner": owner, "name": "r"})
     reader = GitHubStateReader(transport_binding, transport)
     return profile, reader
 
 
-def fixture_source(owner="o"):
-    profile, reader = source()
+def fixture_source(owner="o", profile_name="observation", transport_name="transport"):
+    profile, reader = source(profile_name, transport_name, owner)
     snapshot = AuthoritativeStateSnapshot(
         REPO, profile.profile_id, reader._binding.config_id,
         (NormalizedGitHubObservation(
@@ -176,6 +176,26 @@ def fixture_source(owner="o"):
         ),),
     )
     return profile, reader._binding, snapshot
+
+
+def install_fixture_dependencies(value, *names):
+    dependencies = []
+    for name in names:
+        profile, transport, snapshot = fixture_source(
+            owner="owner-" + name,
+            profile_name="observation-" + name,
+            transport_name="transport-" + name,
+        )
+        value.register_fixture_authoritative_source(profile, transport, snapshot)
+        dependencies.append(ControlStateAuthoritativeDependency(
+            REPO, profile.profile_id, transport.config_id,
+            authoritative_state_binding(snapshot),
+        ))
+    dependencies.sort(key=lambda item: (
+        item.repository_id.value, item.observation_profile_id.value,
+        item.transport_config_id.value,
+    ))
+    return ControlStateAuthoritativeDependencySet(tuple(dependencies))
 
 
 def marker(operation="one", result="result"):
@@ -284,8 +304,17 @@ def reserve_protected(value, name, candidate_id):
 
 
 def start_protected(value, operation, subject, fence, materialization, *,
-                    target=None, base_ref=None, provenance_operation_id=None):
-    control = independent_lease(value)
+                    target=None, base_ref=None, provenance_operation_id=None,
+                    dependencies=None):
+    if dependencies is None:
+        control = independent_lease(value)
+    else:
+        control = value.acquire_control_lease(
+            value.control_capability, dependencies,
+            value.attest_external_state_independence()
+            if not dependencies.dependencies else None,
+        )
+        assert type(control) is ControlStateCommitLease
     capability = (
         value.merge_capability
         if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
@@ -947,14 +976,21 @@ def test_target_effect_audit_failure_preserves_marker_and_restart_reconciles_wit
         if item.intent.operation_id == operation.intent.operation_id
     )
     assert restarted.reconcile_recovered_effect(
-        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        ControlStateAuthoritativeDependencySet(()),
-        restarted.attest_external_state_independence(),
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.EFFECT_SUCCEEDED
+    recovery_audit = next(
+        record.event.preimage for record in reversed(restarted.audit.snapshot())
+        if record.event.preimage.gate == "RECOVERY"
+    )
+    assert recovery_audit.protected_effect_marker_id == value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ).marker_id
+    assert recovery_audit.operation_start_binding_id == performing.start_binding_id
     assert value.reconcile_recovered_effect(
-        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        ControlStateAuthoritativeDependencySet(()),
-        value.attest_external_state_independence(),
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.LEASE_INVALID
 
 
@@ -1005,9 +1041,8 @@ def test_recovered_performing_with_prepared_and_no_marker_releases_and_fails():
         if item.intent.operation_id == operation.intent.operation_id
     )
     assert restarted.reconcile_recovered_effect(
-        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        ControlStateAuthoritativeDependencySet(()),
-        restarted.attest_external_state_independence(),
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.EFFECT_FAILED
     assert restarted.platform.prepared_effect_state(
         operation.intent.operation_id,
@@ -1038,9 +1073,8 @@ def test_contradictory_consumed_marker_postcondition_reconciles_indeterminate():
         if item.intent.operation_id == operation.intent.operation_id
     )
     assert restarted.reconcile_recovered_effect(
-        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        ControlStateAuthoritativeDependencySet(()),
-        restarted.attest_external_state_independence(),
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.INDETERMINATE
     stored = next(
         item for item in restarted.backend.read_task_working_set(TASK).operations
@@ -1134,9 +1168,8 @@ def test_process_loss_after_performing_recovers_prepared_to_failed_without_effec
     assert performing.state is OperationState.PERFORMING
     restarted = value.restart()
     assert restarted.reconcile_recovered_effect(
-        performing, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        ControlStateAuthoritativeDependencySet(()),
-        restarted.attest_external_state_independence(),
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.EFFECT_FAILED
     assert restarted.platform.prepared_effect_state(
         operation.intent.operation_id,
@@ -1306,3 +1339,198 @@ def test_effect_action_package_is_frozen_before_performing():
     assert TargetPublicationGate(value).perform(
         started.continuation
     ).code is GateResultCode.EFFECT_SUCCEEDED
+
+
+def recovered_prepared_operation(value, name, dependencies=None):
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, name, materialization.candidate_id)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(REPO, materialization.candidate_branch, None,
+                          value.platform.snapshot().generation),
+        materialization, dependencies=dependencies,
+    )
+    assert started.code is GateResultCode.START_COMMITTED
+    restarted = value.restart()
+    performing = next(
+        item for item in restarted.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    return restarted, performing
+
+
+def test_public_recovery_api_cannot_accept_dependencies_or_independence():
+    value = runtime()
+    signature = inspect.signature(value.boundary.reconcile_operation)
+    assert "dependencies" not in signature.parameters
+    assert "independence" not in signature.parameters
+    with pytest.raises(TypeError):
+        value.boundary.reconcile_operation(
+            TASK, OperationId("operation"),
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+            dependencies=ControlStateAuthoritativeDependencySet(()),
+        )
+    with pytest.raises(TypeError):
+        value.boundary.reconcile_operation(
+            TASK, OperationId("operation"),
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+            independence=value.attest_external_state_independence(),
+        )
+    with pytest.raises(TypeError):
+        value.reconcile_recovered_effect(
+            TASK, OperationId("operation"),
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+            ControlStateAuthoritativeDependencySet(()),
+        )
+
+
+def test_nonempty_frozen_dependencies_cannot_be_replaced_by_empty_or_d2():
+    value = runtime()
+    d1 = install_fixture_dependencies(value, "d1")
+    d2 = install_fixture_dependencies(value, "d2")
+    restarted, performing = recovered_prepared_operation(value, "frozen-d1", d1)
+    with pytest.raises(TypeError):
+        restarted.boundary.reconcile_operation(
+            TASK, performing.intent.operation_id,
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+            dependencies=ControlStateAuthoritativeDependencySet(()),
+            independence=restarted.attest_external_state_independence(),
+        )
+    with pytest.raises(TypeError):
+        restarted.boundary.reconcile_operation(
+            TASK, performing.intent.operation_id,
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+            dependencies=d2,
+        )
+    frozen = d1.dependencies[0]
+    restarted.platform.replace_authoritative_snapshot(AuthoritativeStateSnapshot(
+        frozen.repository_id, frozen.observation_profile_id,
+        frozen.transport_config_id,
+        (NormalizedGitHubObservation(
+            "repository", (REPO.value, "moved", "r"),
+        ),),
+    ))
+    assert restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    ).code is GateResultCode.INDETERMINATE
+
+
+def test_recovery_reuses_exact_frozen_dependencies_and_audits_them():
+    value = runtime()
+    dependencies = install_fixture_dependencies(value, "a", "b")
+    restarted, performing = recovered_prepared_operation(
+        value, "exact-recovery-dependencies", dependencies
+    )
+    durable = restarted.platform.prepared_effect_record(
+        performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    )
+    assert durable.preimage.dependencies == dependencies
+    result = restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert result.code is GateResultCode.EFFECT_FAILED
+    recovery = next(
+        record.event.preimage for record in reversed(restarted.audit.snapshot())
+        if record.event.preimage.gate == "RECOVERY"
+    )
+    assert recovery.authoritative_dependencies == tuple(
+        GateAuditAuthoritativeDependency(
+            item.repository_id, item.observation_profile_id,
+            item.transport_config_id, item.expected_binding_id,
+        )
+        for item in durable.preimage.dependencies.dependencies
+    )
+    assert recovery.runtime_binding_id == restarted.binding.runtime_binding_id
+    assert recovery.canonical_state_occurrence_binding is not None
+    assert recovery.operation_id == performing.intent.operation_id
+    assert recovery.operation_start_binding_id == performing.start_binding_id
+    assert recovery.protected_effect_marker_id is None
+
+
+def test_empty_recovery_dependencies_are_derived_only_from_frozen_start():
+    value = runtime()
+    restarted, performing = recovered_prepared_operation(
+        value, "empty-frozen-recovery"
+    )
+    assert restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    ).code is GateResultCode.EFFECT_FAILED
+    recovery = next(
+        record.event.preimage for record in reversed(restarted.audit.snapshot())
+        if record.event.preimage.gate == "RECOVERY"
+    )
+    assert recovery.authoritative_dependencies == ()
+
+
+def test_missing_or_mismatched_durable_start_fails_recovery_closed():
+    value = runtime()
+    restarted, performing = recovered_prepared_operation(
+        value, "missing-durable-start"
+    )
+    key = (
+        performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    )
+    with restarted.platform._lock:
+        restarted.platform._prepared[key] = (None, "PREPARED")
+    assert restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    ).code is GateResultCode.INDETERMINATE
+
+
+def test_prepared_start_dependency_identity_contradiction_fails_closed():
+    value = runtime()
+    d1 = install_fixture_dependencies(value, "original")
+    d2 = install_fixture_dependencies(value, "altered")
+    restarted, performing = recovered_prepared_operation(
+        value, "dependency-identity-contradiction", d1
+    )
+    durable = restarted.platform.prepared_effect_record(
+        performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    )
+    object.__setattr__(durable.preimage, "dependencies", d2)
+    assert restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    ).code is GateResultCode.INDETERMINATE
+
+
+def test_recovery_fence_blocks_prepared_state_race():
+    value = runtime()
+    restarted, performing = recovered_prepared_operation(
+        value, "recovery-state-race"
+    )
+    completed = threading.Event()
+    conflicts = []
+
+    def race_release():
+        try:
+            restarted.platform.release_prepared_effect(
+                performing.intent.operation_id,
+                ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+            )
+        except FixtureFenceConflict as error:
+            conflicts.append(error)
+        finally:
+            completed.set()
+
+    def hook():
+        thread = threading.Thread(target=race_release)
+        thread.start()
+        assert completed.wait(1)
+        thread.join()
+
+    restarted.set_recovery_fence_hook_for_test(hook)
+    assert restarted.boundary.reconcile_operation(
+        TASK, performing.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    ).code is GateResultCode.EFFECT_FAILED
+    assert len(conflicts) == 1

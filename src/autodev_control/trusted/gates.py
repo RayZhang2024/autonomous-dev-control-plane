@@ -977,19 +977,9 @@ class TrustedControlCommandBoundary:
     def reconcile_operation(
         self, task_id: TaskId, operation_id: OperationId,
         subject: ProtectedEffectSubject,
-        dependencies: ControlStateAuthoritativeDependencySet,
-        independence: ExternalStateIndependence | None = None,
     ) -> GateResult:
-        current = self._controller._backend.read_task_working_set(task_id)
-        if current is None:
-            raise ValueError("task is not canonical")
-        operation = next(
-            (item for item in current.operations if item.intent.operation_id == operation_id), None
-        )
-        if operation is None:
-            raise ValueError("operation is not canonical")
         return self._runtime.reconcile_recovered_effect(
-            operation, subject, dependencies, independence
+            task_id, operation_id, subject
         )
 
     def evaluate_task(
@@ -1016,7 +1006,7 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
@@ -1036,6 +1026,7 @@ class FixtureProtectedGateRuntime:
         self._authorization_contexts: dict[str, tuple] = {}
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
         self._fail_after_start = False
+        self._recovery_fence_hook = None
         self._control = _mint_capability(ControlStateCapability, self._nonce, binding.control_state_principal)
         self._publication = _mint_capability(TargetPublicationCapability, self._nonce, binding.publication_principal)
         self._merge = _mint_capability(MergeCapability, self._nonce, binding.merge_principal)
@@ -1235,6 +1226,10 @@ class FixtureProtectedGateRuntime:
         )
 
     def attest_external_state_independence(self) -> ExternalStateIndependence:
+        """Trusted fixture decision for non-recovery commands with no dependencies."""
+        return self._trusted_external_state_independence()
+
+    def _trusted_external_state_independence(self) -> ExternalStateIndependence:
         value = object.__new__(ExternalStateIndependence)
         value._nonce = self._nonce
         return value
@@ -1987,70 +1982,150 @@ class FixtureProtectedGateRuntime:
         return False
 
     def reconcile_recovered_effect(
-        self, operation: OperationRecord, subject: ProtectedEffectSubject,
-        dependencies: ControlStateAuthoritativeDependencySet,
-        independence: ExternalStateIndependence | None = None,
+        self, task_id: TaskId, operation_id: OperationId,
+        subject: ProtectedEffectSubject,
     ) -> GateResult:
-        """Reconcile recovered PERFORMING state; never reconstruct or retry an effect."""
+        """Reconcile only from canonical operation and exact durable start provenance."""
         if not self._is_active():
             return GateResult(GateResultCode.LEASE_INVALID)
-        if type(operation) is not OperationRecord or operation.state not in (OperationState.PERFORMING, OperationState.INDETERMINATE):
-            raise ValueError("only unresolved started operations can be recovered")
+        if type(task_id) is not TaskId or type(operation_id) is not OperationId:
+            raise TypeError("exact recovery identities required")
         if type(subject) is not ProtectedEffectSubject:
             raise TypeError("subject has wrong exact type")
+        current = self.backend.read_task_working_set(task_id)
+        operation = None if current is None else next((
+            item for item in current.operations
+            if item.intent.operation_id == operation_id
+        ), None)
+        if (type(operation) is not OperationRecord
+                or operation.state not in (
+                    OperationState.PERFORMING, OperationState.INDETERMINATE,
+                )
+                or type(operation.start_binding_id) is not OperationStartBindingId):
+            return GateResult(GateResultCode.INDETERMINATE)
+        durable = self.platform.prepared_effect_record(operation_id, subject.value)
+        if type(durable) is not PreparedProtectedStart:
+            return GateResult(GateResultCode.INDETERMINATE)
+        expected_prepared_id = PreparedProtectedStartId(RawSha256(
+            hashlib.sha256(canonical_json_bytes(durable.preimage)).hexdigest()
+        ))
+        if (durable.prepared_start_id != expected_prepared_id
+                or operation.start_binding_id
+                != operation_start_binding_id(expected_prepared_id)
+                or durable.operation.intent != operation.intent
+                or durable.subject is not subject
+                or durable.preimage.operation_id != operation_id
+                or durable.preimage.action is not subject
+                or durable.preimage.target_fence != durable.fence):
+            return GateResult(GateResultCode.INDETERMINATE)
+        dependencies = durable.preimage.dependencies
         if type(dependencies) is not ControlStateAuthoritativeDependencySet:
-            raise TypeError("exact dependency set required")
-        marker = self.platform.marker(operation.intent.operation_id, subject.value)
-        prepared = self.platform.prepared_effect_state(operation.intent.operation_id, subject.value)
-        if marker is not None and prepared == "CONSUMED":
-            finding_value = (
-                ReconciliationFinding.INTENDED_EFFECT_PROVEN
-                if self._marker_postcondition(marker)
-                else ReconciliationFinding.UNRESOLVED
-            )
-        elif marker is None and prepared == "PREPARED":
-            finding_value = (
-                ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT
-                if self.platform.release_prepared_effect(
-                    operation.intent.operation_id, subject.value
-                ) else ReconciliationFinding.UNRESOLVED
-            )
-        else:
-            finding_value = ReconciliationFinding.UNRESOLVED
-        finding = object.__new__(TrustedReconciliationFinding)
-        object.__setattr__(finding, "finding", finding_value)
-        lease = self.acquire_control_lease(self._control, dependencies, independence)
-        if lease is None:
-            return GateResult(GateResultCode.LEASE_INVALID)
+            return GateResult(GateResultCode.INDETERMINATE)
+        fence = durable.fence
+        recovery_fact_values = {
+            ("prepared", operation_id, subject.value),
+            ("repository", fence.repository_id),
+            ("ref", fence.repository_id, fence.ref),
+        }
+        if subject is not ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
+            recovery_fact_values.add(("prs", fence.repository_id))
+        if fence.base_ref is not None:
+            recovery_fact_values.add(("ref", fence.repository_id, fence.base_ref))
+        recovery_token = self.registry.acquire(self, frozenset(recovery_fact_values))
+        if recovery_token is None or not self._is_active():
+            if recovery_token is not None:
+                self.registry.release(recovery_token)
+            return GateResult(GateResultCode.INDETERMINATE)
+        lease = None
         try:
-            request = self.controller._decide_reconciliation(
-                operation.intent.task_id, operation.intent.operation_id, finding
+            if self._recovery_fence_hook is not None:
+                self._recovery_fence_hook()
+            if (self.platform.prepared_effect_record(operation_id, subject.value)
+                    is not durable):
+                return GateResult(GateResultCode.INDETERMINATE)
+            fenced_prepared_id = PreparedProtectedStartId(RawSha256(
+                hashlib.sha256(canonical_json_bytes(durable.preimage)).hexdigest()
+            ))
+            if (fenced_prepared_id != expected_prepared_id
+                    or durable.prepared_start_id != fenced_prepared_id
+                    or durable.preimage.dependencies is not dependencies):
+                return GateResult(GateResultCode.INDETERMINATE)
+            independence = (
+                self._trusted_external_state_independence()
+                if not dependencies.dependencies else None
             )
-        except (TypeError, ValueError):
-            self.registry.release(lease.fence_token)
-            return GateResult(GateResultCode.REJECTED)
-        committed = self.commit(request, lease)
-        if committed.code is not GateResultCode.COMMITTED:
-            return committed
-        outcome = {
-            ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateAuditOutcome.RECONCILED_SUCCEEDED,
-            ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateAuditOutcome.RECONCILED_FAILED,
-            ReconciliationFinding.UNRESOLVED: GateAuditOutcome.INDETERMINATE,
-        }[finding_value]
-        if not self._audit_ok(self._audit_event(
-            "RECOVERY", subject.value, outcome,
-            service=self.binding.control_state_principal, dependencies=dependencies,
-            operation_id=operation.intent.operation_id,
-            start_id=operation.start_binding_id, marker=marker,
-            intent=operation.intent,
-        )):
-            return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
-        code = {
-            ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateResultCode.EFFECT_SUCCEEDED,
-            ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateResultCode.EFFECT_FAILED,
-            ReconciliationFinding.UNRESOLVED: GateResultCode.INDETERMINATE,
-        }[finding_value]
-        return GateResult(code, committed.canonical_result)
+            lease = self.acquire_control_lease(
+                self._control, dependencies, independence
+            )
+            if lease is None:
+                return GateResult(GateResultCode.INDETERMINATE)
+            marker = self.platform.marker(operation_id, subject.value)
+            prepared_state = self.platform.prepared_effect_state(
+                operation_id, subject.value
+            )
+            marker_coherent = (
+                marker is None or (
+                    marker.preimage.operation_id == operation_id
+                    and marker.preimage.gate_action == subject.value
+                    and marker.preimage.prepared_start_id == expected_prepared_id
+                )
+            )
+            if not marker_coherent:
+                return GateResult(GateResultCode.INDETERMINATE)
+            if marker is not None and prepared_state == "CONSUMED":
+                finding_value = (
+                    ReconciliationFinding.INTENDED_EFFECT_PROVEN
+                    if self._marker_postcondition(marker)
+                    else ReconciliationFinding.UNRESOLVED
+                )
+            elif marker is None and prepared_state in ("PREPARED", "RELEASED"):
+                if prepared_state == "PREPARED" and not self.platform.release_prepared_effect(
+                    operation_id, subject.value, _fence_token=recovery_token
+                ):
+                    return GateResult(GateResultCode.INDETERMINATE)
+                if self.platform.prepared_effect_state(operation_id, subject.value) != "RELEASED":
+                    return GateResult(GateResultCode.INDETERMINATE)
+                finding_value = ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT
+            else:
+                return GateResult(GateResultCode.INDETERMINATE)
+            finding = object.__new__(TrustedReconciliationFinding)
+            object.__setattr__(finding, "finding", finding_value)
+            try:
+                request = self.controller._decide_reconciliation(
+                    operation.intent.task_id, operation.intent.operation_id, finding
+                )
+            except (TypeError, ValueError):
+                self.registry.release(lease.fence_token)
+                return GateResult(GateResultCode.INDETERMINATE)
+            committed = self.commit(request, lease)
+            if committed.code is not GateResultCode.COMMITTED:
+                return GateResult(GateResultCode.INDETERMINATE,
+                                  committed.canonical_result)
+            outcome = {
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateAuditOutcome.RECONCILED_SUCCEEDED,
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateAuditOutcome.RECONCILED_FAILED,
+                ReconciliationFinding.UNRESOLVED: GateAuditOutcome.INDETERMINATE,
+            }[finding_value]
+            if not self._audit_ok(self._audit_event(
+                "RECOVERY", subject.value, outcome,
+                service=self.binding.control_state_principal,
+                dependencies=dependencies,
+                operation_id=operation.intent.operation_id,
+                start_id=operation.start_binding_id, marker=marker,
+                intent=operation.intent,
+            )):
+                return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT,
+                                  committed.canonical_result)
+            code = {
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN: GateResultCode.EFFECT_SUCCEEDED,
+                ReconciliationFinding.INTENDED_EFFECT_PROVEN_ABSENT: GateResultCode.EFFECT_FAILED,
+                ReconciliationFinding.UNRESOLVED: GateResultCode.INDETERMINATE,
+            }[finding_value]
+            return GateResult(code, committed.canonical_result)
+        finally:
+            if lease is not None and lease.fence_token.active:
+                self.registry.release(lease.fence_token)
+            self.registry.release(recovery_token)
 
     def restart(self) -> "FixtureProtectedGateRuntime":
         previous = (
@@ -2075,6 +2150,12 @@ class FixtureProtectedGateRuntime:
     def fail_after_start_commit_for_test(self) -> None:
         """Inject process loss immediately after the canonical start linearization."""
         self._fail_after_start = True
+
+    def set_recovery_fence_hook_for_test(self, hook) -> None:
+        """Run one fixture test hook after the exact recovery fence is live."""
+        if hook is not None and not callable(hook):
+            raise TypeError("recovery fence hook must be callable or None")
+        self._recovery_fence_hook = hook
 
 
 class ControlStateGate:
