@@ -438,6 +438,18 @@ class GateResult:
             raise TypeError("failure code has wrong exact type")
 
 
+class _DeterministicStartDenied(ValueError):
+    """Internal transport for an exact G4 start denial through G7 orchestration."""
+
+    __slots__ = ("failure_code",)
+
+    def __init__(self, failure_code: G4FailureCode) -> None:
+        if type(failure_code) is not G4FailureCode:
+            raise TypeError("start denial requires an exact G4 failure code")
+        super().__init__(failure_code.value)
+        self.failure_code = failure_code
+
+
 class DeterministicTrustedController:
     """Closed command-to-proposal boundary; caller G4 objects are never accepted."""
 
@@ -675,7 +687,7 @@ class DeterministicTrustedController:
         )
         proposal = result.operation_start_proposal
         if proposal is None:
-            raise ValueError(result.failure.code.value)
+            raise _DeterministicStartDenied(result.failure.code)
         conditions = (
             TaskRevisionEquals(task_id, current.task.revision),
             OperationRevisionEquals(operation_id, operation.revision),
@@ -1735,6 +1747,12 @@ class FixtureProtectedGateRuntime:
                     operation.intent.task_id, operation.intent.operation_id,
                     prepared.prepared_start.prepared_start_id,
                 )
+            except _DeterministicStartDenied as error:
+                self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                )
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(GateResultCode.REJECTED, failure_code=error.failure_code)
             except (TypeError, ValueError):
                 self._release_durable_prepared(
                     prepared.prepared_start, prepared.target_fence_token

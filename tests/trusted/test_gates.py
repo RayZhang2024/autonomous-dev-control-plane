@@ -34,7 +34,7 @@ from autodev_control.trusted.identity import (
 )
 from autodev_control.trusted.operation import (
     AdmissionEventId, AuthoritativeStateBindingId, CandidateId,
-    CompletionRuleSetId, NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
+    CompletionRuleSetId, IntegrationBound, NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
     OperationIdempotencyKey, OperationPurpose, OperationState, OperationSubjectId,
     TrustedOperationClassification, construct_trusted_operation_intent,
 )
@@ -285,12 +285,15 @@ def adopt_materialization(value, materialization):
     ).code is GateResultCode.COMMITTED
 
 
-def reserve_protected(value, name, candidate_id):
+def reserve_protected(value, name, candidate_id, *, integration_binding=None):
     command = OperationReservationCommand(
         operation_id=OperationId(name),
         idempotency_key=OperationIdempotencyKey("key-" + name),
         action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
-        required_evidence_ids=(), integration_binding=NotIntegrationBound(),
+        required_evidence_ids=(),
+        integration_binding=(
+            NotIntegrationBound() if integration_binding is None else integration_binding
+        ),
         is_repair_attempt=False,
     )
     request = value.boundary.reserve_operation(TASK, command)
@@ -792,6 +795,77 @@ def test_manual_same_sha_candidate_branch_conflicts_before_start():
     canonical = value.backend.read_task_working_set(TASK)
     stored = next(item for item in canonical.operations if item.intent.operation_id == operation.intent.operation_id)
     assert stored.state is OperationState.CONFLICT
+
+
+def test_authoritative_cancellation_start_denial_preserves_exact_g4_failure():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "cancelled-start", materialization.candidate_id)
+    cancellation = value.boundary.set_cancellation(
+        TASK, CancellationStatus.AUTHORITATIVE, CancellationRequestId("cancel-first")
+    )
+    assert ControlStateGate(value).commit(
+        cancellation, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+
+    result = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            REPO, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), materialization,
+    )
+
+    assert result.code is GateResultCode.REJECTED
+    assert result.failure_code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+
+
+def test_nonready_integration_start_denial_preserves_exact_g4_failure():
+    value = runtime()
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(
+        value, "nonready-integration-start", materialization.candidate_id,
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+    )
+
+    result = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            REPO, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), materialization,
+    )
+
+    assert result.code is GateResultCode.REJECTED
+    assert result.failure_code is G4FailureCode.OPERATION_NOT_STARTABLE
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
 
 
 def test_start_audit_failure_mints_no_continuation_and_reconciles_failed():
