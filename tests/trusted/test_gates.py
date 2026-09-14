@@ -50,7 +50,7 @@ from autodev_control.trusted.scope import (
 )
 from autodev_control.trusted.state import (
     CandidateApplicabilityDetermination, CompletionAggregate, DecisionEventId,
-    RepairBudget, TaskEvaluationInput,
+    RepairBudget, TaskEvaluationInput, TaskState,
 )
 from autodev_control.trusted.state_reader import (
     AuthenticatedGitHubReadTransport, AuthoritativeObservationProfile,
@@ -233,6 +233,28 @@ def independent_lease(value):
     return value.acquire_control_lease(
         value.control_capability, ControlStateAuthoritativeDependencySet(()),
         value.attest_external_state_independence(),
+    )
+
+
+def completion_context(value, context_id="completion-context", *,
+                       contract=ConditionStatus.UNSATISFIED,
+                       additional=ConditionStatus.SATISFIED,
+                       applicability=ConditionStatus.SATISFIED,
+                       required=()):
+    task = value.backend.read_task_working_set(TASK).task
+    return mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId(context_id), task_id=task.task_id,
+        completion_rule_set_id=CompletionRuleSetId("completion"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=contract,
+        additional_trusted_completion_conditions_status=additional,
+        required_protected_operation_ids=required,
+        current_applicability_and_authority_status=applicability,
     )
 
 
@@ -1437,14 +1459,75 @@ def test_public_boundary_rejects_fabricated_trusted_products_and_authority_conte
 def test_task_evaluation_request_composes_trusted_input_inside_controller():
     value = runtime()
     initialize_task(value)
+    context = completion_context(value)
+    value.register_completion_evaluation_context(context)
     command = TaskEvaluationCommand(
-        TASK, CompletionRuleSetId("completion"),
-        (BlockingConditionId("not-ready"),), (), None, (),
+        TASK, context.context_id, (BlockingConditionId("not-ready"),), (), None,
     )
     request = value.boundary.evaluate_task(command)
     assert request.command_kind is TrustedControlCommandKind.EVALUATE_TASK
     assert all(type(item) is not TaskEvaluationInput
                for item in request.transaction.mutations)
+    assert tuple(inspect.signature(TaskEvaluationCommand).parameters) == (
+        "task_id", "completion_context_id", "blocking_condition_ids",
+        "awaiting_input_requirement_ids", "next_integration_operation_id",
+    )
+
+
+def test_evaluation_uses_all_root_managed_completion_facts_not_controller_defaults():
+    positive = runtime()
+    initialize_task(positive)
+    complete = completion_context(
+        positive, "complete-context", contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED, applicability=ConditionStatus.SATISFIED,
+    )
+    positive.register_completion_evaluation_context(complete)
+    assert ControlStateGate(positive).commit(
+        positive.boundary.evaluate_task(TaskEvaluationCommand(
+            TASK, complete.context_id, (), (), None,
+        )), independent_lease(positive),
+    ).code is GateResultCode.COMMITTED
+    assert positive.backend.read_task_working_set(TASK).task.state is TaskState.COMPLETED
+
+    for name, fields, blockers, expected_state in (
+        ("contract", {"contract": ConditionStatus.UNSATISFIED,
+                      "additional": ConditionStatus.SATISFIED,
+                      "applicability": ConditionStatus.SATISFIED}, (), TaskState.ADMITTED),
+        ("additional", {"contract": ConditionStatus.SATISFIED,
+                        "additional": ConditionStatus.UNSATISFIED,
+                        "applicability": ConditionStatus.SATISFIED}, (), TaskState.ADMITTED),
+        ("applicability", {"contract": ConditionStatus.SATISFIED,
+                            "additional": ConditionStatus.SATISFIED,
+                            "applicability": ConditionStatus.UNSATISFIED},
+         (BlockingConditionId("not-applicable"),), TaskState.BLOCKED),
+    ):
+        value = runtime()
+        initialize_task(value)
+        context = completion_context(value, "negative-" + name, **fields)
+        value.register_completion_evaluation_context(context)
+        assert ControlStateGate(value).commit(
+            value.boundary.evaluate_task(TaskEvaluationCommand(
+                TASK, context.context_id, blockers, (), None,
+            )), independent_lease(value),
+        ).code is GateResultCode.COMMITTED
+        assert value.backend.read_task_working_set(TASK).task.state is expected_state
+
+
+def test_evaluation_fails_closed_when_completion_context_is_missing_or_mismatched():
+    value = runtime()
+    initialize_task(value)
+    missing = TaskEvaluationCommand(
+        TASK, ImmutableConfigId("missing-completion-context"), (), (), None,
+    )
+    with pytest.raises(ValueError, match="completion context is unavailable"):
+        value.boundary.evaluate_task(missing)
+    context = completion_context(value, "wrong-task-context")
+    object.__setattr__(context, "task_id", TaskId("different-task"))
+    value.register_completion_evaluation_context(context)
+    with pytest.raises(ValueError, match="completion context does not match canonical task"):
+        value.boundary.evaluate_task(TaskEvaluationCommand(
+            TASK, context.context_id, (), (), None,
+        ))
 
 
 def test_audit_binds_exact_dependency_members_and_runtime_binding():
