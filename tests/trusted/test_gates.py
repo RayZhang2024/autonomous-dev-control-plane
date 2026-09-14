@@ -816,6 +816,159 @@ def test_start_audit_failure_mints_no_continuation_and_reconciles_failed():
     assert stored.state is OperationState.FAILED
 
 
+def test_post_start_audit_failure_reuses_frozen_dependencies_without_effect_replay():
+    value = runtime()
+    dependencies = install_fixture_dependencies(value, "post-start-a", "post-start-b")
+    alternate = install_fixture_dependencies(value, "post-start-alternate")
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "post-start-frozen", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    value.audit.fail_append_after_for_test(2)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization, dependencies=dependencies,
+    )
+    assert started.code is GateResultCode.AUDIT_FAILURE_AFTER_COMMIT
+    assert started.continuation is None
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.FAILED
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+    expected_dependencies = tuple(
+        GateAuditAuthoritativeDependency(
+            item.repository_id, item.observation_profile_id,
+            item.transport_config_id, item.expected_binding_id,
+        )
+        for item in dependencies.dependencies
+    )
+    path_records = [
+        record.event.preimage for record in value.audit.snapshot()
+        if (record.event.preimage.gate == "CONTROL_STATE"
+            and record.event.preimage.action in (
+                "START_OPERATION", "RECONCILE_OPERATION",
+            )
+            and record.event.preimage.operation_id == operation.intent.operation_id)
+    ]
+    assert [record.action for record in path_records] == [
+        "START_OPERATION", "START_OPERATION",
+        "RECONCILE_OPERATION", "RECONCILE_OPERATION",
+    ]
+    for record in path_records:
+        assert record.authoritative_dependencies == expected_dependencies
+        assert record.authoritative_dependencies != ()
+        assert record.authoritative_dependencies != tuple(
+            GateAuditAuthoritativeDependency(
+                item.repository_id, item.observation_profile_id,
+                item.transport_config_id, item.expected_binding_id,
+            )
+            for item in alternate.dependencies
+        )
+        assert record.runtime_binding_id == value.binding.runtime_binding_id
+        assert record.canonical_state_occurrence_binding is not None
+        assert record.operation_id == operation.intent.operation_id
+        assert record.operation_start_binding_id == stored.start_binding_id
+
+
+def test_post_start_audit_failure_stale_frozen_dependencies_fail_closed():
+    value = runtime()
+    dependencies = install_fixture_dependencies(value, "post-start-stale")
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "post-start-stale", materialization.candidate_id)
+    frozen = dependencies.dependencies[0]
+
+    def stale_dependency():
+        value.platform.replace_authoritative_snapshot(AuthoritativeStateSnapshot(
+            frozen.repository_id, frozen.observation_profile_id,
+            frozen.transport_config_id,
+            (NormalizedGitHubObservation(
+                "repository", (REPO.value, "stale", "repository"),
+            ),),
+        ))
+
+    value._post_start_audit_failure_hook = stale_dependency
+    value.audit.fail_append_after_for_test(2)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            REPO, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), materialization, dependencies=dependencies,
+    )
+    assert started.code is GateResultCode.INDETERMINATE
+    assert started.continuation is None
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.PERFORMING
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "PREPARED"
+
+
+def test_post_start_audit_failure_altered_frozen_dependencies_fail_closed():
+    value = runtime()
+    dependencies = install_fixture_dependencies(value, "post-start-original")
+    alternate = install_fixture_dependencies(value, "post-start-altered")
+    initialize_task(value)
+    materialization = materialize(value)
+    adopt_materialization(value, materialization)
+    operation = reserve_protected(value, "post-start-altered", materialization.candidate_id)
+
+    def alter_preimage():
+        durable = value.platform.prepared_effect_record(
+            operation.intent.operation_id,
+            ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+        )
+        object.__setattr__(durable.preimage, "dependencies", alternate)
+
+    value._post_start_audit_failure_hook = alter_preimage
+    value.audit.fail_append_after_for_test(2)
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            REPO, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), materialization, dependencies=dependencies,
+    )
+    assert started.code is GateResultCode.INDETERMINATE
+    assert started.continuation is None
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.PERFORMING
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "PREPARED"
+
+
 def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
     value = runtime()
     initialize_task(value)

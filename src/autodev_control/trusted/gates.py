@@ -1006,7 +1006,7 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
@@ -1027,6 +1027,7 @@ class FixtureProtectedGateRuntime:
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
         self._fail_after_start = False
         self._recovery_fence_hook = None
+        self._post_start_audit_failure_hook = None
         self._control = _mint_capability(ControlStateCapability, self._nonce, binding.control_state_principal)
         self._publication = _mint_capability(TargetPublicationCapability, self._nonce, binding.publication_principal)
         self._merge = _mint_capability(MergeCapability, self._nonce, binding.merge_principal)
@@ -1338,14 +1339,26 @@ class FixtureProtectedGateRuntime:
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             try:
                 request_digest = RawSha256(hashlib.sha256(canonical_json_bytes(request.transaction)).hexdigest())
-                audit_intent = next((
-                    mutation.operation.intent
+                audit_operation = next((
+                    mutation.operation
                     for mutation in request.transaction.mutations
                     if type(mutation) in (ReplaceOperation, CreateOperationAndAdvanceMembership)
                 ), None)
+                audit_intent = (
+                    None if audit_operation is None else audit_operation.intent
+                )
+                audit_operation_id = (
+                    None if audit_operation is None
+                    else audit_operation.intent.operation_id
+                )
+                audit_start_id = (
+                    None if audit_operation is None
+                    else audit_operation.start_binding_id
+                )
                 if not self._audit_ok(self._audit_event(
                     "CONTROL_STATE", request.command_kind.value, GateAuditOutcome.ATTEMPTED,
                     service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                    operation_id=audit_operation_id, start_id=audit_start_id,
                     action_digest=request_digest, intent=audit_intent,
                 )):
                     return GateResult(GateResultCode.AUDIT_FAILURE_BEFORE_COMMIT)
@@ -1355,6 +1368,7 @@ class FixtureProtectedGateRuntime:
                     self._audit_event(
                         "CONTROL_STATE", request.command_kind.value, outcome,
                         service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                        operation_id=audit_operation_id, start_id=audit_start_id,
                         action_digest=request_digest, detail=result.status.value,
                         intent=audit_intent,
                     )
@@ -1362,6 +1376,7 @@ class FixtureProtectedGateRuntime:
                 if not self._audit_ok(self._audit_event(
                     "CONTROL_STATE", request.command_kind.value, GateAuditOutcome.APPLIED,
                     service=self.binding.control_state_principal, dependencies=lease.dependencies,
+                    operation_id=audit_operation_id, start_id=audit_start_id,
                     action_digest=request_digest, intent=audit_intent,
                 )):
                     return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, result)
@@ -1581,6 +1596,117 @@ class FixtureProtectedGateRuntime:
         )
         return released and prepared.state is PreparedProtectedStartState.RELEASED
 
+    def _durable_recovery_provenance(
+        self, task_id: TaskId, operation_id: OperationId,
+        subject: ProtectedEffectSubject,
+    ) -> tuple[
+        OperationRecord, PreparedProtectedStart, PreparedProtectedStartId,
+        ControlStateAuthoritativeDependencySet,
+    ] | None:
+        """Resolve only the exact durable start record that may drive recovery."""
+        current = self.backend.read_task_working_set(task_id)
+        operation = None if current is None else next((
+            item for item in current.operations
+            if item.intent.operation_id == operation_id
+        ), None)
+        if (type(operation) is not OperationRecord
+                or operation.state not in (
+                    OperationState.PERFORMING, OperationState.INDETERMINATE,
+                )
+                or type(operation.start_binding_id) is not OperationStartBindingId):
+            return None
+        durable = self.platform.prepared_effect_record(operation_id, subject.value)
+        if (type(durable) is not PreparedProtectedStart
+                or type(durable.preimage) is not PreparedProtectedStartPreimage):
+            return None
+        expected_prepared_id = PreparedProtectedStartId(RawSha256(
+            hashlib.sha256(canonical_json_bytes(durable.preimage)).hexdigest()
+        ))
+        expected_service = (
+            self._merge.service_identity
+            if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
+            else self._publication.service_identity
+        )
+        dependencies = durable.preimage.dependencies
+        if (
+            durable.prepared_start_id != expected_prepared_id
+            or operation.start_binding_id
+            != operation_start_binding_id(expected_prepared_id)
+            or durable.operation.intent != operation.intent
+            or durable.subject is not subject
+            or durable.preimage.operation_id != operation_id
+            or durable.preimage.action is not subject
+            or durable.preimage.target_fence != durable.fence
+            or durable.preimage.root_context_id != self.binding.root_context_id
+            or durable.preimage.runtime_generation != self.binding.runtime_generation
+            or type(durable.preimage.runtime_binding_id) is not GateRuntimeBindingId
+            or durable.preimage.service_identity != expected_service
+            or type(dependencies) is not ControlStateAuthoritativeDependencySet
+        ):
+            return None
+        return operation, durable, expected_prepared_id, dependencies
+
+    def _recover_post_start_audit_failure(
+        self, prepared: PreparedStartCommitLease,
+        subject: ProtectedEffectSubject,
+    ) -> GateResult:
+        """Fail a started, unperformed operation from its fenced durable preimage."""
+        prepared_start = prepared.prepared_start
+        provenance = self._durable_recovery_provenance(
+            prepared_start.operation.intent.task_id,
+            prepared_start.operation.intent.operation_id, subject,
+        )
+        if (provenance is None or provenance[1] is not prepared_start
+                or not prepared.target_fence_token.active):
+            return GateResult(GateResultCode.INDETERMINATE)
+        operation, durable, expected_prepared_id, dependencies = provenance
+        if self._post_start_audit_failure_hook is not None:
+            self._post_start_audit_failure_hook()
+        independence = (
+            self._trusted_external_state_independence()
+            if not dependencies.dependencies else None
+        )
+        lease = self.acquire_control_lease(
+            self._control, dependencies, independence
+        )
+        if lease is None:
+            return GateResult(GateResultCode.INDETERMINATE)
+        try:
+            fenced = self._durable_recovery_provenance(
+                operation.intent.task_id, operation.intent.operation_id, subject,
+            )
+            if (fenced is None or fenced[0] != operation
+                    or fenced[1] is not durable
+                    or fenced[2] != expected_prepared_id
+                    or fenced[3] is not dependencies):
+                return GateResult(GateResultCode.INDETERMINATE)
+            if (self.platform.marker(operation.intent.operation_id, subject.value)
+                    is not None
+                    or self.platform.prepared_effect_state(
+                        operation.intent.operation_id, subject.value
+                    ) != "PREPARED"):
+                return GateResult(GateResultCode.INDETERMINATE)
+            if not self._release_durable_prepared(
+                durable, prepared.target_fence_token
+            ):
+                return GateResult(GateResultCode.INDETERMINATE)
+            try:
+                request = self.controller._transition_started_failed(
+                    operation.intent.task_id, operation.intent.operation_id
+                )
+            except (TypeError, ValueError):
+                return GateResult(GateResultCode.INDETERMINATE)
+            committed = self.commit(request, lease)
+            lease = None
+            if committed.code is not GateResultCode.COMMITTED:
+                return GateResult(GateResultCode.INDETERMINATE,
+                                  committed.canonical_result)
+            return GateResult(GateResultCode.COMMITTED,
+                              committed.canonical_result)
+        finally:
+            if lease is not None and lease.fence_token.active:
+                self.registry.release(lease.fence_token)
+
     def commit_protected_start(self, prepared: PreparedStartCommitLease,
                                operation: OperationRecord,
                                subject: ProtectedEffectSubject) -> GateResult:
@@ -1671,23 +1797,15 @@ class FixtureProtectedGateRuntime:
                 action_digest=prepared.prepared_start.prepared_start_id.raw_sha256,
                 intent=proposed.intent,
             )):
-                if not self._release_durable_prepared(
-                    prepared.prepared_start, prepared.target_fence_token
-                ):
-                    self.registry.release(prepared.target_fence_token)
-                    return GateResult(GateResultCode.INDETERMINATE,
-                                      committed.canonical_result)
-                self.registry.release(prepared.target_fence_token)
-                recovery_lease = self.acquire_control_lease(
-                    self._control, ControlStateAuthoritativeDependencySet(()),
-                    self.attest_external_state_independence(),
+                recovery = self._recover_post_start_audit_failure(
+                    prepared, subject
                 )
-                if recovery_lease is not None:
-                    recovery = self.controller._transition_started_failed(
-                        proposed.intent.task_id, proposed.intent.operation_id
-                    )
-                    self.commit(recovery, recovery_lease)
-                return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT, committed.canonical_result)
+                self.registry.release(prepared.target_fence_token)
+                if recovery.code is not GateResultCode.COMMITTED:
+                    return GateResult(GateResultCode.INDETERMINATE,
+                                      recovery.canonical_result)
+                return GateResult(GateResultCode.AUDIT_FAILURE_AFTER_COMMIT,
+                                  committed.canonical_result)
             continuation = object.__new__(LiveProtectedEffectContinuation)
             continuation._owner, continuation._nonce, continuation._used = self, self._nonce, False
             continuation.operation_id = proposed.intent.operation_id
@@ -1992,35 +2110,12 @@ class FixtureProtectedGateRuntime:
             raise TypeError("exact recovery identities required")
         if type(subject) is not ProtectedEffectSubject:
             raise TypeError("subject has wrong exact type")
-        current = self.backend.read_task_working_set(task_id)
-        operation = None if current is None else next((
-            item for item in current.operations
-            if item.intent.operation_id == operation_id
-        ), None)
-        if (type(operation) is not OperationRecord
-                or operation.state not in (
-                    OperationState.PERFORMING, OperationState.INDETERMINATE,
-                )
-                or type(operation.start_binding_id) is not OperationStartBindingId):
+        provenance = self._durable_recovery_provenance(
+            task_id, operation_id, subject
+        )
+        if provenance is None:
             return GateResult(GateResultCode.INDETERMINATE)
-        durable = self.platform.prepared_effect_record(operation_id, subject.value)
-        if type(durable) is not PreparedProtectedStart:
-            return GateResult(GateResultCode.INDETERMINATE)
-        expected_prepared_id = PreparedProtectedStartId(RawSha256(
-            hashlib.sha256(canonical_json_bytes(durable.preimage)).hexdigest()
-        ))
-        if (durable.prepared_start_id != expected_prepared_id
-                or operation.start_binding_id
-                != operation_start_binding_id(expected_prepared_id)
-                or durable.operation.intent != operation.intent
-                or durable.subject is not subject
-                or durable.preimage.operation_id != operation_id
-                or durable.preimage.action is not subject
-                or durable.preimage.target_fence != durable.fence):
-            return GateResult(GateResultCode.INDETERMINATE)
-        dependencies = durable.preimage.dependencies
-        if type(dependencies) is not ControlStateAuthoritativeDependencySet:
-            return GateResult(GateResultCode.INDETERMINATE)
+        operation, durable, expected_prepared_id, dependencies = provenance
         fence = durable.fence
         recovery_fact_values = {
             ("prepared", operation_id, subject.value),
@@ -2040,15 +2135,13 @@ class FixtureProtectedGateRuntime:
         try:
             if self._recovery_fence_hook is not None:
                 self._recovery_fence_hook()
-            if (self.platform.prepared_effect_record(operation_id, subject.value)
-                    is not durable):
-                return GateResult(GateResultCode.INDETERMINATE)
-            fenced_prepared_id = PreparedProtectedStartId(RawSha256(
-                hashlib.sha256(canonical_json_bytes(durable.preimage)).hexdigest()
-            ))
-            if (fenced_prepared_id != expected_prepared_id
-                    or durable.prepared_start_id != fenced_prepared_id
-                    or durable.preimage.dependencies is not dependencies):
+            fenced = self._durable_recovery_provenance(
+                task_id, operation_id, subject
+            )
+            if (fenced is None or fenced[0] != operation
+                    or fenced[1] is not durable
+                    or fenced[2] != expected_prepared_id
+                    or fenced[3] is not dependencies):
                 return GateResult(GateResultCode.INDETERMINATE)
             independence = (
                 self._trusted_external_state_independence()
@@ -2156,7 +2249,6 @@ class FixtureProtectedGateRuntime:
         if hook is not None and not callable(hook):
             raise TypeError("recovery fence hook must be callable or None")
         self._recovery_fence_hook = hook
-
 
 class ControlStateGate:
     """Persistence-only facade; it exposes no publication or merge capability."""
