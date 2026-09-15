@@ -17,7 +17,7 @@ from .audit import (
 )
 from .backend import (
     AuthorizationExistsAndMatches, CanonicalNamespace, CanonicalTransaction,
-    CanonicalWriteResult, CanonicalWriteStatus, CreateAuthorization, CreateCandidate,
+    CanonicalWriteResult, CanonicalWriteStatus, CreateAuthorization, CreateCandidateWithMaterialization,
     CreateContract, ExactRecordEquals,
     CreateEvidenceAndAdvanceHistory, CreateOperationAndAdvanceMembership,
     CreateTaskAndInitialOperationMembership, EvidenceHistoryMembershipEquals,
@@ -55,7 +55,10 @@ from .identity import (
     OperationStartBindingId, PreparedProtectedStartId, RawSha256, RootContextId,
 )
 from .materialization import (
-    CandidateMaterialization, create_materialized_candidate_record,
+    AdmittedCandidateMaterialization, CandidateMaterialization,
+    CandidateMaterializationAdmissionStatus, FixtureGitObjectStore,
+    TrustedCandidateMaterializationContext, admit_candidate_materialization,
+    create_admitted_candidate_record,
     inventory_is_authorized,
 )
 from .operation import (
@@ -94,7 +97,7 @@ class TrustedControlCommandKind(Enum):
     ADMIT_CONTRACT = "ADMIT_CONTRACT"
     ADMIT_AUTHORIZATION = "ADMIT_AUTHORIZATION"
     CREATE_TASK = "CREATE_TASK"
-    CREATE_CANDIDATE = "CREATE_CANDIDATE"
+    RECORD_CANDIDATE_TRUTH = "RECORD_CANDIDATE_TRUTH"
     ADOPT_CANDIDATE = "ADOPT_CANDIDATE"
     REVISE_SUPPORTING_EVIDENCE = "REVISE_SUPPORTING_EVIDENCE"
     RESERVE_OPERATION = "RESERVE_OPERATION"
@@ -484,7 +487,7 @@ class _DeterministicStartDenied(ValueError):
 class DeterministicTrustedController:
     """Closed command-to-proposal boundary; caller G4 objects are never accepted."""
 
-    __slots__ = ("_key", "_backend", "_completion_contexts")
+    __slots__ = ("_key", "_backend", "_completion_contexts", "_object_store")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("trusted controller is installed only by the active gate runtime")
@@ -621,39 +624,84 @@ class DeterministicTrustedController:
         object.__setattr__(request, "_key", self._key)
         return request
 
-    def create_candidate_and_adopt(
-        self, *, task_id: TaskId, materialization: CandidateMaterialization,
-        admission_event_id: AdmissionEventId,
-        decision_event_id: DecisionEventId,
+    def create_candidate_and_adopt(self, **_: object) -> ControlStateCommitRequest:
+        raise TypeError("combined candidate creation/adoption is unavailable; record then adopt by CandidateId")
+
+    def record_candidate_truth(
+        self, *, task_id: TaskId, candidate_id: CandidateId,
+        candidate_commit_id: GitSha,
         parent_candidate_ids: tuple[CandidateId, ...] = (),
         creation_operation_id: OperationId | None = None,
     ) -> ControlStateCommitRequest:
         current = self._backend.read_task_working_set(task_id)
-        if current is None:
-            raise ValueError("task is not canonical")
+        if current is None or self._object_store is None:
+            raise ValueError("canonical task or trusted Git-object substrate is unavailable")
         task = current.task
-        candidate = create_materialized_candidate_record(
-            materialization=materialization, task_id=task.task_id,
-            contract_id=task.contract_id,
-            contract_raw_sha256=task.contract_raw_sha256,
-            authorization_id=task.authorization_id,
-            admission_event_id=admission_event_id,
-            target_registration_id=task.target_registration_id,
-            policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
-            parent_candidate_ids=parent_candidate_ids,
-            creation_operation_id=creation_operation_id,
+        contract = self._backend.read_contract(task.contract_id)
+        if contract is None or contract.contract_raw_sha256 != task.contract_raw_sha256:
+            raise ValueError("canonical task contract is unavailable")
+        context = object.__new__(TrustedCandidateMaterializationContext)
+        for name, value in (
+            ("repository_id", contract.context_anchor.repository_id), ("task_id", task.task_id),
+            ("contract_id", task.contract_id), ("contract_raw_sha256", task.contract_raw_sha256),
+            ("authorization_id", task.authorization_id),
+            ("target_registration_id", task.target_registration_id),
+            ("policy_epoch_identity", task.last_evaluated_policy_epoch_identity),
+            ("base_commit", contract.base_sha),
+        ):
+            object.__setattr__(context, name, value)
+        admission = admit_candidate_materialization(
+            store=self._object_store, context=context, candidate_id=candidate_id,
+            candidate_commit_id=candidate_commit_id,
         )
-        determination = _compose_candidate_applicability(
-            task, candidate, decision_event_id
+        if admission.status is not CandidateMaterializationAdmissionStatus.ADMITTED:
+            raise ValueError(admission.reason.value)
+        materialization = admission.admitted_materialization
+        candidate = create_admitted_candidate_record(
+            materialization=materialization, admission_event_id=task.admission_event_id,
+            parent_candidate_ids=parent_candidate_ids, creation_operation_id=creation_operation_id,
         )
+        transaction = CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (TaskRevisionEquals(task.task_id, task.revision),),
+            (CreateCandidateWithMaterialization(candidate, materialization),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.RECORD_CANDIDATE_TRUTH)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "required_authoritative_binding_ids", ())
+        object.__setattr__(request, "_key", self._key)
+        return request
+
+    def adopt_recorded_candidate(
+        self, *, task_id: TaskId, candidate_id: CandidateId,
+        decision_event_id: DecisionEventId,
+    ) -> ControlStateCommitRequest:
+        current = self._backend.read_task_working_set(task_id)
+        candidate = self._backend.read_candidate(candidate_id)
+        if current is None or candidate is None:
+            raise ValueError("canonical task or candidate is unavailable")
+        materialization = self._backend.read_candidate_materialization(candidate.materialization_id)
+        if materialization is None or (
+            candidate.candidate_id != materialization.candidate_id
+            or candidate.task_id != materialization.task_id
+            or candidate.base != materialization.base_commit
+            or candidate.contract_id != materialization.contract_id
+            or candidate.contract_raw_sha256 != materialization.contract_raw_sha256
+            or candidate.authorization_id != materialization.authorization_id
+            or candidate.target_registration_id != materialization.target_registration_id
+            or candidate.policy_epoch_identity != materialization.policy_epoch_identity
+        ):
+            raise ValueError("canonical candidate/materialization continuity is unavailable")
+        task = current.task
+        determination = _compose_candidate_applicability(task, candidate, decision_event_id)
         result = adopt_candidate(
             task, candidate, determination, expected_task_revision=task.revision,
             snapshot=current.task_operation_snapshot(),
             expected_membership_binding_id=current.task_operation_membership.membership_binding_id,
             expected_operation_revisions=tuple(
                 OperationRevisionBinding(item.intent.operation_id, item.revision)
-                for item in current.operations
-                if item.intent.candidate_id == task.current_candidate_id
+                for item in current.operations if item.intent.candidate_id == task.current_candidate_id
             ),
         )
         if result.proposal is None:
@@ -662,16 +710,16 @@ class DeterministicTrustedController:
             current.canonical_state_occurrence_binding,
             (
                 TaskRevisionEquals(task.task_id, task.revision),
-                TaskOperationMembershipEquals(
-                    task.task_id, current.task_operation_membership.membership_binding_id
-                ),
-                RecordAbsent(CanonicalNamespace.CANDIDATE, candidate.candidate_id),
+                TaskOperationMembershipEquals(task.task_id, current.task_operation_membership.membership_binding_id),
+                ExactRecordEquals(CanonicalNamespace.CANDIDATE, candidate.candidate_id, candidate),
+                ExactRecordEquals(CanonicalNamespace.CANDIDATE_MATERIALIZATION, materialization.materialization_id, materialization),
             ),
-            (CreateCandidate(candidate), ReplaceTask(task.revision, result.proposal.proposed)),
+            (ReplaceTask(task.revision, result.proposal.proposed),),
         )
         request = object.__new__(ControlStateCommitRequest)
-        object.__setattr__(request, "command_kind", TrustedControlCommandKind.CREATE_CANDIDATE)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.ADOPT_CANDIDATE)
         object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "required_authoritative_binding_ids", ())
         object.__setattr__(request, "_key", self._key)
         return request
 
@@ -1041,9 +1089,10 @@ class DeterministicTrustedController:
 
 def _new_controller(key: object, backend: InMemoryCanonicalStateBackend,
                     completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext],
+                    object_store: FixtureGitObjectStore | None,
                     ) -> DeterministicTrustedController:
     value = object.__new__(DeterministicTrustedController)
-    value._key, value._backend, value._completion_contexts = key, backend, completion_contexts
+    value._key, value._backend, value._completion_contexts, value._object_store = key, backend, completion_contexts, object_store
     return value
 
 
@@ -1084,8 +1133,14 @@ class TrustedControlCommandBoundary:
     def create_task(self, **kwargs) -> ControlStateCommitRequest:
         return self._controller.create_task(**kwargs)
 
-    def create_candidate_and_adopt(self, **kwargs) -> ControlStateCommitRequest:
-        return self._controller.create_candidate_and_adopt(**kwargs)
+    def create_candidate_and_adopt(self, **_: object) -> ControlStateCommitRequest:
+        raise TypeError("combined candidate creation/adoption is unavailable")
+
+    def record_candidate_truth(self, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.record_candidate_truth(**kwargs)
+
+    def adopt_recorded_candidate(self, **kwargs) -> ControlStateCommitRequest:
+        return self._controller.adopt_recorded_candidate(**kwargs)
 
     def revise_supporting_evidence(self, *args, **kwargs) -> ControlStateCommitRequest:
         return self._controller.revise_supporting_evidence(*args, **kwargs)
@@ -1135,11 +1190,12 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_object_store", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
                  registry: ActiveFixtureRuntimeRegistry | None = None, *,
+                 object_store: FixtureGitObjectStore | None = None,
                  _restart_from: tuple[object, object, object] | None = None) -> None:
         if type(binding) is not GateRuntimeBinding or type(backend) is not InMemoryCanonicalStateBackend:
             raise TypeError("runtime binding/backend has wrong exact type")
@@ -1156,6 +1212,9 @@ class FixtureProtectedGateRuntime:
         self._contract_contexts: dict[str, TrustedIssueContractAdmissionContext] = {}
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
         self._completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext] = {}
+        if object_store is not None and type(object_store) is not FixtureGitObjectStore:
+            raise TypeError("fixture Git-object store has wrong exact type")
+        self._object_store = object_store
         self._fail_after_start = False
         self._recovery_fence_hook = None
         self._post_start_audit_failure_hook = None
@@ -1178,7 +1237,7 @@ class FixtureProtectedGateRuntime:
         if not activated:
             raise RuntimeError("cannot replace active runtime while a gate lease is live")
         self.controller = _new_controller(
-            self._controller_key, self.backend, self._completion_contexts
+            self._controller_key, self.backend, self._completion_contexts, self._object_store
         )
         self.boundary = TrustedControlCommandBoundary(self.controller, self)
 
@@ -1212,7 +1271,7 @@ class FixtureProtectedGateRuntime:
                      action_digest: RawSha256 | None = None,
                      result_identity: str = "", detail: str = "",
                      intent: OperationIntent | None = None,
-                     materialization: CandidateMaterialization | None = None,
+                     materialization: CandidateMaterialization | AdmittedCandidateMaterialization | None = None,
                      occurrence=None) -> AuditAppendStatus:
         exact_dependencies = tuple(
             GateAuditAuthoritativeDependency(
@@ -1632,7 +1691,7 @@ class FixtureProtectedGateRuntime:
         intent = operation.intent
         resolved = self.backend.read_resolved_target_registration(intent.target_registration_id)
         if (
-            type(materialization) is not CandidateMaterialization
+            type(materialization) not in (CandidateMaterialization, AdmittedCandidateMaterialization)
             or type(target) is not AdmittedTargetRegistration
             or resolved is None or resolved.registration != target
             or materialization.repository_id != fence.repository_id
@@ -2022,7 +2081,7 @@ class FixtureProtectedGateRuntime:
                     return GateResult(GateResultCode.INDETERMINATE)
                 if not self._dependencies_fresh_set(continuation.dependencies):
                     return GateResult(GateResultCode.INDETERMINATE)
-                if type(materialization) is not CandidateMaterialization:
+                if type(materialization) not in (CandidateMaterialization, AdmittedCandidateMaterialization):
                     return GateResult(GateResultCode.REJECTED)
                 intent = continuation.intent
                 if (
@@ -2401,6 +2460,7 @@ class FixtureProtectedGateRuntime:
                                self.binding.control_state_principal, self.binding.publication_principal,
                                self.binding.merge_principal),
             self.backend, self.platform, self.audit, self.registry,
+            object_store=self._object_store,
             _restart_from=previous,
         )
         restarted._profiles.update(self._profiles)
@@ -2477,12 +2537,12 @@ def operation_start_binding_id(prepared_start_id: PreparedProtectedStartId) -> O
 
 def publication_context_is_valid(registration: AdmittedTargetRegistration,
                                  capability: TargetPublicationCapability,
-                                 materialization: CandidateMaterialization,
+                                 materialization: CandidateMaterialization | AdmittedCandidateMaterialization,
                                  operation_integration_ref: object = None) -> bool:
     """Validate namespace/principal/ref separation without cross-nominal equality."""
     if (type(registration) is not AdmittedTargetRegistration
             or type(capability) is not TargetPublicationCapability
-            or type(materialization) is not CandidateMaterialization):
+            or type(materialization) not in (CandidateMaterialization, AdmittedCandidateMaterialization)):
         return False
     destination = materialization.candidate_branch
     if (registration.target_publication is None

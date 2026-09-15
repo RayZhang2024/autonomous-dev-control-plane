@@ -6,6 +6,9 @@ from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha25
 from autodev_control.trusted.materialization import (
     GitObjectKind, GitTreeEntry, MutationKind,
     build_candidate_materialization, derive_mutation_inventory,
+    CandidateMaterializationAdmissionReason, CandidateMaterializationAdmissionStatus,
+    FixtureGitCommit, FixtureGitObjectStore, FixtureGitTree, FixtureGitTreeEntry,
+    TrustedCandidateMaterializationContext, admit_candidate_materialization,
 )
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import CandidateId
@@ -37,6 +40,82 @@ def materialization(*, commit=None, parents=None, base_tree=(), candidate_tree=(
         base_tree=base_tree, candidate_tree=candidate_tree,
         materialization_profile_id=ImmutableConfigId("fixture-materialization"),
     )
+
+
+def trusted_context():
+    value = object.__new__(TrustedCandidateMaterializationContext)
+    for name, field in (
+        ("repository_id", GitHubRepositoryId("1")), ("task_id", TaskId("task")),
+        ("contract_id", ContractId("contract")), ("contract_raw_sha256", RawSha256("1" * 64)),
+        ("authorization_id", AuthorizationId(RawSha256("2" * 64))),
+        ("target_registration_id", TargetRegistrationId(RawSha256("3" * 64))),
+        ("policy_epoch_identity", PolicyEpochIdentity(TrustedManifestId(RawSha256("4" * 64)))),
+        ("base_commit", sha("a")),
+    ):
+        object.__setattr__(value, name, field)
+    return value
+
+
+def observed_store(*, candidate_entries=(), parents=None, unavailable=frozenset(), provider_failure=False):
+    base, candidate = sha("a"), sha("b")
+    base_tree, candidate_tree = sha("d"), sha("e")
+    base_entries = (FixtureGitTreeEntry("base.txt", GitObjectKind.BLOB, "100644", sha("1")),)
+    return FixtureGitObjectStore(
+        GitHubRepositoryId("1"),
+        (FixtureGitCommit(base, (), base_tree), FixtureGitCommit(candidate, (base,) if parents is None else parents, candidate_tree)),
+        (FixtureGitTree(base_tree, base_entries), FixtureGitTree(candidate_tree, candidate_entries)),
+        unavailable, provider_failure,
+    )
+
+
+def test_issue30_admission_derives_exhaustive_candidate_inventory_not_caller_claims():
+    store = observed_store(candidate_entries=(
+        FixtureGitTreeEntry("base.txt", GitObjectKind.BLOB, "100644", sha("1")),
+        FixtureGitTreeEntry("hidden.txt", GitObjectKind.BLOB, "100644", sha("2")),
+    ))
+    result = admit_candidate_materialization(
+        store=store, context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert result.status is CandidateMaterializationAdmissionStatus.ADMITTED
+    assert tuple(item.path.value for item in result.admitted_materialization.mutation_inventory.mutations) == ("hidden.txt",)
+    assert result.git_object_observation_binding_id is not None
+    assert not hasattr(result.admitted_materialization, "git_object_observation_binding_id")
+
+
+@pytest.mark.parametrize(("parents", "reason"), [
+    ((), CandidateMaterializationAdmissionReason.INVALID_PARENT_TOPOLOGY),
+    ((sha("a"), sha("c")), CandidateMaterializationAdmissionReason.INVALID_PARENT_TOPOLOGY),
+    ((sha("c"),), CandidateMaterializationAdmissionReason.BASE_PARENT_MISMATCH),
+])
+def test_issue30_parent_topology_is_denied_only_after_complete_observation(parents, reason):
+    result = admit_candidate_materialization(
+        store=observed_store(parents=parents), context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert (result.status, result.reason) == (CandidateMaterializationAdmissionStatus.DENIED, reason)
+    assert result.git_object_observation_binding_id is not None
+
+
+def test_issue30_missing_object_is_indeterminate_without_fabricated_observation_binding():
+    result = admit_candidate_materialization(
+        store=observed_store(unavailable=frozenset((sha("a"),))), context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert result.status is CandidateMaterializationAdmissionStatus.INDETERMINATE
+    assert result.git_object_observation_binding_id is None
+
+
+def test_issue30_observation_provenance_does_not_change_admitted_materialization():
+    one = admit_candidate_materialization(
+        store=observed_store(), context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    alternate = FixtureGitObjectStore(
+        observed_store().repository_id, observed_store().commits, observed_store().trees,
+        observation_instance_id=RawSha256("9" * 64),
+    )
+    two = admit_candidate_materialization(
+        store=alternate, context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert one.git_object_observation_binding_id != two.git_object_observation_binding_id
+    assert one.admitted_materialization == two.admitted_materialization
 
 
 def test_empty_tree_delta_is_deterministic():

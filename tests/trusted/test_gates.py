@@ -40,6 +40,7 @@ from autodev_control.trusted.operation import (
 )
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.materialization import (
+    FixtureGitCommit, FixtureGitObjectStore, FixtureGitTree, FixtureGitTreeEntry,
     GitObjectKind, GitTreeEntry, build_candidate_materialization,
 )
 from autodev_control.trusted.scope import (
@@ -130,7 +131,7 @@ def authorization():
     )
 
 
-def runtime(target=None):
+def runtime(target=None, object_store=None):
     target = target or registration()
     binding = GateRuntimeBinding(
         RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
@@ -144,6 +145,7 @@ def runtime(target=None):
     return FixtureProtectedGateRuntime(
         binding, InMemoryCanonicalStateBackend((resolved,)),
         FixtureGitPlatform(), FixtureGateAudit(),
+        object_store=object_store or candidate_truth_store(),
     )
 
 
@@ -280,6 +282,53 @@ def initialize_task(value):
     assert result.code is GateResultCode.COMMITTED
 
 
+def candidate_truth_store():
+    candidate = GitSha("b" * 40)
+    base_tree_entries = ()
+    candidate_tree_entries = (GitTreeEntry(
+        CanonicalGitPath("src/new.py"), GitObjectKind.BLOB, "100644",
+        GitSha("c" * 40),
+    ),)
+    base_tree = FixtureGitPlatform.tree_identity(base_tree_entries)
+    candidate_tree = FixtureGitPlatform.tree_identity(candidate_tree_entries)
+    source_tree = GitSha("f" * 40)
+    return FixtureGitObjectStore(
+        REPO,
+        (FixtureGitCommit(SHA, (), base_tree), FixtureGitCommit(candidate, (SHA,), candidate_tree)),
+        (
+            FixtureGitTree(base_tree, ()),
+            FixtureGitTree(candidate_tree, (FixtureGitTreeEntry(
+                "src", GitObjectKind.TREE, "040000", source_tree,
+            ),)),
+            FixtureGitTree(source_tree, (FixtureGitTreeEntry(
+                "new.py", GitObjectKind.BLOB, "100644", GitSha("c" * 40),
+            ),)),
+        ),
+    )
+
+
+def test_issue30_recording_is_nonprogressing_and_adoption_resolves_canonical_pair():
+    value = runtime(object_store=candidate_truth_store())
+    initialize_task(value)
+    before = value.backend.read_task_working_set(TASK).task
+    record = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=CandidateId("candidate"), candidate_commit_id=GitSha("b" * 40),
+    )
+    assert record.command_kind is TrustedControlCommandKind.RECORD_CANDIDATE_TRUTH
+    assert ControlStateGate(value).commit(record, independent_lease(value)).code is GateResultCode.COMMITTED
+    after_record = value.backend.read_task_working_set(TASK).task
+    assert after_record == before
+    candidate = value.backend.read_candidate(CandidateId("candidate"))
+    assert candidate is not None
+    assert value.backend.read_candidate_materialization(candidate.materialization_id) is not None
+    adopt = value.boundary.adopt_recorded_candidate(
+        task_id=TASK, candidate_id=candidate.candidate_id,
+        decision_event_id=DecisionEventId("candidate-applicability"),
+    )
+    assert ControlStateGate(value).commit(adopt, independent_lease(value)).code is GateResultCode.COMMITTED
+    assert value.backend.read_task_working_set(TASK).task.current_candidate_id == candidate.candidate_id
+
+
 def test_admit_contract_uses_controller_gate_cas_and_exact_authoritative_dependencies():
     value = runtime()
     dependencies = install_fixture_dependencies(value, "contract-base", "contract-issue")
@@ -326,16 +375,39 @@ def materialize(value):
     )
 
 
-def adopt_materialization(value, materialization):
-    current = value.backend.read_task_working_set(TASK)
-    request = value.boundary.create_candidate_and_adopt(
-        task_id=TASK, materialization=materialization,
-        admission_event_id=ADMISSION,
+def record_materialization_truth(value, materialization):
+    """Record the pair through the public non-progressing truth boundary."""
+    before = value.backend.read_task_working_set(TASK).task
+    request = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=materialization.candidate_id,
+        candidate_commit_id=materialization.commit,
+    )
+    assert ControlStateGate(value).commit(
+        request, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+    after = value.backend.read_task_working_set(TASK).task
+    assert after == before
+    assert after.revision == before.revision
+    assert after.current_candidate_id is None
+    assert after.state is not TaskState.EVALUATING
+    candidate = value.backend.read_candidate(materialization.candidate_id)
+    assert candidate is not None
+    admitted = value.backend.read_candidate_materialization(candidate.materialization_id)
+    assert admitted is not None
+    return admitted
+
+
+def adopt_recorded_candidate(value, materialization):
+    """Adopt a previously recorded candidate only by its canonical identity."""
+    admitted = record_materialization_truth(value, materialization)
+    request = value.boundary.adopt_recorded_candidate(
+        task_id=TASK, candidate_id=admitted.candidate_id,
         decision_event_id=DecisionEventId("candidate-applicability"),
     )
     assert ControlStateGate(value).commit(
         request, independent_lease(value)
     ).code is GateResultCode.COMMITTED
+    return admitted
 
 
 def reserve_protected(value, name, candidate_id, *, integration_binding=None):
@@ -716,7 +788,7 @@ def test_prepared_start_to_publication_and_one_use_continuation():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -740,7 +812,7 @@ def test_target_mutation_cannot_linearize_across_prepared_start_and_effect():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish-fenced", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -783,7 +855,7 @@ def test_same_operation_exact_marker_and_postcondition_is_already_applied():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish-replay", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -831,7 +903,7 @@ def test_manual_same_sha_candidate_branch_conflicts_before_start():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish", materialization.candidate_id)
     value.platform.create_ref_if_absent(
         REPO, materialization.candidate_branch, materialization.commit
@@ -854,7 +926,7 @@ def test_authoritative_cancellation_start_denial_preserves_exact_g4_failure():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "cancelled-start", materialization.candidate_id)
     cancellation = value.boundary.set_cancellation(
         TASK, CancellationStatus.AUTHORITATIVE, CancellationRequestId("cancel-first")
@@ -893,7 +965,7 @@ def test_nonready_integration_start_denial_preserves_exact_g4_failure():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(
         value, "nonready-integration-start", materialization.candidate_id,
         integration_binding=IntegrationBound(GitRef(REF.value)),
@@ -925,7 +997,7 @@ def test_start_audit_failure_mints_no_continuation_and_reconciles_failed():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -949,7 +1021,7 @@ def test_post_start_audit_failure_reuses_frozen_dependencies_without_effect_repl
     alternate = install_fixture_dependencies(value, "post-start-alternate")
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "post-start-frozen", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -1015,7 +1087,7 @@ def test_post_start_audit_failure_stale_frozen_dependencies_fail_closed():
     dependencies = install_fixture_dependencies(value, "post-start-stale")
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "post-start-stale", materialization.candidate_id)
     frozen = dependencies.dependencies[0]
 
@@ -1060,7 +1132,7 @@ def test_post_start_audit_failure_altered_frozen_dependencies_fail_closed():
     alternate = install_fixture_dependencies(value, "post-start-altered")
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "post-start-altered", materialization.candidate_id)
 
     def alter_preimage():
@@ -1100,7 +1172,7 @@ def test_exact_publication_marker_to_pr_marker_to_fast_forward_merge():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
 
     publish = reserve_protected(value, "publish-chain", materialization.candidate_id)
     publish_fence = ActionTargetFence(
@@ -1169,7 +1241,7 @@ def test_pr_marker_for_different_base_ref_same_sha_cannot_authorize_merge():
     initialize_task(value)
     materialization = materialize(value)
     value.platform.seed_ref(REPO, alternate, materialization.base)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
 
     publish = reserve_protected(value, "publish-wrong-base", materialization.candidate_id)
     publish_start = start_protected(value, publish,
@@ -1207,7 +1279,7 @@ def test_manual_equivalent_pr_cannot_substitute_for_exact_pr_marker():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     publish = reserve_protected(value, "publish-manual-pr", materialization.candidate_id)
     publish_start = start_protected(value, publish,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1233,7 +1305,7 @@ def test_target_effect_audit_failure_preserves_marker_and_restart_reconciles_wit
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish-audit", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -1278,7 +1350,7 @@ def test_post_start_target_conflict_proves_absence_releases_and_reconciles_faile
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "publish-conflict", materialization.candidate_id)
     started = start_protected(value, operation,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1303,7 +1375,7 @@ def test_recovered_performing_with_prepared_and_no_marker_releases_and_fails():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "prepared-recovery", materialization.candidate_id)
     fence = ActionTargetFence(
         REPO, materialization.candidate_branch, None,
@@ -1337,7 +1409,7 @@ def test_contradictory_consumed_marker_postcondition_reconciles_indeterminate():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "contradictory", materialization.candidate_id)
     started = start_protected(value, operation,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1367,7 +1439,7 @@ def test_durable_prepared_record_exists_before_canonical_start():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "prepared-first", materialization.candidate_id)
     prepared = value.prepare_protected_start(
         operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1396,7 +1468,7 @@ def test_failed_g6_start_releases_and_verifies_exact_prepared_record():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "start-cas-failure", materialization.candidate_id)
     prepared = value.prepare_protected_start(
         operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1419,7 +1491,7 @@ def test_process_loss_after_performing_recovers_prepared_to_failed_without_effec
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "crash-after-start", materialization.candidate_id)
     prepared = value.prepare_protected_start(
         operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1482,7 +1554,7 @@ def test_public_boundary_rejects_fabricated_trusted_products_and_authority_conte
     with pytest.raises(TypeError):
         value.boundary.admit_semantic_evidence(fake_evidence_request)
     assert tuple(inspect.signature(value.boundary.admit_authorization).parameters) == ("proposal",)
-    candidate_source = inspect.getsource(DeterministicTrustedController.create_candidate_and_adopt)
+    candidate_source = inspect.getsource(DeterministicTrustedController.adopt_recorded_candidate)
     assert "_compose_candidate_applicability" in candidate_source
     assert "object.__new__(CandidateApplicabilityDetermination)" not in candidate_source
 
@@ -1665,7 +1737,7 @@ def test_effect_action_package_is_frozen_before_performing():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, "frozen-effect", materialization.candidate_id)
     started = start_protected(
         value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
@@ -1685,7 +1757,7 @@ def test_effect_action_package_is_frozen_before_performing():
 def recovered_prepared_operation(value, name, dependencies=None):
     initialize_task(value)
     materialization = materialize(value)
-    adopt_materialization(value, materialization)
+    materialization = adopt_recorded_candidate(value, materialization)
     operation = reserve_protected(value, name, materialization.candidate_id)
     started = start_protected(
         value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,

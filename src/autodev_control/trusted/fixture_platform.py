@@ -11,7 +11,7 @@ from .identity import (
     CandidateMaterializationId, GitRef, GitSha, MutationInventoryId,
     PreparedProtectedStartId, ProtectedEffectMarkerId, RawSha256, RootContextId,
 )
-from .materialization import CandidateMaterialization, GitTreeEntry, derive_mutation_inventory
+from .materialization import AdmittedCandidateMaterialization, CandidateMaterialization, GitTreeEntry, derive_mutation_inventory
 from .operation import (
     AuthoritativeStateBindingId, OperationActionId, OperationId,
     OperationIdempotencyKey,
@@ -439,8 +439,8 @@ class FixtureGitPlatform:
             self._commits[sha] = value
             self._generation += 1
 
-    def verify_materialization(self, materialization: CandidateMaterialization) -> bool:
-        if type(materialization) is not CandidateMaterialization:
+    def verify_materialization(self, materialization: CandidateMaterialization | AdmittedCandidateMaterialization) -> bool:
+        if type(materialization) not in (CandidateMaterialization, AdmittedCandidateMaterialization):
             return False
         with self._lock:
             base = self._commits.get(materialization.base)

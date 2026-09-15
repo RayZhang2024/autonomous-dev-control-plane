@@ -19,8 +19,9 @@ from typing import TypeAlias, Union, get_args, get_origin, get_type_hints
 from .authorization import AdmittedAuthorization
 from .contract import AdmittedIssueContract, validate_admitted_issue_contract_record
 from .evidence import EvidenceRecord, EvidenceSubject, EvidenceSupersessionRecord, SemanticEvidencePayload
-from .identity import GitSha, ImmutableConfigId, RawSha256
+from .identity import CandidateMaterializationId, GitSha, ImmutableConfigId, RawSha256
 from .manifest import PolicyEpochIdentity
+from .materialization import AdmittedCandidateMaterialization, admitted_candidate_materialization_is_valid
 from .operation import CandidateId, EvidenceId, IntegrationBound, OperationId, OperationMembershipBindingId, OperationRecord, OperationState
 from .review import (
     AdmittedSemanticEvidenceBinding,
@@ -204,6 +205,7 @@ class CanonicalNamespace(Enum):
     AUTHORIZATION = "authorizations"
     TASK = "tasks"
     CANDIDATE = "candidates"
+    CANDIDATE_MATERIALIZATION = "candidate_materializations"
     OPERATION = "operations"
     TASK_OPERATION_MEMBERSHIP = "task_operation_memberships"
     REVIEW_ATTEMPT_BINDING = "review_attempt_bindings"
@@ -334,6 +336,14 @@ class ReplaceTask(_ClosedBackendInput):
 
 
 @dataclass(frozen=True, slots=True)
+class CreateCandidateWithMaterialization(_ClosedBackendInput):
+    candidate: CandidateRecord
+    materialization: AdmittedCandidateMaterialization
+
+
+# Retained only as a nominal rejected input so attempts to use the former
+# standalone mutation fail closed rather than becoming an import-time alias.
+@dataclass(frozen=True, slots=True)
 class CreateCandidate(_ClosedBackendInput):
     candidate: CandidateRecord
 
@@ -388,7 +398,7 @@ class CreateSupersession(_ClosedBackendInput):
 
 CanonicalMutation: TypeAlias = (
     CreateContract | CreateAuthorization | CreateTaskAndInitialOperationMembership | ReplaceTask
-    | CreateCandidate | CreateOperationAndAdvanceMembership
+    | CreateCandidateWithMaterialization | CreateOperationAndAdvanceMembership
     | CreateSemanticReviewOperationAndBinding | ReplaceOperation
     | ReplaceTaskOperationMembership | CreateEvidenceHistory
     | CreateEvidenceAndAdvanceHistory | CreateSupersession
@@ -413,7 +423,7 @@ _CONDITION_TYPES = (
 )
 _MUTATION_TYPES = (
     CreateContract, CreateAuthorization, CreateTaskAndInitialOperationMembership, ReplaceTask,
-    CreateCandidate, CreateOperationAndAdvanceMembership,
+    CreateCandidateWithMaterialization, CreateOperationAndAdvanceMembership,
     CreateSemanticReviewOperationAndBinding, ReplaceOperation,
     ReplaceTaskOperationMembership, CreateEvidenceHistory,
     CreateEvidenceAndAdvanceHistory, CreateSupersession,
@@ -425,6 +435,7 @@ _NAMESPACE_TYPES = {
     CanonicalNamespace.AUTHORIZATION: (AuthorizationId, AdmittedAuthorization),
     CanonicalNamespace.TASK: (TaskId, TaskRecord),
     CanonicalNamespace.CANDIDATE: (CandidateId, CandidateRecord),
+    CanonicalNamespace.CANDIDATE_MATERIALIZATION: (CandidateMaterializationId, AdmittedCandidateMaterialization),
     CanonicalNamespace.OPERATION: (OperationId, OperationRecord),
     CanonicalNamespace.TASK_OPERATION_MEMBERSHIP: (TaskId, TaskOperationMembershipRecord),
     CanonicalNamespace.REVIEW_ATTEMPT_BINDING: (OperationId, ReviewAttemptBindingRecord),
@@ -449,6 +460,8 @@ def _record_identity(namespace: CanonicalNamespace, record: object) -> object:
         return record.task_id
     if namespace is CanonicalNamespace.CANDIDATE:
         return record.candidate_id
+    if namespace is CanonicalNamespace.CANDIDATE_MATERIALIZATION:
+        return record.materialization_id
     if namespace is CanonicalNamespace.OPERATION:
         return record.intent.operation_id
     if namespace is CanonicalNamespace.REVIEW_ATTEMPT_BINDING:
@@ -507,6 +520,7 @@ class _State:
     authorizations: dict
     tasks: dict
     candidates: dict
+    candidate_materializations: dict
     operations: dict
     memberships: dict
     attempts: dict
@@ -516,14 +530,14 @@ class _State:
 
     def clone(self) -> _State:
         return _State(*(dict(getattr(self, name)) for name in (
-            "contracts", "authorizations", "tasks", "candidates", "operations", "memberships",
+            "contracts", "authorizations", "tasks", "candidates", "candidate_materializations", "operations", "memberships",
             "attempts", "evidence", "histories", "supersessions",
         )))
 
 
 def _freeze_state(state: _State) -> _State:
     return _State(*(MappingProxyType(dict(getattr(state, name))) for name in (
-        "contracts", "authorizations", "tasks", "candidates", "operations", "memberships",
+        "contracts", "authorizations", "tasks", "candidates", "candidate_materializations", "operations", "memberships",
         "attempts", "evidence", "histories", "supersessions",
     )))
 
@@ -544,7 +558,7 @@ def _mutation_priority(mutation: CanonicalMutation) -> int:
         CreateContract: 0,
         CreateAuthorization: 1,
         CreateTaskAndInitialOperationMembership: 2,
-        CreateCandidate: 3,
+        CreateCandidateWithMaterialization: 3,
         CreateEvidenceHistory: 4,
         CreateOperationAndAdvanceMembership: 5,
         CreateSemanticReviewOperationAndBinding: 5,
@@ -562,6 +576,7 @@ def _namespace_map(state: _State, namespace: CanonicalNamespace) -> dict:
         CanonicalNamespace.AUTHORIZATION: state.authorizations,
         CanonicalNamespace.TASK: state.tasks,
         CanonicalNamespace.CANDIDATE: state.candidates,
+        CanonicalNamespace.CANDIDATE_MATERIALIZATION: state.candidate_materializations,
         CanonicalNamespace.OPERATION: state.operations,
         CanonicalNamespace.TASK_OPERATION_MEMBERSHIP: state.memberships,
         CanonicalNamespace.REVIEW_ATTEMPT_BINDING: state.attempts,
@@ -585,7 +600,7 @@ class InMemoryCanonicalStateBackend:
             raise TypeError("resolved_targets must be an exact trusted tuple")
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_generation", 1)
-        object.__setattr__(self, "_state", _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {}, {})))
+        object.__setattr__(self, "_state", _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})))
         object.__setattr__(self, "_resolved_targets", MappingProxyType({item.target_registration_id: item for item in resolved_targets}))
         if len(self._resolved_targets) != len(resolved_targets) or any(
             item.registration.target_registration_id != item.target_registration_id
@@ -768,12 +783,19 @@ class InMemoryCanonicalStateBackend:
                 return CanonicalWriteStatus.INVALID_TRANSACTION, False
             state.tasks[task.task_id] = task
             return None, True
-        if type(mutation) is CreateCandidate:
+        if type(mutation) is CreateCandidateWithMaterialization:
             candidate = mutation.candidate
+            materialization = mutation.materialization
+            if not admitted_candidate_materialization_is_valid(materialization) or not _candidate_materialization_matches(candidate, materialization):
+                return CanonicalWriteStatus.INVALID_TRANSACTION, False
             current = state.candidates.get(candidate.candidate_id)
-            if current is not None:
-                return (None, False) if current == candidate else (CanonicalWriteStatus.IDENTITY_CONFLICT, False)
+            current_materialization = state.candidate_materializations.get(materialization.materialization_id)
+            if current is not None or current_materialization is not None:
+                return (None, False) if current == candidate and current_materialization == materialization else (CanonicalWriteStatus.IDENTITY_CONFLICT, False)
+            if any(value.candidate_id == candidate.candidate_id for value in state.candidate_materializations.values()):
+                return CanonicalWriteStatus.IDENTITY_CONFLICT, False
             state.candidates[candidate.candidate_id] = candidate
+            state.candidate_materializations[materialization.materialization_id] = materialization
             return None, True
         if type(mutation) in (CreateOperationAndAdvanceMembership, CreateSemanticReviewOperationAndBinding):
             operation = mutation.operation
@@ -909,7 +931,7 @@ class InMemoryCanonicalStateBackend:
                 return False
             if task.current_candidate_id is not None:
                 candidate = state.candidates.get(task.current_candidate_id)
-                if candidate is None or not _candidate_matches_task(candidate, task):
+                if candidate is None or not _candidate_matches_task(candidate, task) or not _candidate_has_matching_materialization(state, candidate):
                     return False
             if task.next_integration_operation_id is not None:
                 operation = state.operations.get(task.next_integration_operation_id)
@@ -935,7 +957,7 @@ class InMemoryCanonicalStateBackend:
             return False
         for candidate in state.candidates.values():
             task = state.tasks.get(candidate.task_id)
-            if task is None or not _candidate_matches_task(candidate, task):
+            if task is None or not _candidate_matches_task(candidate, task) or not _candidate_has_matching_materialization(state, candidate):
                 return False
             if any(
                 parent_id not in state.candidates
@@ -948,6 +970,15 @@ class InMemoryCanonicalStateBackend:
                 if operation is None or operation.intent.task_id != candidate.task_id:
                     return False
         if _candidate_cycle(state.candidates):
+            return False
+        if len(state.candidates) != len(state.candidate_materializations):
+            return False
+        if any(
+            materialization.candidate_id not in state.candidates
+            or not admitted_candidate_materialization_is_valid(materialization)
+            or not _candidate_materialization_matches(state.candidates[materialization.candidate_id], materialization)
+            for materialization in state.candidate_materializations.values()
+        ):
             return False
         for operation in state.operations.values():
             task = state.tasks.get(operation.intent.task_id)
@@ -1058,6 +1089,20 @@ class InMemoryCanonicalStateBackend:
         with self._lock:
             return self._state.contracts.get(contract_id)
 
+    def read_candidate(self, candidate_id: CandidateId) -> CandidateRecord | None:
+        if type(candidate_id) is not CandidateId:
+            raise TypeError("exact CandidateId required")
+        with self._lock:
+            return self._state.candidates.get(candidate_id)
+
+    def read_candidate_materialization(
+        self, materialization_id: CandidateMaterializationId,
+    ) -> AdmittedCandidateMaterialization | None:
+        if type(materialization_id) is not CandidateMaterializationId:
+            raise TypeError("exact CandidateMaterializationId required")
+        with self._lock:
+            return self._state.candidate_materializations.get(materialization_id)
+
     def read_resolved_target_registration(
         self, target_registration_id: TargetRegistrationId,
     ) -> ResolvedTargetRegistration | None:
@@ -1105,6 +1150,27 @@ def _candidate_matches_task(candidate: CandidateRecord, task: TaskRecord) -> boo
         and candidate.admission_event_id == task.admission_event_id
         and candidate.target_registration_id == task.target_registration_id
     )
+
+
+def _candidate_materialization_matches(
+    candidate: CandidateRecord, materialization: AdmittedCandidateMaterialization,
+) -> bool:
+    return (
+        candidate.candidate_id == materialization.candidate_id
+        and candidate.materialization_id == materialization.materialization_id
+        and candidate.task_id == materialization.task_id
+        and candidate.base == materialization.base_commit
+        and candidate.contract_id == materialization.contract_id
+        and candidate.contract_raw_sha256 == materialization.contract_raw_sha256
+        and candidate.authorization_id == materialization.authorization_id
+        and candidate.target_registration_id == materialization.target_registration_id
+        and candidate.policy_epoch_identity == materialization.policy_epoch_identity
+    )
+
+
+def _candidate_has_matching_materialization(state: _State, candidate: CandidateRecord) -> bool:
+    materialization = state.candidate_materializations.get(candidate.materialization_id)
+    return materialization is not None and _candidate_materialization_matches(candidate, materialization)
 
 
 def _intent_matches_task(operation: OperationRecord, task: TaskRecord) -> bool:
@@ -1180,6 +1246,7 @@ class CanonicalRecordKind(Enum):
     AUTHORIZATION = "authorization"
     TASK = "task"
     CANDIDATE = "candidate"
+    CANDIDATE_MATERIALIZATION = "candidate_materialization"
     OPERATION = "operation"
     TASK_OPERATION_MEMBERSHIP = "task_operation_membership"
     REVIEW_ATTEMPT_BINDING = "review_attempt_binding"
@@ -1199,6 +1266,7 @@ CANONICAL_ROOT_KIND_ORDER = (
     CanonicalRecordKind.EVIDENCE,
     CanonicalRecordKind.EVIDENCE_HISTORY,
     CanonicalRecordKind.SUPERSESSION,
+    CanonicalRecordKind.CANDIDATE_MATERIALIZATION,
 )
 
 
@@ -1247,6 +1315,7 @@ _CANONICAL_RECORD_TYPES = {
     CanonicalRecordKind.AUTHORIZATION: AdmittedAuthorization,
     CanonicalRecordKind.TASK: TaskRecord,
     CanonicalRecordKind.CANDIDATE: CandidateRecord,
+    CanonicalRecordKind.CANDIDATE_MATERIALIZATION: AdmittedCandidateMaterialization,
     CanonicalRecordKind.OPERATION: OperationRecord,
     CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP: TaskOperationMembershipRecord,
     CanonicalRecordKind.REVIEW_ATTEMPT_BINDING: ReviewAttemptBindingRecord,
@@ -1342,6 +1411,8 @@ def _identity_parts(record_kind: CanonicalRecordKind, record: object) -> tuple[s
         return (record.task_id.value,)
     if record_kind is CanonicalRecordKind.CANDIDATE:
         return (record.candidate_id.value,)
+    if record_kind is CanonicalRecordKind.CANDIDATE_MATERIALIZATION:
+        return (record.materialization_id.raw_sha256.value,)
     if record_kind is CanonicalRecordKind.OPERATION:
         return (record.intent.operation_id.value,)
     if record_kind is CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP:
@@ -1428,6 +1499,7 @@ class CanonicalStateRootManifest:
     evidence_index: tuple[CanonicalIndexEntry, ...]
     evidence_history_index: tuple[CanonicalIndexEntry, ...]
     supersession_index: tuple[CanonicalIndexEntry, ...]
+    candidate_materialization_index: tuple[CanonicalIndexEntry, ...] = ()
 
     def __post_init__(self) -> None:
         if self.format_version != "2":
@@ -1445,6 +1517,7 @@ class CanonicalStateRootManifest:
             (self.evidence_index, CanonicalRecordKind.EVIDENCE, "evidence_index"),
             (self.evidence_history_index, CanonicalRecordKind.EVIDENCE_HISTORY, "evidence_history_index"),
             (self.supersession_index, CanonicalRecordKind.SUPERSESSION, "supersession_index"),
+            (self.candidate_materialization_index, CanonicalRecordKind.CANDIDATE_MATERIALIZATION, "candidate_materialization_index"),
         ):
             _index(values, kind, name)
 
@@ -1454,6 +1527,7 @@ class CanonicalStateRootManifest:
             "contract_index", "authorization_index", "task_index", "candidate_index", "operation_index",
             "task_operation_membership_index", "review_attempt_binding_index",
             "evidence_index", "evidence_history_index", "supersession_index",
+            "candidate_materialization_index",
         ))
 
 
@@ -1482,6 +1556,7 @@ def validate_canonical_root(
             {record.authorization_id: record for record in decoded[CanonicalRecordKind.AUTHORIZATION]},
             {record.task_id: record for record in decoded[CanonicalRecordKind.TASK]},
             {record.candidate_id: record for record in decoded[CanonicalRecordKind.CANDIDATE]},
+            {record.materialization_id: record for record in decoded[CanonicalRecordKind.CANDIDATE_MATERIALIZATION]},
             {record.intent.operation_id: record for record in decoded[CanonicalRecordKind.OPERATION]},
             {record.task_id: record for record in decoded[CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP]},
             {record.operation_id: record for record in decoded[CanonicalRecordKind.REVIEW_ATTEMPT_BINDING]},
@@ -1493,7 +1568,7 @@ def validate_canonical_root(
             (
                 state.contracts, state.authorizations, state.tasks, state.candidates, state.operations,
                 state.memberships, state.attempts, state.evidence, state.histories,
-                state.supersessions,
+                state.supersessions, state.candidate_materializations,
             ),
             CANONICAL_ROOT_KIND_ORDER,
         )):
