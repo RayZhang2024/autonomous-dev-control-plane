@@ -36,17 +36,22 @@ from autodev_control.trusted.state import (
 
 MAT = CandidateMaterializationId(RawSha256("6" * 64))
 from autodev_control.trusted.target_registration import AdmittedTargetRegistration
+from tests.trusted.contract_fixtures import canonical_contract_fixture
 
 
-RAW = RawSha256("6" * 64)
-AUTH = AuthorizationId(RAW)
-TARGET = TargetRegistrationId(RAW)
+ID_RAW = RawSha256("6" * 64)
+AUTH = AuthorizationId(ID_RAW)
+TARGET = TargetRegistrationId(ID_RAW)
 TASK = TaskId("task")
 CONTRACT = ContractId("contract")
 ADMISSION = AdmissionEventId("admission")
-EPOCH = PolicyEpochIdentity(TrustedManifestId(RAW))
+EPOCH = PolicyEpochIdentity(TrustedManifestId(ID_RAW))
 REPOSITORY = GitHubRepositoryId("123")
 BASE = GitSha("a" * 40)
+_, RAW, CONTRACT_RECORD = canonical_contract_fixture(
+    contract_id=CONTRACT, task_id=TASK, target_registration_id=TARGET,
+    repository_id=REPOSITORY, policy_epoch_identity=EPOCH, base_sha=BASE,
+)
 
 
 def mint(cls, **values):
@@ -171,7 +176,7 @@ def apply(store, *mutations, conditions=()):
 
 def initialized_backend(*, task_epoch=EPOCH):
     store = backend()
-    result = apply(store, CreateAuthorization(admitted_authorization()), CreateTaskAndInitialOperationMembership(task(epoch=task_epoch)))
+    result = apply(store, CreateContract(CONTRACT_RECORD), CreateAuthorization(admitted_authorization()), CreateTaskAndInitialOperationMembership(task(epoch=task_epoch)))
     assert result.status is CanonicalWriteStatus.APPLIED
     return store
 
@@ -216,7 +221,7 @@ def insert_evidence(store, subject, value):
 def test_authorization_create_idempotency_collision_and_generation_rules():
     store = backend()
     before = store.occurrence
-    created = apply(store, CreateAuthorization(admitted_authorization()))
+    created = apply(store, CreateContract(CONTRACT_RECORD), CreateAuthorization(admitted_authorization()))
     assert created.status is CanonicalWriteStatus.APPLIED
     assert created.canonical_state_occurrence_binding.backend_generation.value == before.backend_generation.value + 1
     assert apply(store, CreateAuthorization(admitted_authorization())).status is CanonicalWriteStatus.ALREADY_PRESENT
@@ -228,7 +233,7 @@ def test_authorization_create_idempotency_collision_and_generation_rules():
 
 def test_task_and_authorization_can_be_mutually_created_in_one_final_graph_transaction():
     store = backend()
-    result = apply(store, CreateTaskAndInitialOperationMembership(task()), CreateAuthorization(admitted_authorization()))
+    result = apply(store, CreateTaskAndInitialOperationMembership(task()), CreateAuthorization(admitted_authorization()), CreateContract(CONTRACT_RECORD))
     assert result.status is CanonicalWriteStatus.APPLIED
     working = store.read_task_working_set(TASK)
     assert working.task.state is TaskState.ADMITTED
@@ -479,14 +484,14 @@ def test_coherent_working_set_is_immutable_and_contains_complete_membership():
 
 
 def canonical_root_for(*typed_records):
-    grouped = {kind: [] for kind in CanonicalRecordKind}
+    grouped = {kind: [] for kind in CANONICAL_ROOT_KIND_ORDER}
     stored = []
     for kind, record in typed_records:
         reference = canonical_object_ref(kind, record)
         grouped[kind].append(CanonicalIndexEntry(canonical_logical_identity(kind, record), reference))
         stored.append(CanonicalStoredObject(reference, canonical_record_bytes(kind, record)))
-    indexes = tuple(tuple(sorted(grouped[kind], key=lambda item: item.logical_identity)) for kind in CanonicalRecordKind)
-    return CanonicalStateRootManifest("1", None, *indexes), tuple(stored)
+    indexes = tuple(tuple(sorted(grouped[kind], key=lambda item: item.logical_identity)) for kind in CANONICAL_ROOT_KIND_ORDER)
+    return CanonicalStateRootManifest("2", None, *indexes), tuple(stored)
 
 
 def test_root_digest_indexes_and_unrelated_staging_objects():
@@ -497,7 +502,7 @@ def test_root_digest_indexes_and_unrelated_staging_objects():
         canonical_object_ref(CanonicalRecordKind.TASK, payload, "2")
     reference = canonical_object_ref(CanonicalRecordKind.TASK, payload)
     entry = CanonicalIndexEntry(canonical_logical_identity(CanonicalRecordKind.TASK, payload), reference)
-    manifest = CanonicalStateRootManifest("1", None, (), (entry,), (), (), (), (), (), (), ())
+    manifest = CanonicalStateRootManifest("2", None, (), (), (entry,), (), (), (), (), (), (), ())
     stored = CanonicalStoredObject(reference, canonical_record_bytes(CanonicalRecordKind.TASK, payload))
     extra_payload = replace(payload, task_id=TaskId("staging"))
     extra_ref = canonical_object_ref(CanonicalRecordKind.TASK, extra_payload)
@@ -508,13 +513,13 @@ def test_root_digest_indexes_and_unrelated_staging_objects():
     corrupt = CanonicalStoredObject(reference, b"different")
     assert not validate_canonical_root(manifest, (corrupt,))
     wrong_identity = CanonicalStateRootManifest(
-        "1", None, (), (CanonicalIndexEntry("wrong-task", reference),), (), (), (), (), (), (), ()
+        "2", None, (), (), (CanonicalIndexEntry("wrong-task", reference),), (), (), (), (), (), (), ()
     )
     assert not validate_canonical_root(wrong_identity, (stored,))
     arbitrary = b'{"format":"autodev.canonical-record/v1", "record":{},"record_kind":"task","schema_version":"1"}'
     arbitrary_ref = CanonicalObjectRef(CanonicalRecordKind.TASK, "1", RawSha256(hashlib.sha256(arbitrary).hexdigest()))
     arbitrary_manifest = CanonicalStateRootManifest(
-        "1", None, (), (CanonicalIndexEntry("task", arbitrary_ref),), (), (), (), (), (), (), ()
+        "2", None, (), (), (CanonicalIndexEntry("task", arbitrary_ref),), (), (), (), (), (), (), ()
     )
     assert not validate_canonical_root(arbitrary_manifest, (CanonicalStoredObject(arbitrary_ref, arbitrary),))
 
@@ -532,9 +537,9 @@ def test_root_rejects_incomplete_or_structurally_forged_typed_records():
         raw = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         reference = CanonicalObjectRef(ref_kind, schema, RawSha256(hashlib.sha256(raw).hexdigest()))
         entry = CanonicalIndexEntry(logical_identity, reference)
-        indexes = [(), (), (), (), (), (), (), (), ()]
-        indexes[1 if ref_kind is CanonicalRecordKind.TASK else 2] = (entry,)
-        manifest = CanonicalStateRootManifest("1", None, *indexes)
+        indexes = [() for _ in CANONICAL_ROOT_KIND_ORDER]
+        indexes[2 if ref_kind is CanonicalRecordKind.TASK else 3] = (entry,)
+        manifest = CanonicalStateRootManifest("2", None, *indexes)
         assert not validate_canonical_root(manifest, (CanonicalStoredObject(reference, raw),))
 
     rejected({"task_id": valid_record["task_id"]})
@@ -551,7 +556,7 @@ def test_root_rejects_incomplete_or_structurally_forged_typed_records():
     rejected(valid_record, schema="2")
 
 
-def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind():
+def test_root_accepts_complete_exact_schema_for_every_supported_v2_record_kind():
     subject = effective_subject()
     op = operation(candidate_id=subject.candidate_id)
     admitted_evidence = evidence(subject)
@@ -564,6 +569,7 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind()
         authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
     )
     records = (
+        CONTRACT_RECORD,
         admitted_authorization(),
         task(),
         CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ()),
@@ -585,11 +591,11 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind()
         ),
     )
     indexes, stored = [], []
-    for kind, record in zip(CanonicalRecordKind, records):
+    for kind, record in zip(CANONICAL_ROOT_KIND_ORDER, records):
         reference = canonical_object_ref(kind, record)
         indexes.append((CanonicalIndexEntry(canonical_logical_identity(kind, record), reference),))
         stored.append(CanonicalStoredObject(reference, canonical_record_bytes(kind, record)))
-    manifest = CanonicalStateRootManifest("1", None, *indexes)
+    manifest = CanonicalStateRootManifest("2", None, *indexes)
     assert validate_canonical_root_object_integrity(manifest, tuple(stored))
     assert not validate_canonical_root(manifest, tuple(stored), (resolved_target(),))
 
@@ -597,6 +603,7 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v1_record_kind()
 def test_complete_coherent_reconstructed_root_passes_graph_closure():
     membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), ())
     manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.CONTRACT, CONTRACT_RECORD),
         (CanonicalRecordKind.AUTHORIZATION, admitted_authorization()),
         (CanonicalRecordKind.TASK, task()),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
@@ -847,7 +854,7 @@ def test_apply_rejects_forged_malformed_inputs_without_publishing_partial_state(
 
 
 def test_single_predecessor_commit_and_platform_cas_contract():
-    empty = CanonicalStateRootManifest("1", GitSha("a" * 40), (), (), (), (), (), (), (), (), ())
+    empty = CanonicalStateRootManifest("2", GitSha("a" * 40), (), (), (), (), (), (), (), (), (), ())
     valid = CanonicalStateCommit(GitSha("b" * 40), empty, (GitSha("a" * 40),))
     assert validate_canonical_state_commit(valid, GitSha("a" * 40))
     merge = CanonicalStateCommit(GitSha("c" * 40), empty, (GitSha("a" * 40), GitSha("d" * 40)))
@@ -858,13 +865,13 @@ def test_single_predecessor_commit_and_platform_cas_contract():
 
 def test_ambiguous_write_reconciliation_current_historical_competing_and_unknown():
     s0, s1, s2, other = (GitSha(char * 40) for char in "abcd")
-    m1 = CanonicalStateRootManifest("1", s0, (), (), (), (), (), (), (), (), ())
+    m1 = CanonicalStateRootManifest("2", s0, (), (), (), (), (), (), (), (), (), ())
     attempted = CanonicalStateCommit(s1, m1, (s0,))
-    m2 = CanonicalStateRootManifest("1", s1, (), (), (), (), (), (), (), (), ())
+    m2 = CanonicalStateRootManifest("2", s1, (), (), (), (), (), (), (), (), (), ())
     later = CanonicalStateCommit(s2, m2, (s1,))
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=s1, canonical_history=()) is CanonicalWriteStatus.APPLIED
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=s2, canonical_history=(attempted, later)) is CanonicalWriteStatus.APPLIED
-    competing_manifest = CanonicalStateRootManifest("1", s0, (), (), (), (), (), (), (), (), ())
+    competing_manifest = CanonicalStateRootManifest("2", s0, (), (), (), (), (), (), (), (), (), ())
     competing = CanonicalStateCommit(other, competing_manifest, (s0,))
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=other, canonical_history=(competing,)) is CanonicalWriteStatus.INDETERMINATE
     assert reconcile_ambiguous_canonical_write(attempted=attempted, expected_prior=s0, current_root=other, canonical_history=None) is CanonicalWriteStatus.INDETERMINATE

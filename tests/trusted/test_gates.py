@@ -17,7 +17,7 @@ from autodev_control.trusted.authorization import (
 )
 from autodev_control.trusted.backend import (
     BackendGeneration, CanonicalStateOccurrenceBinding, CanonicalTransaction,
-    CanonicalWriteStatus, CreateAuthorization,
+    CanonicalWriteStatus, CreateAuthorization, CreateContract,
     InMemoryCanonicalStateBackend, ResolvedTargetRegistration,
     canonical_json_bytes,
 )
@@ -61,18 +61,26 @@ from autodev_control.trusted.state_reader import (
 from autodev_control.trusted.target_registration import (
     AdmittedTargetRegistration, MergeConfiguration, TargetPublication,
 )
+from tests.trusted.contract_fixtures import (
+    canonical_contract_fixture, trusted_admission_context_for_fixture,
+)
 
 
 REPO = GitHubRepositoryId("1")
 REF = CanonicalBranchRef("refs/heads/main")
 SHA = GitSha("a" * 40)
-RAW = RawSha256("6" * 64)
-AUTH = AuthorizationId(RAW)
+AUTH_RAW = RawSha256("6" * 64)
+AUTH = AuthorizationId(AUTH_RAW)
 TARGET = TargetRegistrationId(RawSha256("7" * 64))
 TASK = TaskId("task")
 CONTRACT = ContractId("contract")
 ADMISSION = AdmissionEventId("admission")
 EPOCH = PolicyEpochIdentity(TrustedManifestId(RawSha256("8" * 64)))
+_, RAW, CONTRACT_RECORD = canonical_contract_fixture(
+    contract_id=CONTRACT, task_id=TASK, target_registration_id=TARGET,
+    repository_id=REPO, policy_epoch_identity=EPOCH, base_sha=SHA,
+    allowed_repository_scope=True,
+)
 
 
 def mint(cls, **values):
@@ -260,7 +268,7 @@ def completion_context(value, context_id="completion-context", *,
 
 def initialize_task(value):
     assert value.backend.apply(CanonicalTransaction(
-        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+        value.backend.occurrence, (), (CreateContract(CONTRACT_RECORD), CreateAuthorization(authorization()))
     )).status is CanonicalWriteStatus.APPLIED
     request = value.boundary.create_task(
         task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
@@ -270,6 +278,29 @@ def initialize_task(value):
     )
     result = ControlStateGate(value).commit(request, independent_lease(value))
     assert result.code is GateResultCode.COMMITTED
+
+
+def test_admit_contract_uses_controller_gate_cas_and_exact_authoritative_dependencies():
+    value = runtime()
+    dependencies = install_fixture_dependencies(value, "contract-base", "contract-issue")
+    context = trusted_admission_context_for_fixture(
+        CONTRACT_RECORD.raw_bytes, registration(), EPOCH,
+        dependencies.dependencies[0].expected_binding_id,
+        dependencies.dependencies[1].expected_binding_id,
+    )
+    value.register_contract_context(CONTRACT_RECORD.raw_bytes, context)
+    request = value.boundary.admit_contract(CONTRACT_RECORD.raw_bytes)
+    assert request.command_kind is TrustedControlCommandKind.ADMIT_CONTRACT
+    alternate = install_fixture_dependencies(value, "contract-alternate")
+    wrong_lease = value.acquire_control_lease(value.control_capability, alternate)
+    assert ControlStateGate(value).commit(request, wrong_lease).code is GateResultCode.LEASE_INVALID
+    lease = value.acquire_control_lease(value.control_capability, dependencies)
+    result = ControlStateGate(value).commit(request, lease)
+    assert result.code is GateResultCode.COMMITTED
+    assert value.backend.read_contract(CONTRACT) == CONTRACT_RECORD
+    replay = value.boundary.admit_contract(CONTRACT_RECORD.raw_bytes)
+    replay_lease = value.acquire_control_lease(value.control_capability, dependencies)
+    assert ControlStateGate(value).commit(replay, replay_lease).code is GateResultCode.COMMITTED
 
 
 def materialize(value):
@@ -578,7 +609,7 @@ def test_controller_exposes_no_transaction_taking_decision_method():
 def test_semantic_create_task_flows_through_lease_and_g6_commit():
     value = runtime()
     assert value.backend.apply(CanonicalTransaction(
-        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+        value.backend.occurrence, (), (CreateContract(CONTRACT_RECORD), CreateAuthorization(authorization()))
     )).status is CanonicalWriteStatus.APPLIED
     request = value.boundary.create_task(
         task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
@@ -597,7 +628,7 @@ def test_semantic_create_task_flows_through_lease_and_g6_commit():
 def test_dependency_mutation_cannot_linearize_while_control_lease_is_live():
     value = runtime()
     assert value.backend.apply(CanonicalTransaction(
-        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+        value.backend.occurrence, (), (CreateContract(CONTRACT_RECORD), CreateAuthorization(authorization()))
     )).status is CanonicalWriteStatus.APPLIED
     request = value.boundary.create_task(
         task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
@@ -648,7 +679,7 @@ def test_same_thread_fenced_fixture_mutation_is_rejected_deterministically():
 def test_runtime_replacement_waits_for_live_lease_and_retires_old_runtime():
     value = runtime()
     assert value.backend.apply(CanonicalTransaction(
-        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+        value.backend.occurrence, (), (CreateContract(CONTRACT_RECORD), CreateAuthorization(authorization()))
     )).status is CanonicalWriteStatus.APPLIED
     request = value.boundary.create_task(
         task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,
@@ -1533,7 +1564,7 @@ def test_evaluation_fails_closed_when_completion_context_is_missing_or_mismatche
 def test_audit_binds_exact_dependency_members_and_runtime_binding():
     value = runtime()
     assert value.backend.apply(CanonicalTransaction(
-        value.backend.occurrence, (), (CreateAuthorization(authorization()),)
+        value.backend.occurrence, (), (CreateContract(CONTRACT_RECORD), CreateAuthorization(authorization()))
     )).status is CanonicalWriteStatus.APPLIED
     request = value.boundary.create_task(
         task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=RAW,

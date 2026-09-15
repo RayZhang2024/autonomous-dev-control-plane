@@ -18,6 +18,7 @@ from .audit import (
 from .backend import (
     AuthorizationExistsAndMatches, CanonicalNamespace, CanonicalTransaction,
     CanonicalWriteResult, CanonicalWriteStatus, CreateAuthorization, CreateCandidate,
+    CreateContract, ExactRecordEquals,
     CreateEvidenceAndAdvanceHistory, CreateOperationAndAdvanceMembership,
     CreateTaskAndInitialOperationMembership, EvidenceHistoryMembershipEquals,
     InMemoryCanonicalStateBackend, OperationRevisionEquals, RecordAbsent,
@@ -32,9 +33,16 @@ from .authorization import (
     OrdinaryRootProtectionContext, admit_delegated_authorization,
     admit_direct_authorization,
 )
+from .contract import (
+    CandidateIssueContract, TrustedIssueContractAdmissionContext,
+    TrustedIssueContractApplicabilityContext, admit_issue_contract,
+    derive_contract_authority_ceiling, evaluate_issue_contract_applicability,
+    load_candidate_issue_contract,
+)
 from .evidence import (
     EvidenceAdmissionDecision, SemanticEvidenceAdmissionRequest, admit_semantic_review,
 )
+from .decision import Decision
 from .errors import G4FailureCode
 from .fixture_platform import (
     ActiveFixtureRuntimeRegistry, CreatedCandidatePrEffectSubject,
@@ -83,6 +91,7 @@ from .target_registration import AdmittedTargetRegistration
 
 
 class TrustedControlCommandKind(Enum):
+    ADMIT_CONTRACT = "ADMIT_CONTRACT"
     ADMIT_AUTHORIZATION = "ADMIT_AUTHORIZATION"
     CREATE_TASK = "CREATE_TASK"
     CREATE_CANDIDATE = "CREATE_CANDIDATE"
@@ -435,6 +444,7 @@ class PreparedProtectedStart:
 class ControlStateCommitRequest:
     command_kind: TrustedControlCommandKind
     transaction: CanonicalTransaction
+    required_authoritative_binding_ids: tuple[AuthoritativeStateBindingId, ...]
     _key: object
 
     def __init__(self, *_: object, **__: object) -> None:
@@ -479,10 +489,52 @@ class DeterministicTrustedController:
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("trusted controller is installed only by the active gate runtime")
 
+    def admit_contract(
+        self, raw: bytes, context: TrustedIssueContractAdmissionContext | None,
+    ) -> ControlStateCommitRequest:
+        candidate = load_candidate_issue_contract(raw)
+        if type(candidate) is not CandidateIssueContract:
+            raise ValueError(candidate.code.value)
+        existing = self._backend.read_contract(candidate.contract_id)
+        if existing is not None:
+            if existing.contract_raw_sha256 != candidate.source_document.raw_sha256:
+                raise ValueError(CanonicalWriteStatus.IDENTITY_CONFLICT.value)
+            transaction = CanonicalTransaction(
+                self._backend.occurrence,
+                (ExactRecordEquals(CanonicalNamespace.CONTRACT, candidate.contract_id, existing),),
+                (),
+            )
+            request = object.__new__(ControlStateCommitRequest)
+            object.__setattr__(request, "command_kind", TrustedControlCommandKind.ADMIT_CONTRACT)
+            object.__setattr__(request, "transaction", transaction)
+            object.__setattr__(request, "required_authoritative_binding_ids", ())
+            object.__setattr__(request, "_key", self._key)
+            return request
+        if type(context) is not TrustedIssueContractAdmissionContext:
+            raise ValueError("trusted contract admission context is unavailable")
+        result = admit_issue_contract(candidate, context)
+        if result.proposed_contract is None:
+            raise ValueError(result.reason_code.value)
+        contract = result.proposed_contract
+        transaction = CanonicalTransaction(
+            self._backend.occurrence,
+            (),
+            (CreateContract(contract),),
+        )
+        request = object.__new__(ControlStateCommitRequest)
+        object.__setattr__(request, "command_kind", TrustedControlCommandKind.ADMIT_CONTRACT)
+        object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "required_authoritative_binding_ids", tuple(dict.fromkeys((
+            context.issue_identity.authoritative_state_binding_id,
+            context.base_observation.authoritative_state_binding_id,
+        ))))
+        object.__setattr__(request, "_key", self._key)
+        return request
+
     def admit_authorization(
         self, proposal: CandidateAuthorizationProposal,
         target: AdmittedTargetRegistration | None,
-        contract: ContractAuthorityCeiling | None,
+        contract_context: TrustedIssueContractApplicabilityContext,
         policy: AuthorizationPolicyContext | None,
         root: OrdinaryRootProtectionContext | None,
         *, approval: AuthenticatedHumanAuthorizationApproval | None = None,
@@ -490,6 +542,13 @@ class DeterministicTrustedController:
     ) -> ControlStateCommitRequest:
         if type(proposal) is not CandidateAuthorizationProposal:
             raise TypeError("exact candidate authorization proposal required")
+        contract = self._backend.read_contract(proposal.contract_id)
+        if contract is None or contract.contract_raw_sha256 != proposal.contract_raw_sha256:
+            raise ValueError("contract is not the exact canonical value")
+        applicability = evaluate_issue_contract_applicability(contract, contract_context)
+        if applicability.decision is not Decision.ALLOW:
+            raise ValueError(applicability.outcome.value)
+        ceiling = derive_contract_authority_ceiling(contract)
         resolved = self._backend.read_resolved_target_registration(
             proposal.target_registration_id
         )
@@ -497,7 +556,7 @@ class DeterministicTrustedController:
             raise ValueError("target registration is not the exact root-resolved value")
         if proposal.kind is AuthorizationKind.DIRECT_HUMAN:
             result = admit_direct_authorization(
-                proposal, target, contract, policy, approval, issuer, root
+                proposal, target, ceiling, policy, approval, issuer, root
             )
         else:
             parent = (
@@ -505,7 +564,7 @@ class DeterministicTrustedController:
                 else self._backend.read_authorization(proposal.parent_authorization_id)
             )
             result = admit_delegated_authorization(
-                proposal, target, contract, policy, parent, root
+                proposal, target, ceiling, policy, parent, root
             )
         if result.admitted_authorization is None:
             raise ValueError(result.reason_code.value)
@@ -518,6 +577,7 @@ class DeterministicTrustedController:
         request = object.__new__(ControlStateCommitRequest)
         object.__setattr__(request, "command_kind", TrustedControlCommandKind.ADMIT_AUTHORIZATION)
         object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "required_authoritative_binding_ids", ())
         object.__setattr__(request, "_key", self._key)
         return request
 
@@ -538,10 +598,18 @@ class DeterministicTrustedController:
         working = self._backend.read_authorization(authorization_id)
         if working is None:
             raise ValueError("authorization is not canonical")
+        contract = self._backend.read_contract(contract_id)
+        if (
+            contract is None or contract.contract_raw_sha256 != contract_raw_sha256
+            or contract.task_id != task_id or contract.target_registration_id != target_registration_id
+            or working.contract_id != contract_id or working.contract_raw_sha256 != contract_raw_sha256
+        ):
+            raise ValueError("task requires exact canonical contract and authorization")
         transaction = CanonicalTransaction(
             self._backend.occurrence,
             (
                 AuthorizationExistsAndMatches(working),
+                ExactRecordEquals(CanonicalNamespace.CONTRACT, contract_id, contract),
                 RecordAbsent(CanonicalNamespace.TASK, task_id),
             ),
             (CreateTaskAndInitialOperationMembership(proposal.proposed),),
@@ -549,6 +617,7 @@ class DeterministicTrustedController:
         request = object.__new__(ControlStateCommitRequest)
         object.__setattr__(request, "command_kind", TrustedControlCommandKind.CREATE_TASK)
         object.__setattr__(request, "transaction", transaction)
+        object.__setattr__(request, "required_authoritative_binding_ids", ())
         object.__setattr__(request, "_key", self._key)
         return request
 
@@ -990,6 +1059,12 @@ class TrustedControlCommandBoundary:
     def submit(self, *_: object, **__: object) -> ControlStateCommitRequest:
         raise TypeError("use one explicit closed semantic command method")
 
+    def admit_contract(self, raw: bytes) -> ControlStateCommitRequest:
+        if type(raw) is not bytes:
+            raise TypeError("exact raw contract bytes required")
+        context = self._runtime._contract_contexts.get(hashlib.sha256(raw).hexdigest())
+        return self._controller.admit_contract(raw, context)
+
     def admit_authorization(
         self, proposal: CandidateAuthorizationProposal,
     ) -> ControlStateCommitRequest:
@@ -1000,9 +1075,9 @@ class TrustedControlCommandBoundary:
         )
         if context is None:
             raise ValueError("exact root-managed authorization context is unavailable")
-        target, contract, policy, root, approval, issuer = context
+        target, contract_context, policy, root, approval, issuer = context
         return self._controller.admit_authorization(
-            proposal, target, contract, policy, root,
+            proposal, target, contract_context, policy, root,
             approval=approval, issuer=issuer,
         )
 
@@ -1060,7 +1135,7 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
@@ -1078,6 +1153,7 @@ class FixtureProtectedGateRuntime:
         self._readers: dict[ImmutableConfigId, GitHubStateReader] = {}
         self._fixture_transports: dict[ImmutableConfigId, TrustedGitHubReadTransportBinding] = {}
         self._authorization_contexts: dict[str, tuple] = {}
+        self._contract_contexts: dict[str, TrustedIssueContractAdmissionContext] = {}
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
         self._completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext] = {}
         self._fail_after_start = False
@@ -1230,7 +1306,7 @@ class FixtureProtectedGateRuntime:
     def register_authorization_context(
         self, proposal: CandidateAuthorizationProposal,
         target: AdmittedTargetRegistration | None,
-        contract: ContractAuthorityCeiling | None,
+        contract_context: TrustedIssueContractApplicabilityContext,
         policy: AuthorizationPolicyContext | None,
         root: OrdinaryRootProtectionContext | None, *,
         approval: AuthenticatedHumanAuthorizationApproval | None = None,
@@ -1239,10 +1315,20 @@ class FixtureProtectedGateRuntime:
         """Fixture root/admin setup; these authority facts never cross the command boundary."""
         if type(proposal) is not CandidateAuthorizationProposal:
             raise TypeError("exact candidate authorization proposal required")
+        if type(contract_context) is not TrustedIssueContractApplicabilityContext:
+            raise TypeError("assembled current contract applicability context required")
         key = hashlib.sha256(canonical_json_bytes(proposal)).hexdigest()
         self._authorization_contexts[key] = (
-            target, contract, policy, root, approval, issuer,
+            target, contract_context, policy, root, approval, issuer,
         )
+
+    def register_contract_context(
+        self, raw: bytes, context: TrustedIssueContractAdmissionContext,
+    ) -> None:
+        """Fixture root setup keeps trusted admission facts off the command surface."""
+        if type(raw) is not bytes or type(context) is not TrustedIssueContractAdmissionContext:
+            raise TypeError("exact raw bytes and trusted admission context required")
+        self._contract_contexts[hashlib.sha256(raw).hexdigest()] = context
 
     def register_semantic_evidence_context(
         self, context_id: ImmutableConfigId,
@@ -1398,6 +1484,11 @@ class FixtureProtectedGateRuntime:
         with self._lock:
             if type(request) is not ControlStateCommitRequest or request._key is not self._controller_key:
                 return GateResult(GateResultCode.REJECTED)
+            required_bindings = getattr(request, "required_authoritative_binding_ids", ())
+            if required_bindings and frozenset(required_bindings) != frozenset(
+                item.expected_binding_id for item in lease.dependencies.dependencies
+            ):
+                return GateResult(GateResultCode.LEASE_INVALID)
             if type(lease) is not ControlStateCommitLease or not self._dependencies_fresh(lease) or not self._is_active():
                 return GateResult(GateResultCode.LEASE_INVALID)
             if (lease.runtime_binding is not self.binding or lease.root_context_id != self.binding.root_context_id
@@ -1432,7 +1523,11 @@ class FixtureProtectedGateRuntime:
                 )):
                     return GateResult(GateResultCode.AUDIT_FAILURE_BEFORE_COMMIT)
                 result = self.backend.apply(request.transaction)
-                if result.status is not CanonicalWriteStatus.APPLIED:
+                replay = (
+                    request.command_kind is TrustedControlCommandKind.ADMIT_CONTRACT
+                    and result.status is CanonicalWriteStatus.ALREADY_PRESENT
+                )
+                if result.status is not CanonicalWriteStatus.APPLIED and not replay:
                     outcome = GateAuditOutcome.CAS_CONFLICT if result.status is CanonicalWriteStatus.CAS_CONFLICT else GateAuditOutcome.DENIED
                     self._audit_event(
                         "CONTROL_STATE", request.command_kind.value, outcome,
@@ -2312,6 +2407,7 @@ class FixtureProtectedGateRuntime:
         restarted._readers.update(self._readers)
         restarted._fixture_transports.update(self._fixture_transports)
         restarted._authorization_contexts.update(self._authorization_contexts)
+        restarted._contract_contexts.update(self._contract_contexts)
         restarted._evidence_contexts.update(self._evidence_contexts)
         restarted._completion_contexts.update(self._completion_contexts)
         return restarted

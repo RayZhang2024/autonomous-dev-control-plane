@@ -877,6 +877,38 @@ def contract_to_ops(contract: ContractAuthorityCeiling) -> AuthorizationOperatio
     return AuthorizationOperationalConstraints(refs, contract.controlled_runtime_profile_ids, contract.repair_max_attempts)
 
 
+def _contract_authority_ceiling_from_admitted_contract(contract: object) -> ContractAuthorityCeiling:
+    """The sole production construction path from canonical contract to G3 ceiling."""
+    from .contract import AdmittedIssueContract
+
+    if type(contract) is not AdmittedIssueContract:
+        raise TypeError("exact AdmittedIssueContract required")
+    integration_ref = (
+        contract.integration_ref
+        if TaskCapability.MERGE in contract.requested_operations
+        else None
+    )
+    return _new_private(
+        ContractAuthorityCeiling, _AUTHORITY_KEY, _AUTHORITY_KEY,
+        task_id=contract.task_id,
+        contract_id=contract.contract_id,
+        contract_raw_sha256=contract.contract_raw_sha256,
+        target_registration_id=contract.target_registration_id,
+        requested_capabilities=contract.requested_operations,
+        allowed_mutation_scope=contract.allowed_mutation_scope,
+        prohibited_mutation_scope=contract.prohibited_mutation_scope,
+        risk_floor=contract.risk_floor,
+        integration_ref=integration_ref,
+        controlled_runtime_profile_ids=tuple(
+            identity.config_id for identity in contract.runtime_profile_identities
+        ),
+        repair_max_attempts=contract.repair_max_attempts,
+        delegation_max_depth=contract.delegation_limits.max_depth,
+        delegable_capabilities=contract.delegation_limits.delegable_operations,
+        delegation_risk_ceiling=contract.delegation_limits.risk_ceiling,
+    )
+
+
 def _authenticated_human_approval_for_test(**fields: object) -> AuthenticatedHumanAuthorizationApproval:
     _require_authority_fields(fields, {
         "human_principal_id": HumanPrincipalId,

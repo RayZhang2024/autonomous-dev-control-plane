@@ -17,6 +17,7 @@ from types import MappingProxyType, UnionType
 from typing import TypeAlias, Union, get_args, get_origin, get_type_hints
 
 from .authorization import AdmittedAuthorization
+from .contract import AdmittedIssueContract, validate_admitted_issue_contract_record
 from .evidence import EvidenceRecord, EvidenceSubject, EvidenceSupersessionRecord, SemanticEvidencePayload
 from .identity import GitSha, ImmutableConfigId, RawSha256
 from .manifest import PolicyEpochIdentity
@@ -36,7 +37,7 @@ from .review import (
     TrustedEffectiveSubjectEvidenceSnapshot,
     TrustedReviewSlotAttemptSnapshot,
 )
-from .scope import AuthorizationId, GitHubRepositoryId, TargetRegistrationId, TaskId
+from .scope import AuthorizationId, ContractId, GitHubRepositoryId, TargetRegistrationId, TaskId
 from .state import CancellationStatus, CandidateRecord, TaskOperationSnapshot, TaskRecord, TaskState
 from .target_registration import AdmittedTargetRegistration
 
@@ -199,6 +200,7 @@ class CanonicalReviewEligibilitySnapshot:
 
 
 class CanonicalNamespace(Enum):
+    CONTRACT = "contracts"
     AUTHORIZATION = "authorizations"
     TASK = "tasks"
     CANDIDATE = "candidates"
@@ -316,6 +318,11 @@ class CreateAuthorization(_ClosedBackendInput):
 
 
 @dataclass(frozen=True, slots=True)
+class CreateContract(_ClosedBackendInput):
+    contract: AdmittedIssueContract
+
+
+@dataclass(frozen=True, slots=True)
 class CreateTaskAndInitialOperationMembership(_ClosedBackendInput):
     task: TaskRecord
 
@@ -380,7 +387,7 @@ class CreateSupersession(_ClosedBackendInput):
 
 
 CanonicalMutation: TypeAlias = (
-    CreateAuthorization | CreateTaskAndInitialOperationMembership | ReplaceTask
+    CreateContract | CreateAuthorization | CreateTaskAndInitialOperationMembership | ReplaceTask
     | CreateCandidate | CreateOperationAndAdvanceMembership
     | CreateSemanticReviewOperationAndBinding | ReplaceOperation
     | ReplaceTaskOperationMembership | CreateEvidenceHistory
@@ -405,7 +412,7 @@ _CONDITION_TYPES = (
     TaskCancellationStatusEquals, CanonicalStateRootEquals,
 )
 _MUTATION_TYPES = (
-    CreateAuthorization, CreateTaskAndInitialOperationMembership, ReplaceTask,
+    CreateContract, CreateAuthorization, CreateTaskAndInitialOperationMembership, ReplaceTask,
     CreateCandidate, CreateOperationAndAdvanceMembership,
     CreateSemanticReviewOperationAndBinding, ReplaceOperation,
     ReplaceTaskOperationMembership, CreateEvidenceHistory,
@@ -414,6 +421,7 @@ _MUTATION_TYPES = (
 
 
 _NAMESPACE_TYPES = {
+    CanonicalNamespace.CONTRACT: (ContractId, AdmittedIssueContract),
     CanonicalNamespace.AUTHORIZATION: (AuthorizationId, AdmittedAuthorization),
     CanonicalNamespace.TASK: (TaskId, TaskRecord),
     CanonicalNamespace.CANDIDATE: (CandidateId, CandidateRecord),
@@ -433,6 +441,8 @@ def _runtime_exact(value: object, expected: object) -> None:
 
 
 def _record_identity(namespace: CanonicalNamespace, record: object) -> object:
+    if namespace is CanonicalNamespace.CONTRACT:
+        return record.contract_id
     if namespace is CanonicalNamespace.AUTHORIZATION:
         return record.authorization_id
     if namespace in (CanonicalNamespace.TASK, CanonicalNamespace.TASK_OPERATION_MEMBERSHIP):
@@ -493,6 +503,7 @@ def _validate_closed_transaction(transaction: CanonicalTransaction) -> None:
 
 @dataclass(frozen=True, slots=True)
 class _State:
+    contracts: dict
     authorizations: dict
     tasks: dict
     candidates: dict
@@ -505,14 +516,14 @@ class _State:
 
     def clone(self) -> _State:
         return _State(*(dict(getattr(self, name)) for name in (
-            "authorizations", "tasks", "candidates", "operations", "memberships",
+            "contracts", "authorizations", "tasks", "candidates", "operations", "memberships",
             "attempts", "evidence", "histories", "supersessions",
         )))
 
 
 def _freeze_state(state: _State) -> _State:
     return _State(*(MappingProxyType(dict(getattr(state, name))) for name in (
-        "authorizations", "tasks", "candidates", "operations", "memberships",
+        "contracts", "authorizations", "tasks", "candidates", "operations", "memberships",
         "attempts", "evidence", "histories", "supersessions",
     )))
 
@@ -530,22 +541,24 @@ def _history_binding(subject_id: SemanticReviewEffectiveSubjectId, revision: int
 def _mutation_priority(mutation: CanonicalMutation) -> int:
     """Dependency order is fixed by mutation type, never caller source order."""
     return {
-        CreateAuthorization: 0,
-        CreateTaskAndInitialOperationMembership: 1,
-        CreateCandidate: 2,
-        CreateEvidenceHistory: 3,
-        CreateOperationAndAdvanceMembership: 4,
-        CreateSemanticReviewOperationAndBinding: 4,
-        CreateEvidenceAndAdvanceHistory: 5,
-        CreateSupersession: 6,
-        ReplaceOperation: 7,
-        ReplaceTaskOperationMembership: 8,
-        ReplaceTask: 9,
+        CreateContract: 0,
+        CreateAuthorization: 1,
+        CreateTaskAndInitialOperationMembership: 2,
+        CreateCandidate: 3,
+        CreateEvidenceHistory: 4,
+        CreateOperationAndAdvanceMembership: 5,
+        CreateSemanticReviewOperationAndBinding: 5,
+        CreateEvidenceAndAdvanceHistory: 6,
+        CreateSupersession: 7,
+        ReplaceOperation: 8,
+        ReplaceTaskOperationMembership: 9,
+        ReplaceTask: 10,
     }[type(mutation)]
 
 
 def _namespace_map(state: _State, namespace: CanonicalNamespace) -> dict:
     return {
+        CanonicalNamespace.CONTRACT: state.contracts,
         CanonicalNamespace.AUTHORIZATION: state.authorizations,
         CanonicalNamespace.TASK: state.tasks,
         CanonicalNamespace.CANDIDATE: state.candidates,
@@ -572,7 +585,7 @@ class InMemoryCanonicalStateBackend:
             raise TypeError("resolved_targets must be an exact trusted tuple")
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_generation", 1)
-        object.__setattr__(self, "_state", _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {})))
+        object.__setattr__(self, "_state", _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {}, {})))
         object.__setattr__(self, "_resolved_targets", MappingProxyType({item.target_registration_id: item for item in resolved_targets}))
         if len(self._resolved_targets) != len(resolved_targets) or any(
             item.registration.target_registration_id != item.target_registration_id
@@ -715,6 +728,15 @@ class InMemoryCanonicalStateBackend:
         return None
 
     def _apply_mutation(self, state: _State, mutation: CanonicalMutation) -> tuple[CanonicalWriteStatus | None, bool]:
+        if type(mutation) is CreateContract:
+            value = mutation.contract
+            if not validate_admitted_issue_contract_record(value):
+                return CanonicalWriteStatus.INVALID_TRANSACTION, False
+            current = state.contracts.get(value.contract_id)
+            if current is not None:
+                return (None, False) if current.contract_raw_sha256 == value.contract_raw_sha256 and current == value else (CanonicalWriteStatus.IDENTITY_CONFLICT, False)
+            state.contracts[value.contract_id] = value
+            return None, True
         if type(mutation) is CreateAuthorization:
             value = mutation.authorization
             if type(value) is not AdmittedAuthorization:
@@ -845,17 +867,32 @@ class InMemoryCanonicalStateBackend:
         return CanonicalWriteStatus.UNSUPPORTED, False
 
     def _valid_graph(self, state: _State) -> bool:
+        if any(not validate_admitted_issue_contract_record(contract) for contract in state.contracts.values()):
+            return False
         # External target resolution is root/admin-governed, never caller inferred.
         for authorization in state.authorizations.values():
+            contract = state.contracts.get(authorization.contract_id)
             resolved = self._resolved_targets.get(authorization.target_registration_id)
-            if resolved is None or resolved.registration.target_registration_id != authorization.target_registration_id:
+            if (
+                contract is None
+                or contract.contract_raw_sha256 != authorization.contract_raw_sha256
+                or contract.task_id != authorization.task_id
+                or contract.target_registration_id != authorization.target_registration_id
+                or resolved is None
+                or resolved.registration.target_registration_id != authorization.target_registration_id
+            ):
                 return False
         for task_id, task in state.tasks.items():
+            contract = state.contracts.get(task.contract_id)
             authorization = state.authorizations.get(task.authorization_id)
             membership = state.memberships.get(task_id)
-            if authorization is None or membership is None:
+            if contract is None or authorization is None or membership is None:
                 return False
             if (
+                contract.task_id != task.task_id
+                or contract.contract_raw_sha256 != task.contract_raw_sha256
+                or contract.target_registration_id != task.target_registration_id
+                or
                 authorization.task_id != task.task_id
                 or authorization.contract_id != task.contract_id
                 or authorization.contract_raw_sha256 != task.contract_raw_sha256
@@ -1014,6 +1051,13 @@ class InMemoryCanonicalStateBackend:
         with self._lock:
             return self._state.authorizations.get(authorization_id)
 
+    def read_contract(self, contract_id: ContractId) -> AdmittedIssueContract | None:
+        """Return the exact immutable canonical contract for assembled trusted flows."""
+        if type(contract_id) is not ContractId:
+            raise TypeError("exact ContractId required")
+        with self._lock:
+            return self._state.contracts.get(contract_id)
+
     def read_resolved_target_registration(
         self, target_registration_id: TargetRegistrationId,
     ) -> ResolvedTargetRegistration | None:
@@ -1132,6 +1176,7 @@ def _candidate_cycle(candidates: dict) -> bool:
 
 
 class CanonicalRecordKind(Enum):
+    CONTRACT = "contract"
     AUTHORIZATION = "authorization"
     TASK = "task"
     CANDIDATE = "candidate"
@@ -1141,6 +1186,20 @@ class CanonicalRecordKind(Enum):
     EVIDENCE = "evidence"
     EVIDENCE_HISTORY = "evidence_history"
     SUPERSESSION = "supersession"
+
+
+CANONICAL_ROOT_KIND_ORDER = (
+    CanonicalRecordKind.CONTRACT,
+    CanonicalRecordKind.AUTHORIZATION,
+    CanonicalRecordKind.TASK,
+    CanonicalRecordKind.CANDIDATE,
+    CanonicalRecordKind.OPERATION,
+    CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP,
+    CanonicalRecordKind.REVIEW_ATTEMPT_BINDING,
+    CanonicalRecordKind.EVIDENCE,
+    CanonicalRecordKind.EVIDENCE_HISTORY,
+    CanonicalRecordKind.SUPERSESSION,
+)
 
 
 def _canonical_value(value):
@@ -1184,6 +1243,7 @@ def canonical_record_bytes(
 
 
 _CANONICAL_RECORD_TYPES = {
+    CanonicalRecordKind.CONTRACT: AdmittedIssueContract,
     CanonicalRecordKind.AUTHORIZATION: AdmittedAuthorization,
     CanonicalRecordKind.TASK: TaskRecord,
     CanonicalRecordKind.CANDIDATE: CandidateRecord,
@@ -1274,6 +1334,8 @@ def _decode_canonical_value(value: object, expected: object, *, owner: type | No
 
 
 def _identity_parts(record_kind: CanonicalRecordKind, record: object) -> tuple[str, ...]:
+    if record_kind is CanonicalRecordKind.CONTRACT:
+        return (record.contract_id.value,)
     if record_kind is CanonicalRecordKind.AUTHORIZATION:
         return (record.authorization_id.raw_sha256.value,)
     if record_kind is CanonicalRecordKind.TASK:
@@ -1356,6 +1418,7 @@ def _index(values: object, kind: CanonicalRecordKind, name: str) -> tuple:
 class CanonicalStateRootManifest:
     format_version: str
     predecessor_state_root: GitSha | None
+    contract_index: tuple[CanonicalIndexEntry, ...]
     authorization_index: tuple[CanonicalIndexEntry, ...]
     task_index: tuple[CanonicalIndexEntry, ...]
     candidate_index: tuple[CanonicalIndexEntry, ...]
@@ -1367,11 +1430,12 @@ class CanonicalStateRootManifest:
     supersession_index: tuple[CanonicalIndexEntry, ...]
 
     def __post_init__(self) -> None:
-        if self.format_version != "1":
+        if self.format_version != "2":
             raise ValueError("unsupported canonical root format")
         if self.predecessor_state_root is not None and type(self.predecessor_state_root) is not GitSha:
             raise TypeError("predecessor_state_root has wrong exact type")
         for values, kind, name in (
+            (self.contract_index, CanonicalRecordKind.CONTRACT, "contract_index"),
             (self.authorization_index, CanonicalRecordKind.AUTHORIZATION, "authorization_index"),
             (self.task_index, CanonicalRecordKind.TASK, "task_index"),
             (self.candidate_index, CanonicalRecordKind.CANDIDATE, "candidate_index"),
@@ -1387,7 +1451,7 @@ class CanonicalStateRootManifest:
     @property
     def indexes(self) -> tuple[tuple[CanonicalIndexEntry, ...], ...]:
         return tuple(getattr(self, name) for name in (
-            "authorization_index", "task_index", "candidate_index", "operation_index",
+            "contract_index", "authorization_index", "task_index", "candidate_index", "operation_index",
             "task_operation_membership_index", "review_attempt_binding_index",
             "evidence_index", "evidence_history_index", "supersession_index",
         ))
@@ -1414,6 +1478,7 @@ def validate_canonical_root(
     try:
         validator = InMemoryCanonicalStateBackend(resolved_targets)
         state = _State(
+            {record.contract_id: record for record in decoded[CanonicalRecordKind.CONTRACT]},
             {record.authorization_id: record for record in decoded[CanonicalRecordKind.AUTHORIZATION]},
             {record.task_id: record for record in decoded[CanonicalRecordKind.TASK]},
             {record.candidate_id: record for record in decoded[CanonicalRecordKind.CANDIDATE]},
@@ -1426,11 +1491,11 @@ def validate_canonical_root(
         )
         if any(len(namespace) != len(decoded[kind]) for namespace, kind in zip(
             (
-                state.authorizations, state.tasks, state.candidates, state.operations,
+                state.contracts, state.authorizations, state.tasks, state.candidates, state.operations,
                 state.memberships, state.attempts, state.evidence, state.histories,
                 state.supersessions,
             ),
-            CanonicalRecordKind,
+            CANONICAL_ROOT_KIND_ORDER,
         )):
             return False
         return validator._valid_graph(state)
@@ -1460,7 +1525,7 @@ def _decode_canonical_root_objects(
     if len(set(claimed)) != len(claimed):
         return None
     decoded_by_kind: dict[CanonicalRecordKind, list[object]] = {
-        kind: [] for kind in CanonicalRecordKind
+        kind: [] for kind in CANONICAL_ROOT_KIND_ORDER
     }
     for entry in (entry for index in manifest.indexes for entry in index):
         reference = entry.object_ref
