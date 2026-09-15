@@ -10,6 +10,7 @@ from autodev_control.trusted.backend import (
     CanonicalNamespace, CanonicalStateRootManifest, CanonicalTransaction,
     CanonicalWriteStatus, CreateContract, InMemoryCanonicalStateBackend,
 )
+import autodev_control.trusted.contract as contract_module
 from autodev_control.trusted.contract import *
 from autodev_control.trusted.decision import Decision
 from autodev_control.trusted.errors import IssueContractAdmissionReasonCode, IssueContractFailure, IssueContractFailureCode
@@ -266,6 +267,38 @@ def test_duplicate_global_identities_are_rejected_after_values(mutation):
     assert load_candidate_issue_contract(raw_bytes(value)).code is IssueContractFailureCode.DUPLICATE_IDENTITY
 
 
+def test_scope_rule_array_duplicates_are_accepted_but_rule_change_type_duplicates_are_not():
+    value = raw_value()
+    allowed = dict(value["scope"]["allowed_changes"][0])
+    value["scope"]["allowed_changes"].append(allowed)
+    prohibited = {
+        "selector": {"kind": "exact_path", "path": "blocked.py"},
+        "change_types": ["modify"],
+    }
+    value["scope"]["prohibited_changes"] = [prohibited, dict(prohibited)]
+    candidate = load_candidate_issue_contract(raw_bytes(value))
+    assert type(candidate) is CandidateIssueContract
+    assert len(candidate.allowed_mutation_scope.rules) == 1
+    assert len(candidate.prohibited_mutation_scope.rules) == 1
+
+    value = raw_value()
+    value["scope"]["allowed_changes"][0]["change_types"] = ["modify", "modify"]
+    assert load_candidate_issue_contract(raw_bytes(value)).code is IssueContractFailureCode.DUPLICATE_IDENTITY
+
+
+@pytest.mark.parametrize("max_depth", [65, 1_000_000])
+def test_positive_delegation_depth_has_no_implementation_only_schema_ceiling(max_depth):
+    value = raw_value()
+    value["delegation_limits"] = {
+        "max_depth": max_depth,
+        "delegable_operations": ["implementation"],
+        "risk_ceiling": "routine",
+    }
+    candidate = load_candidate_issue_contract(raw_bytes(value))
+    assert type(candidate) is CandidateIssueContract
+    assert candidate.delegation_limits.max_depth == max_depth
+
+
 def test_required_empty_and_cross_field_rules_are_exact():
     empty = raw_value(requested_operations=[])
     assert load_candidate_issue_contract(raw_bytes(empty)).code is IssueContractFailureCode.EMPTY_REQUIRED_SET
@@ -360,6 +393,61 @@ def test_config_freshness_rebinding_and_base_movement_are_closed():
     assert rebound.outcome is IssueContractApplicabilityCode.CONFIG_BINDING_CHANGED
     fresh_same = applicability_context(contract, epoch=LATER_EPOCH, evaluator_epoch=LATER_EPOCH)
     assert evaluate_issue_contract_applicability(contract, fresh_same).outcome is IssueContractApplicabilityCode.APPLICABLE
+
+
+def test_current_schema_epoch_mismatch_denies_instead_of_escalating():
+    _, contract = admitted()
+    current = applicability_context(contract, epoch=LATER_EPOCH, evaluator_epoch=LATER_EPOCH)
+    object.__setattr__(current.schema_binding, "policy_epoch_identity", EPOCH)
+    result = evaluate_issue_contract_applicability(contract, current)
+    assert result.decision is Decision.DENY
+    assert result.outcome is IssueContractApplicabilityCode.SCHEMA_BINDING_MISMATCH
+
+
+def test_current_indeterminate_root_context_escalates():
+    _, contract = admitted()
+    indeterminate_root = mint(
+        TrustedContractRootContext,
+        policy_epoch_identity=EPOCH,
+        repository_id=REPOSITORY,
+        root_protected_mutation_scope=MutationScope(()),
+        determinate=False,
+    )
+    result = evaluate_issue_contract_applicability(
+        contract, applicability_context(contract, root_value=indeterminate_root),
+    )
+    assert result.decision is Decision.ESCALATE
+    assert result.outcome is IssueContractApplicabilityCode.ROOT_CONTEXT_UNAVAILABLE
+
+
+def test_current_indeterminate_root_overlap_escalates(monkeypatch):
+    _, contract = admitted()
+    monkeypatch.setattr(
+        contract_module,
+        "evaluate_effective_root_overlap",
+        lambda *_: EffectiveRootOverlap.INDETERMINATE,
+    )
+    result = evaluate_issue_contract_applicability(contract, applicability_context(contract))
+    assert result.decision is Decision.ESCALATE
+    assert result.outcome is IssueContractApplicabilityCode.ROOT_CONTEXT_UNAVAILABLE
+
+
+def test_current_proven_root_overlap_denies():
+    _, contract = admitted()
+    overlapping_root = mint(
+        TrustedContractRootContext,
+        policy_epoch_identity=EPOCH,
+        repository_id=REPOSITORY,
+        root_protected_mutation_scope=MutationScope((MutationScopeRule(
+            ExactPathSelector(CanonicalGitPath("src/app.py")), (ChangeType.MODIFY,),
+        ),)),
+        determinate=True,
+    )
+    result = evaluate_issue_contract_applicability(
+        contract, applicability_context(contract, root_value=overlapping_root),
+    )
+    assert result.decision is Decision.DENY
+    assert result.outcome is IssueContractApplicabilityCode.ROOT_SCOPE_OVERLAP
 
 
 def test_evaluator_parameter_mechanism_and_prerequisite_fail_closed():

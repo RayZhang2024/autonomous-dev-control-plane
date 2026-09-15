@@ -78,6 +78,7 @@ class EffectiveRootOverlap(Enum):
 class IssueContractApplicabilityCode(Enum):
     APPLICABLE = "APPLICABLE"
     UNSUPPORTED_SCHEMA_BINDING = "UNSUPPORTED_SCHEMA_BINDING"
+    SCHEMA_BINDING_MISMATCH = "SCHEMA_BINDING_MISMATCH"
     TARGET_CONTEXT_UNAVAILABLE = "TARGET_CONTEXT_UNAVAILABLE"
     TARGET_REGISTRATION_MISMATCH = "TARGET_REGISTRATION_MISMATCH"
     TARGET_POLICY_EPOCH_MISMATCH = "TARGET_POLICY_EPOCH_MISMATCH"
@@ -646,6 +647,23 @@ def _scope_value(value: tuple) -> ParsedMutationScope | IssueContractFailure:
     return parsed
 
 
+def _scope_has_duplicate_change_types(value: tuple) -> bool:
+    """Keep scope-rule array multiplicity separate from rule-local uniqueness."""
+    return any(len(item["change_types"]) != len(set(item["change_types"])) for item in value)
+
+
+def _canonical_contract_scope(parsed: ParsedMutationScope) -> MutationScope:
+    """Project schema-permitted repeated scope rules into G3's set-valued algebra."""
+    rules: list[MutationScopeRule] = []
+    seen: set[tuple[object, frozenset[ChangeType]]] = set()
+    for rule in parsed.rules:
+        key = rule.semantic_key()
+        if key not in seen:
+            seen.add(key)
+            rules.append(rule)
+    return MutationScope(tuple(rules))
+
+
 def load_candidate_issue_contract(raw: object) -> CandidateIssueContract | IssueContractFailure:
     if type(raw) is not bytes:
         return _failure(IssueContractFailureCode.INVALID_INPUT_TYPE)
@@ -751,7 +769,7 @@ def load_candidate_issue_contract(raw: object) -> CandidateIssueContract | Issue
             return _failure(IssueContractFailureCode.INVALID_FIELD_VALUE)
         approvals.append(CandidateHumanApprovalRequirement(approval_id, before, approval_ref))
     depth = _integer(delegation_value["max_depth"])
-    if depth is None or not 0 <= depth <= 64 or len(delegation_value["delegable_operations"]) > 16:
+    if depth is None or depth < 0 or len(delegation_value["delegable_operations"]) > 16:
         return _failure(IssueContractFailureCode.INVALID_FIELD_VALUE)
     delegable: list[TaskCapability] = []
     try:
@@ -769,7 +787,11 @@ def load_candidate_issue_contract(raw: object) -> CandidateIssueContract | Issue
         tuple(item.approval_id for item in approvals),
         tuple(delegable),
     )
-    if allowed.has_duplicates or prohibited.has_duplicates or any(len(items) != len(set(items)) for items in identity_sets):
+    if (
+        _scope_has_duplicate_change_types(scope_value["allowed_changes"])
+        or _scope_has_duplicate_change_types(scope_value["prohibited_changes"])
+        or any(len(items) != len(set(items)) for items in identity_sets)
+    ):
         return _failure(IssueContractFailureCode.DUPLICATE_IDENTITY)
 
     # Cross-field consistency is intentionally last.
@@ -789,7 +811,8 @@ def load_candidate_issue_contract(raw: object) -> CandidateIssueContract | Issue
         source_document=document, schema_version=value["schema_version"], contract_id=contract_id,
         task_id=task_id, context_anchor=IssueContextAnchor(repository_id, issue_number, issue_id),
         objective=value["objective"], target=ContractTargetBinding(target_ref, base_ref, base_sha, integration_ref),
-        allowed_mutation_scope=MutationScope(allowed.rules), prohibited_mutation_scope=MutationScope(prohibited.rules),
+        allowed_mutation_scope=_canonical_contract_scope(allowed),
+        prohibited_mutation_scope=_canonical_contract_scope(prohibited),
         requested_operations=requested, risk_floor=risk_floor, acceptance_requirements=tuple(requirements),
         runtime_profile_ids=tuple(runtime_profiles), repair_max_attempts=repair_max,
         human_approval_requirements=tuple(approvals),
@@ -1073,7 +1096,11 @@ def evaluate_issue_contract_applicability(
         raise TypeError("canonical contract and assembled applicability context required")
     epoch = current_context.policy_epoch_identity
     schema = current_context.schema_binding
-    if epoch is None or schema is None or schema.policy_epoch_identity != epoch or not _schema_supported(schema):
+    if epoch is None or schema is None:
+        return _applicability_result(IssueContractApplicabilityCode.UNSUPPORTED_SCHEMA_BINDING)
+    if schema.policy_epoch_identity != epoch:
+        return _applicability_result(IssueContractApplicabilityCode.SCHEMA_BINDING_MISMATCH)
+    if not _schema_supported(schema):
         return _applicability_result(IssueContractApplicabilityCode.UNSUPPORTED_SCHEMA_BINDING)
     if (
         schema.schema_resource.resource_id != contract.schema_resource_id
@@ -1093,10 +1120,15 @@ def evaluate_issue_contract_applicability(
         return _applicability_result(IssueContractApplicabilityCode.ROOT_CONTEXT_UNAVAILABLE)
     if root.policy_epoch_identity != epoch or root.repository_id != target.repository_id:
         return _applicability_result(IssueContractApplicabilityCode.ROOT_CONTEXT_BINDING_MISMATCH)
-    if not root.determinate or evaluate_effective_root_overlap(
+    if not root.determinate:
+        return _applicability_result(IssueContractApplicabilityCode.ROOT_CONTEXT_UNAVAILABLE)
+    root_overlap = evaluate_effective_root_overlap(
         contract.allowed_mutation_scope, contract.prohibited_mutation_scope,
         root.root_protected_mutation_scope,
-    ) is not EffectiveRootOverlap.PROVEN_DISJOINT:
+    )
+    if root_overlap is EffectiveRootOverlap.INDETERMINATE:
+        return _applicability_result(IssueContractApplicabilityCode.ROOT_CONTEXT_UNAVAILABLE)
+    if root_overlap is EffectiveRootOverlap.EFFECTIVE_OVERLAP:
         return _applicability_result(IssueContractApplicabilityCode.ROOT_SCOPE_OVERLAP)
     base = current_context.base_observation
     if base is None:
