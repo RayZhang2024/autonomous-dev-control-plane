@@ -64,7 +64,7 @@ def response_for(request, **changes):
     elif type(request) is ReadCommitAncestry:
         value = {"repository_id": request.repository_id.value, "ancestor": request.ancestor.value, "descendant": request.descendant.value, "result": "ANCESTOR"}
     elif type(request) is ReadIssueIdentity:
-        value = {"repository_id": request.repository_id.value, "number": request.issue_number.value, "state": "open", "title": "prose", "body": "prose", "labels": ["blocked"], "comments": ["completed"]}
+        value = {"repository_id": request.repository_id.value, "number": request.issue_number.value, "issue_id": "platform-issue-16", "state": "open", "title": "prose", "body": "prose", "labels": ["blocked"], "comments": ["completed"]}
     elif type(request) is ReadPullRequest:
         value = {
             "repository_id": request.repository_id.value, "number": request.pull_request_number.value,

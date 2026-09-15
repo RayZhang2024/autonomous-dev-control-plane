@@ -274,6 +274,17 @@ def test_authorization_loader_exact_identity_kind_and_precedence() -> None:
     assert load_candidate_authorization_proposal(json.dumps(forbidden).encode()).code is AuthorizationProposalFailureCode.UNKNOWN_FIELD
 
 
+def test_target_publish_contract_ceiling_does_not_bypass_later_target_authorization_ceiling():
+    target = admitted_target(capabilities=["implementation"])
+    value = proposal_json(target.target_registration_id)
+    value["capabilities"] = ["target_publish"]
+    proposal = load_candidate_authorization_proposal(json.dumps(value).encode())
+    assert type(proposal) is CandidateAuthorizationProposal
+    contract, policy, approval, issuer, root = direct_contexts(proposal, target)
+    result = admit_direct_authorization(proposal, target, contract, policy, approval, issuer, root)
+    assert result.reason_code is AuthorizationAdmissionReasonCode.CAPABILITY_NOT_PERMITTED
+
+
 def test_loader_duplicate_and_operational_zero_depth_consistency() -> None:
     target = admitted_target()
     value = proposal_json(target.target_registration_id)

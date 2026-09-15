@@ -304,13 +304,17 @@ class GitHubStateNormalizer:
 
     @staticmethod
     def _issue(request, response):
-        required = {"repository_id", "number", "state", "title", "body", "labels", "comments"}
+        required = {"repository_id", "number", "issue_id", "state", "title", "body", "labels", "comments"}
         if set(response) != required or response["number"] != request.issue_number.value:
             return GitHubNormalizationResult(failure=StateReadFailure.MISMATCH)
         if response["state"] not in ("open", "closed") or type(response["title"]) is not str or type(response["body"]) is not str or type(response["labels"]) is not list or type(response["comments"]) is not list:
             return GitHubNormalizationResult(failure=StateReadFailure.MALFORMED_RESPONSE)
-        # Prose, labels and comments are deliberately excluded from control facts.
-        return _ok(f"issue:{request.issue_number.value}", (request.repository_id.value, request.issue_number.value, response["state"]))
+        issue_id = LogicalIdentifier(response["issue_id"])
+        # Mutable state, prose, labels and comments are deliberately excluded.
+        return _ok(
+            f"issue:{request.issue_number.value}",
+            (request.repository_id.value, request.issue_number.value, issue_id.value),
+        )
 
     @staticmethod
     def _pull_request(request, response):
