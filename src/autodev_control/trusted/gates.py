@@ -640,9 +640,22 @@ class DeterministicTrustedController:
         contract = self._backend.read_contract(task.contract_id)
         if contract is None or contract.contract_raw_sha256 != task.contract_raw_sha256:
             raise ValueError("canonical task contract is unavailable")
+        resolved_target = self._backend.read_resolved_target_registration(
+            task.target_registration_id
+        )
+        if (
+            resolved_target is None
+            or resolved_target.target_registration_id != task.target_registration_id
+            or resolved_target.registration.target_registration_id != task.target_registration_id
+            or resolved_target.policy_epoch_identity
+            != task.last_evaluated_policy_epoch_identity
+            or resolved_target.registration.policy_epoch_identity
+            != task.last_evaluated_policy_epoch_identity
+        ):
+            raise ValueError("canonical resolved target registration is unavailable")
         context = object.__new__(TrustedCandidateMaterializationContext)
         for name, value in (
-            ("repository_id", contract.context_anchor.repository_id), ("task_id", task.task_id),
+            ("repository_id", resolved_target.registration.repository_id), ("task_id", task.task_id),
             ("contract_id", task.contract_id), ("contract_raw_sha256", task.contract_raw_sha256),
             ("authorization_id", task.authorization_id),
             ("target_registration_id", task.target_registration_id),

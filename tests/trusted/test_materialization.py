@@ -118,6 +118,76 @@ def test_issue30_observation_provenance_does_not_change_admitted_materialization
     assert one.admitted_materialization == two.admitted_materialization
 
 
+@pytest.mark.parametrize(("unavailable", "reason"), [
+    (sha("a"), CandidateMaterializationAdmissionReason.BASE_COMMIT_UNAVAILABLE),
+    (sha("b"), CandidateMaterializationAdmissionReason.CANDIDATE_COMMIT_UNAVAILABLE),
+    (sha("d"), CandidateMaterializationAdmissionReason.BASE_TREE_UNAVAILABLE),
+    (sha("e"), CandidateMaterializationAdmissionReason.CANDIDATE_TREE_UNAVAILABLE),
+])
+def test_issue30_required_unavailable_observations_are_indeterminate_without_binding(unavailable, reason):
+    result = admit_candidate_materialization(
+        store=observed_store(unavailable=frozenset((unavailable,))),
+        context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert (result.status, result.reason) == (
+        CandidateMaterializationAdmissionStatus.INDETERMINATE, reason,
+    )
+    assert result.admitted_materialization is None
+    assert result.git_object_observation_binding_id is None
+
+
+def test_issue30_provider_failure_and_observation_conflict_are_indeterminate_without_binding():
+    provider = admit_candidate_materialization(
+        store=observed_store(provider_failure=True), context=trusted_context(),
+        candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert (provider.status, provider.reason, provider.git_object_observation_binding_id) == (
+        CandidateMaterializationAdmissionStatus.INDETERMINATE,
+        CandidateMaterializationAdmissionReason.OBSERVATION_PROVIDER_FAILURE, None,
+    )
+    base, candidate, tree = sha("a"), sha("b"), sha("d")
+    conflict = FixtureGitObjectStore(
+        GitHubRepositoryId("1"),
+        (FixtureGitCommit(base, (), tree), FixtureGitCommit(candidate, (base,), tree)),
+        (FixtureGitTree(tree, (FixtureGitTreeEntry("loop", GitObjectKind.TREE, "040000", tree),)),),
+    )
+    result = admit_candidate_materialization(
+        store=conflict, context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=candidate,
+    )
+    assert (result.status, result.reason, result.git_object_observation_binding_id) == (
+        CandidateMaterializationAdmissionStatus.INDETERMINATE,
+        CandidateMaterializationAdmissionReason.OBSERVATION_CONFLICT, None,
+    )
+
+
+@pytest.mark.parametrize(("entry_value", "reason"), [
+    (FixtureGitTreeEntry("link", GitObjectKind.SYMLINK, "120000", sha("1")), CandidateMaterializationAdmissionReason.TREE_OBJECT_UNSUPPORTED),
+    (FixtureGitTreeEntry("submodule", GitObjectKind.GITLINK, "160000", sha("1")), CandidateMaterializationAdmissionReason.TREE_OBJECT_UNSUPPORTED),
+    (FixtureGitTreeEntry("bad-mode", GitObjectKind.BLOB, "100600", sha("1")), CandidateMaterializationAdmissionReason.TREE_MODE_UNSUPPORTED),
+])
+def test_issue30_unsupported_leaf_truth_is_denied_after_complete_observation(entry_value, reason):
+    result = admit_candidate_materialization(
+        store=observed_store(candidate_entries=(entry_value,)), context=trusted_context(),
+        candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert (result.status, result.reason) == (CandidateMaterializationAdmissionStatus.DENIED, reason)
+    assert result.git_object_observation_binding_id is None
+
+
+def test_issue30_duplicate_normalized_path_is_denied_and_caller_values_cannot_enter_inventory():
+    result = admit_candidate_materialization(
+        store=observed_store(candidate_entries=(
+            FixtureGitTreeEntry("same", GitObjectKind.BLOB, "100644", sha("1")),
+            FixtureGitTreeEntry("same", GitObjectKind.BLOB, "100644", sha("2")),
+        )), context=trusted_context(), candidate_id=CandidateId("c"), candidate_commit_id=sha("b"),
+    )
+    assert (result.status, result.reason) == (
+        CandidateMaterializationAdmissionStatus.DENIED,
+        CandidateMaterializationAdmissionReason.TREE_PATH_DUPLICATE,
+    )
+    assert result.admitted_materialization is None
+
+
 def test_empty_tree_delta_is_deterministic():
     assert derive_mutation_inventory((), ()) == derive_mutation_inventory((), ())
 

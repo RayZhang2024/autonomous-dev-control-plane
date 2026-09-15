@@ -2,7 +2,7 @@ import pickle
 import inspect
 import threading
 import hashlib
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -327,6 +327,63 @@ def test_issue30_recording_is_nonprogressing_and_adoption_resolves_canonical_pai
     )
     assert ControlStateGate(value).commit(adopt, independent_lease(value)).code is GateResultCode.COMMITTED
     assert value.backend.read_task_working_set(TASK).task.current_candidate_id == candidate.candidate_id
+
+
+def test_issue30_recording_binds_repository_to_resolved_target_not_issue_anchor():
+    issue_repository = GitHubRepositoryId("2")
+    _, issue_raw, issue_contract = canonical_contract_fixture(
+        contract_id=CONTRACT, task_id=TASK, target_registration_id=TARGET,
+        repository_id=issue_repository, policy_epoch_identity=EPOCH, base_sha=SHA,
+        allowed_repository_scope=True,
+    )
+    value = runtime(object_store=candidate_truth_store())
+    admitted = authorization()
+    issue_authorization = mint(
+        AdmittedAuthorization,
+        **{
+            name: issue_raw if name == "contract_raw_sha256" else getattr(admitted, name)
+            for name in admitted.__dataclass_fields__
+        },
+    )
+    assert value.backend.apply(CanonicalTransaction(
+        value.backend.occurrence, (), (
+            CreateContract(issue_contract),
+            CreateAuthorization(issue_authorization),
+        ),
+    )).status is CanonicalWriteStatus.APPLIED
+    create = value.boundary.create_task(
+        task_id=TASK, contract_id=CONTRACT, contract_raw_sha256=issue_raw,
+        authorization_id=AUTH, admission_event_id=ADMISSION,
+        target_registration_id=TARGET, policy_epoch_identity=EPOCH,
+        repair_budget=RepairBudget(2),
+    )
+    assert ControlStateGate(value).commit(
+        create, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+    recorded = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=CandidateId("target-repository"),
+        candidate_commit_id=GitSha("b" * 40),
+    )
+    assert ControlStateGate(value).commit(
+        recorded, independent_lease(value)
+    ).code is GateResultCode.COMMITTED
+    candidate = value.backend.read_candidate(CandidateId("target-repository"))
+    assert candidate is not None
+    materialization = value.backend.read_candidate_materialization(candidate.materialization_id)
+    assert materialization is not None
+    assert materialization.repository_id == REPO
+
+    target_store = candidate_truth_store()
+    issue_store = FixtureGitObjectStore(
+        issue_repository, target_store.commits, target_store.trees,
+    )
+    value._object_store = issue_store
+    value.controller._object_store = issue_store
+    with pytest.raises(ValueError, match="REPOSITORY_MISMATCH"):
+        value.boundary.record_candidate_truth(
+            task_id=TASK, candidate_id=CandidateId("issue-repository"),
+            candidate_commit_id=GitSha("b" * 40),
+        )
 
 
 def test_admit_contract_uses_controller_gate_cas_and_exact_authoritative_dependencies():
