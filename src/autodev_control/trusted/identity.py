@@ -71,6 +71,17 @@ class CandidateMaterializationId:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticEvaluatorResolutionId:
+    """Content address of one exact, derived semantic evaluator declaration."""
+
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
 class MutationInventoryId:
     raw_sha256: RawSha256
 

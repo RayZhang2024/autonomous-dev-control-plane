@@ -52,6 +52,14 @@ from .operation import (
 )
 from .parsing import ParseLimits, ParsedJsonDocument, parse_trusted_json
 from .resources import resolve_trusted_json_resource, verify_inline_resource_bytes
+from .semantic_config import (
+    SemanticEvaluatorConfigResolutionReason,
+    SemanticEvaluatorConfigResolutionResult,
+    SemanticEvaluatorConfigResolutionStatus,
+    SemanticReviewContextRequirement,
+    TrustedSemanticEvaluatorResolution,
+    resolve_semantic_evaluator_config,
+)
 from .review import (
     RawSemanticVerdict,
     ReviewEligibilityResult,
@@ -158,6 +166,11 @@ __all__ = [
     "IssueContractAdmissionResult",
     "IssueContractApplicabilityResult",
     "TrustedConfigIdentity",
+    "TrustedSemanticEvaluatorResolution",
+    "SemanticEvaluatorConfigResolutionResult",
+    "SemanticEvaluatorConfigResolutionStatus",
+    "SemanticEvaluatorConfigResolutionReason",
+    "SemanticReviewContextRequirement",
     "CanonicalReviewEligibilitySnapshot",
     "CanonicalStateOccurrenceBinding",
     "CanonicalStateRootManifest",
@@ -217,6 +230,7 @@ __all__ = [
     "transition_operation",
     "validate_review_verdict_v1",
     "verify_inline_resource_bytes",
+    "resolve_semantic_evaluator_config",
     "encode_contract_json_value",
     "contract_json_value_digest",
     "derive_contract_authority_ceiling",
