@@ -80,6 +80,15 @@ class MutationInventoryId:
 
 
 @dataclass(frozen=True, slots=True)
+class GitObjectObservationBindingId:
+    raw_sha256: RawSha256
+
+    def __post_init__(self) -> None:
+        if type(self.raw_sha256) is not RawSha256:
+            raise TypeError("raw_sha256 must be exactly RawSha256")
+
+
+@dataclass(frozen=True, slots=True)
 class OperationStartBindingId:
     raw_sha256: RawSha256
 

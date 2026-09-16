@@ -1,8 +1,10 @@
 from dataclasses import FrozenInstanceError, fields, replace
 import hashlib
 import json
+from typing import get_args
 
 import pytest
+import autodev_control.trusted.backend as backend_module
 
 from autodev_control.trusted.authorization import (
     AdmittedAuthorization, AuthorizationOperationalConstraints, DelegationAllowance,
@@ -15,7 +17,16 @@ from autodev_control.trusted.evidence import (
     TrustedSupersessionAuthorization, build_evidence_supersession_record,
 )
 from autodev_control.trusted.identity import CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256
+from autodev_control.trusted.materialization import (
+    FixtureGitCommit, FixtureGitObjectStore, FixtureGitTree, FixtureGitTreeEntry,
+    GitObjectKind, TrustedCandidateMaterializationContext,
+    admitted_candidate_materialization_is_valid, admit_candidate_materialization,
+    create_admitted_candidate_record,
+)
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
+from autodev_control.trusted.gates import (
+    DeterministicTrustedController, TrustedControlCommandKind,
+)
 from autodev_control.trusted.operation import (
     AdmissionEventId, AuthoritativeStateBindingId, EvidenceId, IntegrationBound,
     NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
@@ -34,7 +45,6 @@ from autodev_control.trusted.state import (
     initial_task_proposal,
 )
 
-MAT = CandidateMaterializationId(RawSha256("6" * 64))
 from autodev_control.trusted.target_registration import AdmittedTargetRegistration
 from tests.trusted.contract_fixtures import canonical_contract_fixture
 
@@ -181,10 +191,65 @@ def initialized_backend(*, task_epoch=EPOCH):
     return store
 
 
+def admitted_candidate_pair(candidate_id=CandidateId("candidate"), *,
+                            parents=(), creation_operation_id=None, variant="", observation="0",
+                            include_admission=False):
+    """Build an admitted C/M pair through the production observation boundary."""
+    suffix = hashlib.sha256((candidate_id.value + variant).encode("utf-8")).hexdigest()
+    candidate_commit = GitSha(suffix[:40])
+    base_tree = GitSha("d" * 40)
+    candidate_tree = GitSha("e" * 40)
+    store = FixtureGitObjectStore(
+        REPOSITORY,
+        (
+            FixtureGitCommit(BASE, (), base_tree),
+            FixtureGitCommit(candidate_commit, (BASE,), candidate_tree),
+        ),
+        (
+            FixtureGitTree(base_tree, ()),
+            FixtureGitTree(
+                candidate_tree,
+                (FixtureGitTreeEntry(
+                    "candidate-" + candidate_id.value + ".txt",
+                    GitObjectKind.BLOB, "100644", GitSha("c" * 40),
+                ),),
+            ),
+        ),
+        observation_instance_id=RawSha256(observation * 64),
+    )
+    context = object.__new__(TrustedCandidateMaterializationContext)
+    for name, value in {
+        "repository_id": REPOSITORY,
+        "task_id": TASK,
+        "contract_id": CONTRACT,
+        "contract_raw_sha256": RAW,
+        "authorization_id": AUTH,
+        "target_registration_id": TARGET,
+        "policy_epoch_identity": EPOCH,
+        "base_commit": BASE,
+    }.items():
+        object.__setattr__(context, name, value)
+    admitted = admit_candidate_materialization(
+        store=store, context=context, candidate_id=candidate_id,
+        candidate_commit_id=candidate_commit,
+    )
+    assert admitted.admitted_materialization is not None
+    candidate = create_admitted_candidate_record(
+        materialization=admitted.admitted_materialization, admission_event_id=ADMISSION,
+        parent_candidate_ids=parents, creation_operation_id=creation_operation_id,
+    )
+    if include_admission:
+        return candidate, admitted.admitted_materialization, admitted
+    return candidate, admitted.admitted_materialization
+
+
 def adopt_canonical_candidate(store):
-    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
+    candidate, materialization = admitted_candidate_pair()
     evaluating = replace(task(), revision=2, state=TaskState.EVALUATING, current_candidate_id=candidate.candidate_id)
-    assert apply(store, ReplaceTask(1, evaluating), CreateCandidate(candidate)).status is CanonicalWriteStatus.APPLIED
+    assert apply(
+        store, ReplaceTask(1, evaluating),
+        CreateCandidateWithMaterialization(candidate, materialization),
+    ).status is CanonicalWriteStatus.APPLIED
     return candidate
 
 
@@ -288,33 +353,181 @@ def test_membership_cannot_omit_any_existing_same_task_operation():
 
 def test_candidate_and_current_candidate_closure_and_same_transaction_reference():
     store = initialized_backend()
-    candidate = CandidateRecord(CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
+    candidate, materialization = admitted_candidate_pair()
     evaluating = replace(task(), revision=2, state=TaskState.EVALUATING, current_candidate_id=candidate.candidate_id)
-    assert apply(store, ReplaceTask(1, evaluating), CreateCandidate(candidate)).status is CanonicalWriteStatus.APPLIED
+    assert apply(
+        store, ReplaceTask(1, evaluating),
+        CreateCandidateWithMaterialization(candidate, materialization),
+    ).status is CanonicalWriteStatus.APPLIED
     assert store.read_task_working_set(TASK).candidate == candidate
 
-    bad = CandidateRecord(CandidateId("bad"), TASK, BASE, ContractId("other"), RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
-    assert apply(store, CreateCandidate(bad)).status is CanonicalWriteStatus.INVALID_TRANSACTION
+    bad = replace(candidate, candidate_id=CandidateId("bad"), contract_id=ContractId("other"))
+    assert apply(
+        store, CreateCandidateWithMaterialization(bad, materialization),
+    ).status is CanonicalWriteStatus.INVALID_TRANSACTION
 
 
 def test_candidate_parent_and_creation_operation_must_resolve():
     store = initialized_backend()
-    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, (CandidateId("missing"),), OperationId("missing"))
-    assert apply(store, CreateCandidate(child)).status is CanonicalWriteStatus.INVALID_TRANSACTION
+    child, materialization = admitted_candidate_pair(
+        CandidateId("child"), parents=(CandidateId("missing"),),
+        creation_operation_id=OperationId("missing"),
+    )
+    assert apply(
+        store, CreateCandidateWithMaterialization(child, materialization),
+    ).status is CanonicalWriteStatus.INVALID_TRANSACTION
 
 
 def test_candidate_parent_and_creation_operation_can_resolve_in_complete_same_transaction_graph():
     store = initialized_backend()
     membership = store.read_task_working_set(TASK).task_operation_membership
     creation = operation("candidate-creation")
-    parent = CandidateRecord(CandidateId("parent"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
-    child = CandidateRecord(CandidateId("child"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, (parent.candidate_id,), creation.intent.operation_id)
+    parent, parent_materialization = admitted_candidate_pair(CandidateId("parent"))
+    child, child_materialization = admitted_candidate_pair(
+        CandidateId("child"), parents=(parent.candidate_id,),
+        creation_operation_id=creation.intent.operation_id,
+    )
     assert apply(
         store,
-        CreateCandidate(child),
+        CreateCandidateWithMaterialization(child, child_materialization),
         CreateOperationAndAdvanceMembership(creation, 1, membership.membership_binding_id),
-        CreateCandidate(parent),
+        CreateCandidateWithMaterialization(parent, parent_materialization),
     ).status is CanonicalWriteStatus.APPLIED
+
+
+def test_issue30_closed_admitted_materialization_and_standalone_candidate_surfaces():
+    with pytest.raises(TypeError):
+        AdmittedCandidateMaterialization()
+    candidate, materialization = admitted_candidate_pair()
+    with pytest.raises(TypeError):
+        CreateCandidate(candidate)
+    assert CreateCandidate not in CanonicalMutation.__args__
+    assert CreateCandidateWithMaterialization in CanonicalMutation.__args__
+    assert not any(
+        "Materialization" in mutation.__name__ and mutation is not CreateCandidateWithMaterialization
+        for mutation in CanonicalMutation.__args__
+    )
+    assert type(materialization) is AdmittedCandidateMaterialization
+
+
+def test_issue30_candidate_truth_has_no_canonical_delete_or_gc_authority():
+    canonical_mutations = get_args(CanonicalMutation)
+    assert canonical_mutations == backend_module._MUTATION_TYPES
+    assert CreateCandidateWithMaterialization in canonical_mutations
+    assert CreateCandidate not in canonical_mutations
+    candidate_truth_mutations = tuple(
+        item for item in canonical_mutations
+        if "Candidate" in item.__name__ or "Materialization" in item.__name__
+    )
+    assert candidate_truth_mutations == (CreateCandidateWithMaterialization,)
+
+    candidate_commands = tuple(
+        item for item in TrustedControlCommandKind
+        if "CANDIDATE" in item.name or "MATERIALIZATION" in item.name
+    )
+    assert candidate_commands == (
+        TrustedControlCommandKind.RECORD_CANDIDATE_TRUTH,
+        TrustedControlCommandKind.ADOPT_CANDIDATE,
+    )
+
+    forbidden_surfaces = (
+        "delete_candidate", "delete_candidate_materialization",
+        "remove_candidate", "remove_candidate_materialization",
+        "gc_candidate", "gc_candidate_materialization", "retire_candidate",
+    )
+    assert all(not callable(getattr(DeterministicTrustedController, name, None))
+               for name in forbidden_surfaces)
+
+
+def test_issue30_exact_pair_replay_is_idempotent_and_preserves_occurrence():
+    store = initialized_backend()
+    candidate, materialization = admitted_candidate_pair()
+    before = store.occurrence
+    created = apply(store, CreateCandidateWithMaterialization(candidate, materialization))
+    assert created.status is CanonicalWriteStatus.APPLIED
+    assert store.occurrence != before
+    after = store.occurrence
+    replay = apply(store, CreateCandidateWithMaterialization(candidate, materialization))
+    assert replay.status is CanonicalWriteStatus.ALREADY_PRESENT
+    assert store.occurrence == after
+
+
+def test_issue30_candidate_id_collision_between_two_valid_admitted_pairs_fails_closed():
+    store = initialized_backend()
+    first_candidate, first_materialization = admitted_candidate_pair(
+        CandidateId("same-candidate"), variant="one",
+    )
+    second_candidate, second_materialization = admitted_candidate_pair(
+        CandidateId("same-candidate"), variant="two",
+    )
+    assert first_candidate.candidate_id == second_candidate.candidate_id
+    assert first_candidate != second_candidate
+    assert first_materialization != second_materialization
+    assert apply(
+        store, CreateCandidateWithMaterialization(first_candidate, first_materialization),
+    ).status is CanonicalWriteStatus.APPLIED
+    before = store.occurrence
+    assert apply(
+        store, CreateCandidateWithMaterialization(second_candidate, second_materialization),
+    ).status is CanonicalWriteStatus.IDENTITY_CONFLICT
+    assert store.occurrence == before
+    assert store.read_candidate(first_candidate.candidate_id) == first_candidate
+    assert store.read_candidate_materialization(first_materialization.materialization_id) == first_materialization
+    assert store.read_candidate_materialization(second_materialization.materialization_id) is None
+
+
+def test_issue30_same_materialization_id_forgery_is_rejected_before_canonical_write():
+    store = initialized_backend()
+    candidate, materialization = admitted_candidate_pair()
+    forged = object.__new__(AdmittedCandidateMaterialization)
+    for field in fields(materialization):
+        object.__setattr__(forged, field.name, getattr(materialization, field.name))
+    object.__setattr__(forged, "candidate_commit", GitSha("f" * 40))
+    assert not admitted_candidate_materialization_is_valid(forged)
+    result = apply(store, CreateCandidateWithMaterialization(candidate, forged))
+    assert result.status is CanonicalWriteStatus.INVALID_TRANSACTION
+    assert store.read_candidate(candidate.candidate_id) is None
+
+
+def test_issue30_provenance_independent_admission_replays_exact_canonical_pair():
+    store = initialized_backend()
+    candidate_a, materialization_a, admission_a = admitted_candidate_pair(
+        observation="1", include_admission=True,
+    )
+    candidate_b, materialization_b, admission_b = admitted_candidate_pair(
+        observation="2", include_admission=True,
+    )
+    assert admission_a.git_object_observation_binding_id != admission_b.git_object_observation_binding_id
+    assert materialization_a == materialization_b
+    assert materialization_a.materialization_id == materialization_b.materialization_id
+    assert materialization_a.mutation_inventory == materialization_b.mutation_inventory
+    assert apply(store, CreateCandidateWithMaterialization(candidate_a, materialization_a)).status is CanonicalWriteStatus.APPLIED
+    occurrence = store.occurrence
+    replay = apply(store, CreateCandidateWithMaterialization(candidate_b, materialization_b))
+    assert replay.status is CanonicalWriteStatus.ALREADY_PRESENT
+    assert replay.status is not CanonicalWriteStatus.IDENTITY_CONFLICT
+    assert store.occurrence == occurrence
+    assert store.read_candidate(candidate_a.candidate_id) == candidate_a
+    assert store.read_candidate_materialization(materialization_a.materialization_id) == materialization_a
+
+
+def test_issue30_admitted_materialization_round_trips_through_closed_canonical_root():
+    candidate, materialization = admitted_candidate_pair()
+    membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), ())
+    manifest, objects = canonical_root_for(
+        (CanonicalRecordKind.CONTRACT, CONTRACT_RECORD),
+        (CanonicalRecordKind.AUTHORIZATION, admitted_authorization()),
+        (CanonicalRecordKind.TASK, task()),
+        (CanonicalRecordKind.CANDIDATE, candidate),
+        (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
+    )
+    decoded = backend_module._decode_canonical_root_objects(manifest, objects)
+    assert decoded is not None
+    reconstructed = decoded[CanonicalRecordKind.CANDIDATE_MATERIALIZATION]
+    assert reconstructed == (materialization,)
+    assert canonical_record_bytes(CanonicalRecordKind.CANDIDATE_MATERIALIZATION, reconstructed[0]) == canonical_record_bytes(CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization)
+    assert validate_canonical_root(manifest, objects, (resolved_target(),))
 
 
 def test_next_integration_and_repair_budget_references_fail_closed_when_dangling():
@@ -558,6 +771,7 @@ def test_root_rejects_incomplete_or_structurally_forged_typed_records():
 
 def test_root_accepts_complete_exact_schema_for_every_supported_v2_record_kind():
     subject = effective_subject()
+    candidate, materialization = admitted_candidate_pair(subject.candidate_id)
     op = operation(candidate_id=subject.candidate_id)
     admitted_evidence = evidence(subject)
     earlier, later = EvidenceId("earlier"), EvidenceId("later")
@@ -572,7 +786,7 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v2_record_kind()
         CONTRACT_RECORD,
         admitted_authorization(),
         task(),
-        CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ()),
+        candidate,
         op,
         TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), (op.intent.operation_id,)),
         ReviewAttemptBindingRecord(
@@ -589,6 +803,7 @@ def test_root_accepts_complete_exact_schema_for_every_supported_v2_record_kind()
             authorized_reason=SupersessionReason.AUTHORIZED_ADJUDICATION,
             decision_id=SupersessionDecisionId("decision"), authorization=supersession_authorization,
         ),
+        materialization,
     )
     indexes, stored = [], []
     for kind, record in zip(CANONICAL_ROOT_KIND_ORDER, records):
@@ -646,24 +861,25 @@ def test_root_rejects_dangling_task_candidate_and_operation_references():
         )),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
     )
-    parent_missing = CandidateRecord(
-        CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
-        MAT, (CandidateId("missing-parent"),),
+    parent_missing, parent_missing_materialization = admitted_candidate_pair(
+        CandidateId("candidate"), parents=(CandidateId("missing-parent"),),
     )
+
     rejected(
         (CanonicalRecordKind.AUTHORIZATION, authorization),
         (CanonicalRecordKind.TASK, base_task),
         (CanonicalRecordKind.CANDIDATE, parent_missing),
+        (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, parent_missing_materialization),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
     )
-    creation_missing = CandidateRecord(
-        CandidateId("candidate"), TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH,
-        MAT, (), OperationId("missing-creation"),
+    creation_missing, creation_missing_materialization = admitted_candidate_pair(
+        CandidateId("candidate"), creation_operation_id=OperationId("missing-creation"),
     )
     rejected(
         (CanonicalRecordKind.AUTHORIZATION, authorization),
         (CanonicalRecordKind.TASK, base_task),
         (CanonicalRecordKind.CANDIDATE, creation_missing),
+        (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, creation_missing_materialization),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
     )
     evidence_missing = operation(evidence=(EvidenceId("missing-evidence"),))
@@ -676,6 +892,26 @@ def test_root_rejects_dangling_task_candidate_and_operation_references():
         (CanonicalRecordKind.OPERATION, evidence_missing),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, evidence_membership),
     )
+
+
+def test_issue30_reconstructed_candidate_only_materialization_only_and_mismatched_pairs_fail_graph():
+    candidate, materialization = admitted_candidate_pair()
+    membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("membership"), ())
+    base_records = (
+        (CanonicalRecordKind.CONTRACT, CONTRACT_RECORD),
+        (CanonicalRecordKind.AUTHORIZATION, admitted_authorization()),
+        (CanonicalRecordKind.TASK, task()),
+        (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
+    )
+    for extra in (
+        ((CanonicalRecordKind.CANDIDATE, candidate),),
+        ((CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization),),
+        ((CanonicalRecordKind.CANDIDATE, replace(candidate, base=GitSha("f" * 40))),
+         (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization)),
+    ):
+        manifest, objects = canonical_root_for(*base_records, *extra)
+        assert validate_canonical_root_object_integrity(manifest, objects)
+        assert not validate_canonical_root(manifest, objects, (resolved_target(),))
 
 
 def test_root_rejects_incomplete_operation_membership_and_review_binding_closure():
@@ -737,7 +973,7 @@ def test_root_rejects_incomplete_operation_membership_and_review_binding_closure
 def test_root_rejects_incomplete_evidence_history_and_supersession_closure():
     authorization, base_task = admitted_authorization(), task()
     subject = effective_subject()
-    candidate = CandidateRecord(subject.candidate_id, TASK, BASE, CONTRACT, RAW, AUTH, ADMISSION, TARGET, EPOCH, MAT, ())
+    candidate, materialization = admitted_candidate_pair(subject.candidate_id)
     empty_membership = TaskOperationMembershipRecord(TASK, 1, OperationMembershipBindingId("empty"), ())
     history_with_missing = EvidenceHistoryMembershipRecord(
         subject, 1, EvidenceHistoryMembershipBindingId("history"), (EvidenceId("missing"),),
@@ -746,6 +982,7 @@ def test_root_rejects_incomplete_evidence_history_and_supersession_closure():
         (CanonicalRecordKind.AUTHORIZATION, authorization),
         (CanonicalRecordKind.TASK, base_task),
         (CanonicalRecordKind.CANDIDATE, candidate),
+        (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, empty_membership),
         (CanonicalRecordKind.EVIDENCE_HISTORY, history_with_missing),
     )
@@ -767,6 +1004,7 @@ def test_root_rejects_incomplete_evidence_history_and_supersession_closure():
         (CanonicalRecordKind.AUTHORIZATION, authorization),
         (CanonicalRecordKind.TASK, base_task),
         (CanonicalRecordKind.CANDIDATE, candidate),
+        (CanonicalRecordKind.CANDIDATE_MATERIALIZATION, materialization),
         (CanonicalRecordKind.OPERATION, review_operation),
         (CanonicalRecordKind.TASK_OPERATION_MEMBERSHIP, membership),
         (CanonicalRecordKind.REVIEW_ATTEMPT_BINDING, binding),
