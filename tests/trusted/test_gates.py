@@ -329,6 +329,98 @@ def test_issue30_recording_is_nonprogressing_and_adoption_resolves_canonical_pai
     assert value.backend.read_task_working_set(TASK).task.current_candidate_id == candidate.candidate_id
 
 
+def test_issue30_recording_derives_security_bindings_from_canonical_trusted_state():
+    value = runtime()
+    initialize_task(value)
+    task = value.backend.read_task_working_set(TASK).task
+    contract = value.backend.read_contract(task.contract_id)
+    resolved_target = value.backend.read_resolved_target_registration(task.target_registration_id)
+    assert contract is not None and resolved_target is not None
+    request = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=CandidateId("derived-bindings"), candidate_commit_id=GitSha("b" * 40),
+    )
+    assert ControlStateGate(value).commit(request, independent_lease(value)).code is GateResultCode.COMMITTED
+    candidate = value.backend.read_candidate(CandidateId("derived-bindings"))
+    assert candidate is not None
+    materialization = value.backend.read_candidate_materialization(candidate.materialization_id)
+    assert materialization is not None
+    assert (
+        candidate.task_id, candidate.contract_id, candidate.contract_raw_sha256,
+        candidate.authorization_id, candidate.admission_event_id, candidate.target_registration_id,
+        candidate.policy_epoch_identity, candidate.base,
+    ) == (
+        task.task_id, task.contract_id, task.contract_raw_sha256,
+        task.authorization_id, task.admission_event_id, task.target_registration_id,
+        task.last_evaluated_policy_epoch_identity, contract.base_sha,
+    )
+    assert (
+        materialization.repository_id, materialization.task_id, materialization.contract_id,
+        materialization.contract_raw_sha256, materialization.authorization_id,
+        materialization.target_registration_id, materialization.policy_epoch_identity,
+        materialization.base_commit,
+    ) == (
+        resolved_target.registration.repository_id, task.task_id, task.contract_id,
+        task.contract_raw_sha256, task.authorization_id, task.target_registration_id,
+        task.last_evaluated_policy_epoch_identity, contract.base_sha,
+    )
+
+
+def test_issue30_recording_rejects_caller_security_binding_overrides():
+    value = runtime()
+    initialize_task(value)
+    before_task = value.backend.read_task_working_set(TASK).task
+    before_occurrence = value.backend.occurrence
+    with pytest.raises(TypeError):
+        value.boundary.record_candidate_truth(
+            task_id=TASK, candidate_id=CandidateId("no-overrides"),
+            candidate_commit_id=GitSha("b" * 40), contract_id=ContractId("conflict"),
+        )
+    with pytest.raises(TypeError):
+        value.boundary.record_candidate_truth(
+            task_id=TASK, candidate_id=CandidateId("no-overrides"),
+            candidate_commit_id=GitSha("b" * 40), repository_id=GitHubRepositoryId("2"),
+        )
+    assert value.backend.occurrence == before_occurrence
+    assert value.backend.read_task_working_set(TASK).task == before_task
+    assert value.backend.read_candidate(CandidateId("no-overrides")) is None
+
+
+def test_issue30_materialization_admission_does_not_grant_publication_authority():
+    value = runtime()
+    initialize_task(value)
+    admitted = record_materialization_truth(value, materialize(value))
+    before = value.platform.snapshot()
+    # The only public publication entry point accepts a gate-private live continuation,
+    # never an admitted materialization as bearer authority.
+    result = TargetPublicationGate(value).perform(admitted)
+    assert result.code is GateResultCode.LEASE_CONSUMED
+    assert value.platform.snapshot() == before
+    assert value.backend.read_task_working_set(TASK).task.current_candidate_id is None
+    assert value.platform.marker(
+        OperationId("publication-from-materialization"),
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+
+def test_issue30_combined_candidate_creation_and_adoption_path_is_unavailable():
+    value = runtime()
+    initialize_task(value)
+    candidate_id = CandidateId("combined-path")
+    before_task = value.backend.read_task_working_set(TASK).task
+    before_occurrence = value.backend.occurrence
+    before_candidates = dict(value.backend._state.candidates)
+    before_materializations = dict(value.backend._state.candidate_materializations)
+    with pytest.raises(TypeError, match="combined candidate creation/adoption is unavailable"):
+        value.boundary.create_candidate_and_adopt(
+            task_id=TASK, candidate_id=candidate_id, candidate_commit_id=GitSha("b" * 40),
+        )
+    assert value.backend.occurrence == before_occurrence
+    assert value.backend.read_task_working_set(TASK).task == before_task
+    assert value.backend.read_candidate(candidate_id) is None
+    assert value.backend._state.candidates == before_candidates
+    assert value.backend._state.candidate_materializations == before_materializations
+
+
 def test_issue30_recording_binds_repository_to_resolved_target_not_issue_anchor():
     issue_repository = GitHubRepositoryId("2")
     _, issue_raw, issue_contract = canonical_contract_fixture(
@@ -384,6 +476,153 @@ def test_issue30_recording_binds_repository_to_resolved_target_not_issue_anchor(
             task_id=TASK, candidate_id=CandidateId("issue-repository"),
             candidate_commit_id=GitSha("b" * 40),
         )
+
+
+def test_issue30_adoption_is_candidate_id_only_and_missing_candidate_fails_closed():
+    value = runtime()
+    initialize_task(value)
+    before = value.backend.read_task_working_set(TASK).task
+    occurrence = value.backend.occurrence
+    with pytest.raises(TypeError):
+        value.boundary.adopt_recorded_candidate(
+            task_id=TASK, candidate_id=CandidateId("missing"),
+            decision_event_id=DecisionEventId("missing"), candidate=object(),
+        )
+    with pytest.raises(ValueError, match="candidate is unavailable"):
+        value.boundary.adopt_recorded_candidate(
+            task_id=TASK, candidate_id=CandidateId("missing"),
+            decision_event_id=DecisionEventId("missing"),
+        )
+    assert value.backend.read_task_working_set(TASK).task == before
+    assert value.backend.occurrence == occurrence
+
+
+def test_issue30_adoption_rejects_unavailable_or_mismatched_materialization_before_g4():
+    value = runtime()
+    initialize_task(value)
+    proposed = materialize(value)
+    admitted = record_materialization_truth(value, proposed)
+    other_request = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=CandidateId("other"), candidate_commit_id=proposed.commit,
+    )
+    assert ControlStateGate(value).commit(other_request, independent_lease(value)).code is GateResultCode.COMMITTED
+    other_candidate = value.backend.read_candidate(CandidateId("other"))
+    assert other_candidate is not None
+    other = value.backend.read_candidate_materialization(other_candidate.materialization_id)
+    assert other is not None
+    candidate = value.backend.read_candidate(admitted.candidate_id)
+    assert candidate is not None
+    before_task, before_occurrence = value.backend.read_task_working_set(TASK).task, value.backend.occurrence
+
+    class ReadFacade:
+        def __init__(self, materialization):
+            self.materialization = materialization
+
+        def read_task_working_set(self, task_id):
+            return value.backend.read_task_working_set(task_id)
+
+        def read_candidate(self, candidate_id):
+            return value.backend.read_candidate(candidate_id)
+
+        def read_candidate_materialization(self, _):
+            return self.materialization
+
+    controller_backend = value.controller._backend
+    try:
+        value.controller._backend = ReadFacade(None)
+        with pytest.raises(ValueError, match="continuity is unavailable"):
+            value.boundary.adopt_recorded_candidate(
+                task_id=TASK, candidate_id=candidate.candidate_id,
+                decision_event_id=DecisionEventId("missing-materialization"),
+            )
+        assert other.candidate_id != candidate.candidate_id
+        value.controller._backend = ReadFacade(other)
+        with pytest.raises(ValueError, match="continuity is unavailable"):
+            value.boundary.adopt_recorded_candidate(
+                task_id=TASK, candidate_id=candidate.candidate_id,
+                decision_event_id=DecisionEventId("mismatched-materialization"),
+            )
+    finally:
+        value.controller._backend = controller_backend
+    assert value.backend.read_task_working_set(TASK).task == before_task
+    assert value.backend.occurrence == before_occurrence
+
+
+def test_issue30_recorded_truth_survives_authoritative_cancellation_g4_denial():
+    value = runtime()
+    initialize_task(value)
+    admitted = record_materialization_truth(value, materialize(value))
+    candidate = value.backend.read_candidate(admitted.candidate_id)
+    assert candidate is not None
+    cancel = value.boundary.set_cancellation(
+        TASK, CancellationStatus.AUTHORITATIVE, CancellationRequestId("deny-adoption"),
+    )
+    assert ControlStateGate(value).commit(cancel, independent_lease(value)).code is GateResultCode.COMMITTED
+    before_task, before_occurrence = value.backend.read_task_working_set(TASK).task, value.backend.occurrence
+    with pytest.raises(ValueError, match="TERMINAL_TASK"):
+        value.boundary.adopt_recorded_candidate(
+            task_id=TASK, candidate_id=candidate.candidate_id,
+            decision_event_id=DecisionEventId("cancelled-adoption"),
+        )
+    assert value.backend.read_task_working_set(TASK).task == before_task
+    assert value.backend.occurrence == before_occurrence
+    assert value.backend.read_candidate(candidate.candidate_id) == candidate
+    assert value.backend.read_candidate_materialization(admitted.materialization_id) == admitted
+
+
+def test_issue30_stale_adoption_request_cannot_overwrite_newer_task_state():
+    value = runtime()
+    initialize_task(value)
+    admitted = record_materialization_truth(value, materialize(value))
+    stale = value.boundary.adopt_recorded_candidate(
+        task_id=TASK, candidate_id=admitted.candidate_id,
+        decision_event_id=DecisionEventId("stale-adoption"),
+    )
+    stale_occurrence = stale.transaction.expected_state_occurrence
+    cancel = value.boundary.set_cancellation(
+        TASK, CancellationStatus.REQUESTED, CancellationRequestId("competing-write"),
+    )
+    assert ControlStateGate(value).commit(cancel, independent_lease(value)).code is GateResultCode.COMMITTED
+    after_competing_task, after_competing_occurrence = value.backend.read_task_working_set(TASK).task, value.backend.occurrence
+    assert stale_occurrence != after_competing_occurrence
+    result = ControlStateGate(value).commit(stale, independent_lease(value))
+    assert result.code is GateResultCode.REJECTED
+    assert result.canonical_result.status is CanonicalWriteStatus.CAS_CONFLICT
+    assert value.backend.read_task_working_set(TASK).task == after_competing_task
+    assert value.backend.occurrence == after_competing_occurrence
+    assert value.backend.read_candidate(admitted.candidate_id) is not None
+    assert value.backend.read_candidate_materialization(admitted.materialization_id) == admitted
+
+
+def test_issue30_candidate_replacement_preserves_historical_pairs_without_retirement_authority():
+    value = runtime()
+    initialize_task(value)
+    first = record_materialization_truth(value, materialize(value))
+    first_candidate = value.backend.read_candidate(first.candidate_id)
+    assert first_candidate is not None
+    first_adopt = value.boundary.adopt_recorded_candidate(
+        task_id=TASK, candidate_id=first.candidate_id, decision_event_id=DecisionEventId("adopt-first"),
+    )
+    assert ControlStateGate(value).commit(first_adopt, independent_lease(value)).code is GateResultCode.COMMITTED
+    second_request = value.boundary.record_candidate_truth(
+        task_id=TASK, candidate_id=CandidateId("second"), candidate_commit_id=GitSha("b" * 40),
+    )
+    assert ControlStateGate(value).commit(second_request, independent_lease(value)).code is GateResultCode.COMMITTED
+    second_candidate = value.backend.read_candidate(CandidateId("second"))
+    assert second_candidate is not None
+    second = value.backend.read_candidate_materialization(second_candidate.materialization_id)
+    assert second is not None
+    second_adopt = value.boundary.adopt_recorded_candidate(
+        task_id=TASK, candidate_id=second.candidate_id, decision_event_id=DecisionEventId("adopt-second"),
+    )
+    assert ControlStateGate(value).commit(second_adopt, independent_lease(value)).code is GateResultCode.COMMITTED
+    assert value.backend.read_task_working_set(TASK).task.current_candidate_id == second.candidate_id
+    assert value.backend.read_candidate(first.candidate_id) == first_candidate
+    assert value.backend.read_candidate_materialization(first.materialization_id) == first
+    assert value.backend.read_candidate(second.candidate_id) == second_candidate
+    assert value.backend.read_candidate_materialization(second.materialization_id) == second
+    assert not any("retire" in name.lower() or "delete" in name.lower() or "gc" in name.lower()
+                   for name in TrustedControlCommandKind.__members__)
 
 
 def test_admit_contract_uses_controller_gate_cas_and_exact_authoritative_dependencies():

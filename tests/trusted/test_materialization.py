@@ -1,19 +1,25 @@
+import hashlib
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from autodev_control.trusted.identity import GitSha, ImmutableConfigId, RawSha256
+from autodev_control.trusted.backend import canonical_json_bytes
+from autodev_control.trusted.identity import (
+    GitObjectObservationBindingId, GitSha, ImmutableConfigId, RawSha256,
+)
 from autodev_control.trusted.materialization import (
-    GitObjectKind, GitTreeEntry, MutationKind,
+    GitObjectKind, GitTreeEntry, MutationInventory, MutationKind,
     build_candidate_materialization, derive_mutation_inventory,
     CandidateMaterializationAdmissionReason, CandidateMaterializationAdmissionStatus,
     FixtureGitCommit, FixtureGitObjectStore, FixtureGitTree, FixtureGitTreeEntry,
-    TrustedCandidateMaterializationContext, admit_candidate_materialization,
+    MAX_LEAF_ENTRIES, MAX_TREE_DEPTH, TrustedCandidateMaterializationContext,
+    admit_candidate_materialization, inventory_is_authorized,
 )
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import CandidateId
 from autodev_control.trusted.scope import (
     AuthorizationId, CanonicalGitPath, ContractId, GitHubRepositoryId,
+    ExactPathSelector, MutationScope, MutationScopeRule, ChangeType,
     TargetRegistrationId, TaskId,
 )
 
@@ -66,6 +72,24 @@ def observed_store(*, candidate_entries=(), parents=None, unavailable=frozenset(
         (FixtureGitTree(base_tree, base_entries), FixtureGitTree(candidate_tree, candidate_entries)),
         unavailable, provider_failure,
     )
+
+
+def admitted_variant(*, base="a", candidate="b", base_tree="d", result_tree="e", entries=()):
+    base_id, candidate_id = sha(base), sha(candidate)
+    context = trusted_context()
+    object.__setattr__(context, "base_commit", base_id)
+    result = admit_candidate_materialization(
+        store=FixtureGitObjectStore(
+            GitHubRepositoryId("1"),
+            (FixtureGitCommit(base_id, (), sha(base_tree)), FixtureGitCommit(candidate_id, (base_id,), sha(result_tree))),
+            (
+                FixtureGitTree(sha(base_tree), (FixtureGitTreeEntry("base", GitObjectKind.BLOB, "100644", sha("1")),)),
+                FixtureGitTree(sha(result_tree), entries),
+            ),
+        ), context=context, candidate_id=CandidateId("identity"), candidate_commit_id=candidate_id,
+    )
+    assert result.status is CandidateMaterializationAdmissionStatus.ADMITTED
+    return result.admitted_materialization
 
 
 def test_issue30_admission_derives_exhaustive_candidate_inventory_not_caller_claims():
@@ -188,8 +212,171 @@ def test_issue30_duplicate_normalized_path_is_denied_and_caller_values_cannot_en
     assert result.admitted_materialization is None
 
 
+def test_issue30_exact_tree_exceeding_frozen_depth_limit_is_denied():
+    base, candidate, base_tree = sha("a"), sha("b"), sha("d")
+    tree_ids = tuple(GitSha(f"{index:040x}") for index in range(MAX_TREE_DEPTH + 2))
+    trees = [FixtureGitTree(base_tree, ())]
+    for index, tree_id in enumerate(tree_ids):
+        next_id = tree_ids[index + 1] if index + 1 < len(tree_ids) else sha("1")
+        trees.append(FixtureGitTree(tree_id, (FixtureGitTreeEntry(
+            "d", GitObjectKind.TREE, "040000", next_id,
+        ),)))
+    result = admit_candidate_materialization(
+        store=FixtureGitObjectStore(
+            GitHubRepositoryId("1"),
+            (FixtureGitCommit(base, (), base_tree), FixtureGitCommit(candidate, (base,), tree_ids[0])),
+            tuple(trees),
+        ), context=trusted_context(), candidate_id=CandidateId("depth"), candidate_commit_id=candidate,
+    )
+    assert (result.status, result.reason) == (
+        CandidateMaterializationAdmissionStatus.DENIED,
+        CandidateMaterializationAdmissionReason.OBSERVATION_LIMIT_EXCEEDED,
+    )
+
+
+def test_issue30_exact_tree_exceeding_frozen_leaf_limit_is_denied():
+    entries = tuple(
+        FixtureGitTreeEntry(f"entry-{index}", GitObjectKind.BLOB, "100644", sha("1"))
+        for index in range(MAX_LEAF_ENTRIES + 1)
+    )
+    result = admit_candidate_materialization(
+        store=observed_store(candidate_entries=entries), context=trusted_context(),
+        candidate_id=CandidateId("entry-limit"), candidate_commit_id=sha("b"),
+    )
+    assert (result.status, result.reason) == (
+        CandidateMaterializationAdmissionStatus.DENIED,
+        CandidateMaterializationAdmissionReason.OBSERVATION_LIMIT_EXCEEDED,
+    )
+
+
+def test_issue30_admitted_identity_moves_only_with_fresh_trusted_git_facts():
+    same_one = admitted_variant()
+    same_two = admitted_variant()
+    assert same_one.mutation_inventory.inventory_id == same_two.mutation_inventory.inventory_id
+    assert same_one.materialization_id == same_two.materialization_id
+    candidate_moved = admitted_variant(candidate="c")
+    base_moved = admitted_variant(base="f")
+    result_tree_moved = admitted_variant(result_tree="9")
+    inventory_moved = admitted_variant(
+        result_tree="8", entries=(FixtureGitTreeEntry("changed", GitObjectKind.BLOB, "100644", sha("2")),),
+    )
+    assert candidate_moved.materialization_id != same_one.materialization_id
+    assert base_moved.materialization_id != same_one.materialization_id
+    assert result_tree_moved.materialization_id != same_one.materialization_id
+    assert inventory_moved.mutation_inventory.inventory_id != same_one.mutation_inventory.inventory_id
+    assert inventory_moved.materialization_id != same_one.materialization_id
+
+
+def test_issue30_admission_result_binding_exists_only_after_complete_observation():
+    admitted = admit_candidate_materialization(
+        store=observed_store(), context=trusted_context(), candidate_id=CandidateId("shape"), candidate_commit_id=sha("b"),
+    )
+    assert admitted.status is CandidateMaterializationAdmissionStatus.ADMITTED
+    assert admitted.admitted_materialization is not None
+    assert admitted.git_object_observation_binding_id is not None
+    topology = admit_candidate_materialization(
+        store=observed_store(parents=()), context=trusted_context(), candidate_id=CandidateId("shape"), candidate_commit_id=sha("b"),
+    )
+    assert topology.status is CandidateMaterializationAdmissionStatus.DENIED
+    assert topology.admitted_materialization is None
+    assert topology.git_object_observation_binding_id is not None
+    wrong_context = trusted_context()
+    object.__setattr__(wrong_context, "repository_id", GitHubRepositoryId("2"))
+    early = admit_candidate_materialization(
+        store=observed_store(), context=wrong_context, candidate_id=CandidateId("shape"), candidate_commit_id=sha("b"),
+    )
+    assert early.status is CandidateMaterializationAdmissionStatus.DENIED
+    assert early.admitted_materialization is None
+    assert early.git_object_observation_binding_id is None
+
+
+def test_issue30_trusted_nested_tree_observation_is_exhaustive_and_excludes_invented_paths():
+    base, candidate = sha("a"), sha("b")
+    base_root, candidate_root = sha("d"), sha("e")
+    base_nested, candidate_nested, second = sha("f"), sha("7"), sha("8")
+    base_leaves = (
+        GitTreeEntry(CanonicalGitPath("nested/modified.txt"), GitObjectKind.BLOB, "100644", sha("3")),
+        GitTreeEntry(CanonicalGitPath("nested/retained.txt"), GitObjectKind.BLOB, "100644", sha("2")),
+        GitTreeEntry(CanonicalGitPath("root.txt"), GitObjectKind.BLOB, "100644", sha("1")),
+        GitTreeEntry(CanonicalGitPath("second/leaf.txt"), GitObjectKind.BLOB, "100644", sha("4")),
+    )
+    candidate_leaves = (
+        GitTreeEntry(CanonicalGitPath("nested/added.txt"), GitObjectKind.BLOB, "100644", sha("6")),
+        GitTreeEntry(CanonicalGitPath("nested/modified.txt"), GitObjectKind.BLOB, "100644", sha("5")),
+        GitTreeEntry(CanonicalGitPath("nested/retained.txt"), GitObjectKind.BLOB, "100644", sha("2")),
+        GitTreeEntry(CanonicalGitPath("root.txt"), GitObjectKind.BLOB, "100644", sha("1")),
+        GitTreeEntry(CanonicalGitPath("second/leaf.txt"), GitObjectKind.BLOB, "100644", sha("4")),
+    )
+    store = FixtureGitObjectStore(
+        GitHubRepositoryId("1"),
+        (FixtureGitCommit(base, (), base_root), FixtureGitCommit(candidate, (base,), candidate_root)),
+        (
+            FixtureGitTree(base_root, (
+                FixtureGitTreeEntry("root.txt", GitObjectKind.BLOB, "100644", sha("1")),
+                FixtureGitTreeEntry("nested", GitObjectKind.TREE, "040000", base_nested),
+                FixtureGitTreeEntry("second", GitObjectKind.TREE, "040000", second),
+            )),
+            FixtureGitTree(candidate_root, (
+                FixtureGitTreeEntry("root.txt", GitObjectKind.BLOB, "100644", sha("1")),
+                FixtureGitTreeEntry("nested", GitObjectKind.TREE, "040000", candidate_nested),
+                FixtureGitTreeEntry("second", GitObjectKind.TREE, "040000", second),
+            )),
+            FixtureGitTree(base_nested, (
+                FixtureGitTreeEntry("retained.txt", GitObjectKind.BLOB, "100644", sha("2")),
+                FixtureGitTreeEntry("modified.txt", GitObjectKind.BLOB, "100644", sha("3")),
+            )),
+            FixtureGitTree(candidate_nested, (
+                FixtureGitTreeEntry("retained.txt", GitObjectKind.BLOB, "100644", sha("2")),
+                FixtureGitTreeEntry("modified.txt", GitObjectKind.BLOB, "100644", sha("5")),
+                FixtureGitTreeEntry("added.txt", GitObjectKind.BLOB, "100644", sha("6")),
+            )),
+            FixtureGitTree(second, (FixtureGitTreeEntry("leaf.txt", GitObjectKind.BLOB, "100644", sha("4")),)),
+        ),
+        observation_instance_id=RawSha256("9" * 64),
+    )
+    result = admit_candidate_materialization(
+        store=store, context=trusted_context(), candidate_id=CandidateId("nested"), candidate_commit_id=candidate,
+    )
+    assert result.status is CandidateMaterializationAdmissionStatus.ADMITTED
+    expected_binding_preimage = (
+        "autodev.git-object-observation/v1", store.observation_instance_id, store.repository_id,
+        base, candidate, base_root, candidate_root,
+        RawSha256(hashlib.sha256(canonical_json_bytes(base_leaves)).hexdigest()),
+        RawSha256(hashlib.sha256(canonical_json_bytes(candidate_leaves)).hexdigest()),
+    )
+    expected_binding = GitObjectObservationBindingId(RawSha256(
+        hashlib.sha256(canonical_json_bytes(expected_binding_preimage)).hexdigest()
+    ))
+    assert result.git_object_observation_binding_id == expected_binding
+    inventory = result.admitted_materialization.mutation_inventory
+    assert inventory == derive_mutation_inventory(base_leaves, candidate_leaves)
+    assert [(fact.path.value, fact.kind) for fact in inventory.mutations] == [
+        ("nested/added.txt", MutationKind.ADDED),
+        ("nested/modified.txt", MutationKind.MODIFIED),
+    ]
+    assert all(fact.path != CanonicalGitPath("invented/path.txt") for fact in inventory.mutations)
+
+
+def test_issue30_materialization_admission_does_not_grant_scope_authorization():
+    result = admit_candidate_materialization(
+        store=observed_store(candidate_entries=(FixtureGitTreeEntry(
+            "outside.txt", GitObjectKind.BLOB, "100644", sha("2"),
+        ),)), context=trusted_context(), candidate_id=CandidateId("scope"), candidate_commit_id=sha("b"),
+    )
+    assert result.status is CandidateMaterializationAdmissionStatus.ADMITTED
+    narrow_scope = MutationScope((MutationScopeRule(
+        ExactPathSelector(CanonicalGitPath("inside.txt")), (ChangeType.ADD,),
+    ),))
+    assert not inventory_is_authorized(
+        result.admitted_materialization.mutation_inventory, narrow_scope, MutationScope(()),
+    )
+
+
 def test_empty_tree_delta_is_deterministic():
-    assert derive_mutation_inventory((), ()) == derive_mutation_inventory((), ())
+    inventory = derive_mutation_inventory((), ())
+    assert type(inventory) is MutationInventory
+    assert inventory.mutations == ()
+    assert inventory == derive_mutation_inventory((), ())
 
 
 def test_added_path_is_derived_from_object_truth():
