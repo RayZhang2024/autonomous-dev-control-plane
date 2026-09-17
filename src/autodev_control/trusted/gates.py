@@ -86,7 +86,8 @@ from .state import (
 from .manifest import PolicyEpochIdentity
 from .operation import AdmissionEventId, CandidateId, DecisionEventId
 from .state_reader import (
-    AuthoritativeObservationProfile, AuthoritativeStateSnapshot,
+    AuthoritativeObservationProfile, AuthoritativeStateDependency,
+    AuthoritativeStateDependencySet, AuthoritativeStateSnapshot,
     GitHubPullRequestNumber, GitHubStateReader, RegisteredStateFactDescriptor,
     TrustedGitHubReadTransportBinding,
 )
@@ -294,41 +295,11 @@ def _mint_capability(kind: type[_Capability], nonce: object, service_identity: S
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class ControlStateAuthoritativeDependency:
-    repository_id: GitHubRepositoryId
-    observation_profile_id: ImmutableConfigId
-    transport_config_id: ImmutableConfigId
-    expected_binding_id: AuthoritativeStateBindingId
-
-    def __post_init__(self) -> None:
-        exact = ((self.repository_id, GitHubRepositoryId), (self.observation_profile_id, ImmutableConfigId),
-                 (self.transport_config_id, ImmutableConfigId),
-                 (self.expected_binding_id, AuthoritativeStateBindingId))
-        if any(type(value) is not expected for value, expected in exact):
-            raise TypeError("dependency field has wrong exact type")
-
-    @property
-    def locator(self) -> tuple[GitHubRepositoryId, ImmutableConfigId, ImmutableConfigId]:
-        return self.repository_id, self.observation_profile_id, self.transport_config_id
-
-
-@dataclass(frozen=True, slots=True)
-class ControlStateAuthoritativeDependencySet:
-    dependencies: tuple[ControlStateAuthoritativeDependency, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.dependencies) is not tuple or any(type(item) is not ControlStateAuthoritativeDependency for item in self.dependencies):
-            raise TypeError("dependencies must be an exact tuple")
-        locators = tuple(item.locator for item in self.dependencies)
-        keys = tuple((a.value, b.value, c.value) for a, b, c in locators)
-        if keys != tuple(sorted(keys)) or len(locators) != len(set(locators)):
-            raise ValueError("dependencies require unique canonical locator order")
-
-
-# Compatibility aliases intentionally preserve the one closed dependency model.
-ResolvableStateDependency = ControlStateAuthoritativeDependency
-ExactDependencySet = ControlStateAuthoritativeDependencySet
+# Compatibility aliases intentionally preserve the one closed lower-layer model.
+ControlStateAuthoritativeDependency = AuthoritativeStateDependency
+ControlStateAuthoritativeDependencySet = AuthoritativeStateDependencySet
+ResolvableStateDependency = AuthoritativeStateDependency
+ExactDependencySet = AuthoritativeStateDependencySet
 
 
 class ExternalStateIndependence:

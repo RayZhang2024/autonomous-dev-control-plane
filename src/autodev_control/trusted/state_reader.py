@@ -116,6 +116,17 @@ class ReadPullRequest(GitHubReadRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class ReadCandidatePullRequestSet(GitHubReadRequest):
+    """Closed B1 discovery request.  Expected PR facts are observations, never filters."""
+    head_ref: GitRef
+
+    def __post_init__(self) -> None:
+        GitHubReadRequest.__post_init__(self)
+        if type(self.head_ref) is not GitRef:
+            raise TypeError("head_ref has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
 class ReadChangedFileInventory(GitHubReadRequest):
     pull_request_number: GitHubPullRequestNumber
 
@@ -161,6 +172,40 @@ class StateReadFailure(Enum):
     INCOMPLETE = "INCOMPLETE"
     STATE_MOVED = "STATE_MOVED"
     UNTRUSTED_TRANSPORT = "UNTRUSTED_TRANSPORT"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeStateDependency:
+    """One factual, non-bearer binding to a complete authoritative state read."""
+    repository_id: GitHubRepositoryId
+    observation_profile_id: ImmutableConfigId
+    transport_config_id: ImmutableConfigId
+    expected_binding_id: AuthoritativeStateBindingId
+
+    def __post_init__(self) -> None:
+        exact = ((self.repository_id, GitHubRepositoryId),
+                 (self.observation_profile_id, ImmutableConfigId),
+                 (self.transport_config_id, ImmutableConfigId),
+                 (self.expected_binding_id, AuthoritativeStateBindingId))
+        if any(type(value) is not expected for value, expected in exact):
+            raise TypeError("dependency field has wrong exact type")
+
+    @property
+    def locator(self) -> tuple[GitHubRepositoryId, ImmutableConfigId, ImmutableConfigId]:
+        return self.repository_id, self.observation_profile_id, self.transport_config_id
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeStateDependencySet:
+    dependencies: tuple[AuthoritativeStateDependency, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.dependencies) is not tuple or any(type(item) is not AuthoritativeStateDependency for item in self.dependencies):
+            raise TypeError("dependencies must be an exact tuple")
+        locators = tuple(item.locator for item in self.dependencies)
+        keys = tuple((a.value, b.value, c.value) for a, b, c in locators)
+        if keys != tuple(sorted(keys)) or len(locators) != len(set(locators)):
+            raise ValueError("dependencies require unique canonical locator order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +425,30 @@ def _ok(key: str, value: tuple) -> GitHubNormalizationResult:
     return GitHubNormalizationResult(observation=NormalizedGitHubObservation(key, value))
 
 
+def _candidate_pr_observation(item: object) -> CandidatePullRequestObservation | StateReadFailure:
+    required = {"number", "state", "merged", "base_repository_id", "base_ref", "base_sha",
+                "head_repository_id", "head_ref", "head_sha", "merge_sha"}
+    if type(item) is not dict or set(item) != required:
+        return StateReadFailure.MALFORMED_RESPONSE
+    try:
+        state, merged, merge_sha = item["state"], item["merged"], item["merge_sha"]
+        if state not in ("open", "closed") or type(merged) is not bool:
+            return StateReadFailure.MALFORMED_RESPONSE
+        if merged:
+            if state != "closed":
+                return StateReadFailure.MISMATCH
+            merge_sha = GitSha(merge_sha)
+        elif merge_sha is not None:
+            return StateReadFailure.MISMATCH
+        return CandidatePullRequestObservation(
+            GitHubPullRequestNumber(item["number"]), state, merged,
+            GitHubRepositoryId(item["base_repository_id"]), GitRef(item["base_ref"]), GitSha(item["base_sha"]),
+            GitHubRepositoryId(item["head_repository_id"]), GitRef(item["head_ref"]), GitSha(item["head_sha"]), merge_sha,
+        )
+    except (TypeError, ValueError):
+        return StateReadFailure.MALFORMED_RESPONSE
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedGitHubReadTransportBinding:
     config_id: ImmutableConfigId
@@ -468,6 +537,40 @@ class AuthoritativeStateReadResult:
             raise ValueError("failed authoritative read cannot carry authoritative state")
 
 
+@dataclass(frozen=True, slots=True)
+class CandidatePullRequestObservation:
+    number: GitHubPullRequestNumber
+    state: str
+    merged: bool
+    base_repository_id: GitHubRepositoryId
+    base_ref: GitRef
+    base_sha: GitSha
+    head_repository_id: GitHubRepositoryId
+    head_ref: GitRef
+    head_sha: GitSha
+    merge_sha: GitSha | None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePullRequestSetReadResult:
+    status: AuthoritativeStateReadStatus
+    observations: tuple[CandidatePullRequestObservation, ...] | None = None
+    snapshot: AuthoritativeStateSnapshot | None = None
+    binding_id: AuthoritativeStateBindingId | None = None
+    failure: StateReadFailure | None = None
+
+    def __post_init__(self) -> None:
+        if self.status is AuthoritativeStateReadStatus.SUCCESS:
+            if (type(self.observations) is not tuple
+                    or any(type(item) is not CandidatePullRequestObservation for item in self.observations)
+                    or type(self.snapshot) is not AuthoritativeStateSnapshot
+                    or type(self.binding_id) is not AuthoritativeStateBindingId
+                    or self.failure is not None):
+                raise ValueError("successful PR-set read must be complete")
+        elif self.observations is not None or self.snapshot is not None or self.binding_id is not None or type(self.failure) is not StateReadFailure:
+            raise ValueError("failed PR-set read cannot carry authoritative state")
+
+
 class GitHubStateReader:
     __slots__ = ("_binding", "_transport", "_normalizer", "_sealed")
 
@@ -502,6 +605,11 @@ class GitHubStateReader:
         if getattr(self, "_sealed", False):
             raise AttributeError("authoritative reader transport cannot be replaced")
         object.__setattr__(self, name, value)
+
+    @property
+    def binding(self) -> TrustedGitHubReadTransportBinding:
+        """Read-only exact transport binding; it confers no transport capability."""
+        return self._binding
 
     def read_authoritative(
         self,
@@ -549,6 +657,89 @@ class GitHubStateReader:
             snapshot,
             _authoritative_binding(snapshot),
         )
+
+    def read_candidate_pull_request_set(
+        self, request: ReadCandidatePullRequestSet, profile_id: ImmutableConfigId,
+    ) -> CandidatePullRequestSetReadResult:
+        """Read the entire matching PR set twice; no partial enumeration is authoritative."""
+        if type(request) is not ReadCandidatePullRequestSet or type(profile_id) is not ImmutableConfigId:
+            raise TypeError("exact B1 request and profile required")
+        if request.repository_id not in self._binding.permitted_repository_ids:
+            return _pr_failure(StateReadFailure.MISMATCH)
+        first = self._read_candidate_pr_pages(request)
+        if isinstance(first, StateReadFailure):
+            return _pr_failure(first)
+        second = self._read_candidate_pr_pages(request)
+        if isinstance(second, StateReadFailure):
+            return _pr_failure(second)
+        if first != second:
+            return _pr_failure(StateReadFailure.STATE_MOVED)
+        observations = tuple(sorted(first, key=lambda item: item.number.value))
+        normalized = NormalizedGitHubObservation(
+            "candidate-pull-request-set:" + request.head_ref.value,
+            (request.repository_id.value, request.head_ref.value, tuple(
+                (item.number.value, item.state, item.merged, item.base_repository_id.value,
+                 item.base_ref.value, item.base_sha.value, item.head_repository_id.value,
+                 item.head_ref.value, item.head_sha.value,
+                 None if item.merge_sha is None else item.merge_sha.value)
+                for item in observations)),
+        )
+        snapshot = AuthoritativeStateSnapshot(
+            request.repository_id, profile_id, self._binding.config_id, (normalized,),
+        )
+        return CandidatePullRequestSetReadResult(
+            AuthoritativeStateReadStatus.SUCCESS, observations, snapshot,
+            authoritative_state_binding(snapshot), None,
+        )
+
+    def _read_candidate_pr_pages(self, request: ReadCandidatePullRequestSet) -> tuple[CandidatePullRequestObservation, ...] | StateReadFailure:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        seen_numbers: set[GitHubPullRequestNumber] = set()
+        observations: list[CandidatePullRequestObservation] = []
+        pages = 0
+        try:
+            while True:
+                pages += 1
+                if pages > 64:
+                    return StateReadFailure.INCOMPLETE
+                raw = self._transport.read(request, cursor)
+                if type(raw) is not dict or set(raw) != {"repository_id", "head_ref", "items", "next_cursor", "complete"}:
+                    return StateReadFailure.MALFORMED_RESPONSE
+                if raw["repository_id"] != request.repository_id.value or raw["head_ref"] != request.head_ref.value:
+                    return StateReadFailure.MISMATCH
+                if type(raw["items"]) is not list or type(raw["complete"]) is not bool:
+                    return StateReadFailure.MALFORMED_RESPONSE
+                for item in raw["items"]:
+                    observed = _candidate_pr_observation(item)
+                    if isinstance(observed, StateReadFailure):
+                        return observed
+                    if observed.number in seen_numbers:
+                        return StateReadFailure.INCOMPLETE
+                    seen_numbers.add(observed.number)
+                    if (observed.state == "open" and not observed.merged
+                            and observed.base_repository_id == request.repository_id
+                            and observed.head_repository_id == request.repository_id
+                            and observed.head_ref == request.head_ref
+                            and observed.merge_sha is None):
+                        observations.append(observed)
+                        if len(observations) > 64:
+                            return StateReadFailure.INCOMPLETE
+                next_cursor = raw["next_cursor"]
+                if next_cursor is not None and (type(next_cursor) is not str or not next_cursor or next_cursor in seen_cursors):
+                    return StateReadFailure.INCOMPLETE
+                if raw["complete"]:
+                    if next_cursor is not None:
+                        return StateReadFailure.INCOMPLETE
+                    return tuple(sorted(observations, key=lambda item: item.number.value))
+                if next_cursor is None:
+                    return StateReadFailure.INCOMPLETE
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        except (TypeError, ValueError, KeyError):
+            return StateReadFailure.MALFORMED_RESPONSE
+        except Exception:
+            return StateReadFailure.UNAVAILABLE
 
     def _read_one(self, request: GitHubReadRequest) -> GitHubNormalizationResult:
         if type(request) is ReadChangedFileInventory:
@@ -660,3 +851,7 @@ def authoritative_state_binding_from_result(
 
 def _failure(reason: StateReadFailure) -> AuthoritativeStateReadResult:
     return AuthoritativeStateReadResult(AuthoritativeStateReadStatus.FAILURE, failure=reason)
+
+
+def _pr_failure(reason: StateReadFailure) -> CandidatePullRequestSetReadResult:
+    return CandidatePullRequestSetReadResult(AuthoritativeStateReadStatus.FAILURE, failure=reason)
