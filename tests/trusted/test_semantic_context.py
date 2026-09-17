@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import pytest
 from decimal import Decimal
+from dataclasses import fields
+import inspect
 
 from autodev_control.trusted.backend import ResolvedTargetRegistration
 from autodev_control.trusted.contract import contract_json_value_digest
@@ -14,6 +16,7 @@ from autodev_control.trusted.semantic_context import *
 from autodev_control.trusted import semantic_context as contexts
 from autodev_control.trusted.state_reader import *
 from autodev_control.trusted.target_registration import AdmittedTargetRegistration, MergeConfiguration
+from autodev_control.trusted.gates import ControlStateAuthoritativeDependency, ControlStateAuthoritativeDependencySet
 
 
 REPO = GitHubRepositoryId("1")
@@ -30,7 +33,7 @@ def mint(cls, **fields):
     return value
 
 
-def reader(*, pages, profile="event", transport="transport", permitted=(REPO,)):
+def reader(*, pages, profile="event", transport="transport", permitted=(REPO,), owner="o", record=None):
     binding = mint(TrustedGitHubReadTransportBinding, config_id=ImmutableConfigId(transport),
         expected_api_host_identity=ImmutableConfigId("host"), authentication_mode_identity=ImmutableConfigId("auth"),
         service_identity=__import__("autodev_control.trusted.scope", fromlist=["ServicePrincipalId"]).ServicePrincipalId("reader"),
@@ -38,9 +41,11 @@ def reader(*, pages, profile="event", transport="transport", permitted=(REPO,)):
     transport_value = object.__new__(AuthenticatedGitHubReadTransport)
     values = list(pages)
     def execute(request, cursor):
+        if record is not None:
+            record.append(request)
         assert type(request) in (ReadRepositoryIdentity, ReadCandidatePullRequestSet)
         if type(request) is ReadRepositoryIdentity:
-            return {"repository_id": REPO.value, "owner": "o", "name": "r"}
+            return {"repository_id": REPO.value, "owner": owner, "name": "r"}
         return values.pop(0) if len(values) > 1 else values[0]
     object.__setattr__(transport_value, "_binding", binding)
     object.__setattr__(transport_value, "_executor", execute)
@@ -48,11 +53,11 @@ def reader(*, pages, profile="event", transport="transport", permitted=(REPO,)):
     return mint(AuthoritativeObservationProfile, profile_id=ImmutableConfigId(profile), registered_fact_descriptors=(descriptor,)), GitHubStateReader(binding, transport_value)
 
 
-def target(event_ids=(ImmutableConfigId("event"),)):
+def target(event_ids=(ImmutableConfigId("event"),), *, target_id=TARGET, epoch=EPOCH):
     registration = mint(AdmittedTargetRegistration, repository_id=REPO, event_state_profile_ids=event_ids,
         merge=MergeConfiguration(__import__("autodev_control.trusted.scope", fromlist=["ServicePrincipalId"]).ServicePrincipalId("merge"), ImmutableConfigId("merge"), (CanonicalBranchRef("refs/heads/main"),)))
-    return mint(ResolvedTargetRegistration, registration=registration, target_registration_id=TARGET,
-                root_config_id=ImmutableConfigId("root"), policy_epoch_identity=EPOCH)
+    return mint(ResolvedTargetRegistration, registration=registration, target_registration_id=target_id,
+                root_config_id=ImmutableConfigId("root"), policy_epoch_identity=epoch)
 
 
 def source(bindings=(), policy=None, pr_reader=None):
@@ -321,3 +326,121 @@ def test_pr_pre_read_contract_candidate_target_continuity_fails_before_transport
     result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
     assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
     assert result.pull_request_identity is None and result.dependencies == ()
+
+
+@pytest.mark.parametrize("failure, status, reason", [
+    (StateReadFailure.UNAVAILABLE, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.UNSUPPORTED, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.INDETERMINATE, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.MALFORMED_RESPONSE, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.INCOMPLETE, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.STATE_MOVED, SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE),
+    (StateReadFailure.MISMATCH, SemanticContextResolutionStatus.DENIED, CurrentSemanticTargetContextReason.TARGET_OBSERVATION_CONFLICT),
+    (StateReadFailure.UNTRUSTED_TRANSPORT, SemanticContextResolutionStatus.DENIED, CurrentSemanticTargetContextReason.SOURCE_INVALID),
+], ids=lambda value: getattr(value, "value", str(value)))
+def test_target_every_frozen_state_read_failure_maps_exactly(monkeypatch, failure, status, reason):
+    profile, state_reader = reader(pages=[])
+    monkeypatch.setattr(GitHubStateReader, "read_authoritative", lambda *_: AuthoritativeStateReadResult(AuthoritativeStateReadStatus.FAILURE, failure=failure))
+    result = resolve_current_semantic_target_context(target(), source(((ImmutableConfigId("event"), profile, state_reader),)))
+    assert (result.status, result.reason, result.state_read_failure) == (status, reason, failure)
+    assert result.target_context_id is None and result.dependencies == ()
+
+
+def test_shared_dependency_is_exact_lower_layer_model_with_canonical_locator_validation():
+    dependency = AuthoritativeStateDependency(REPO, ImmutableConfigId("p"), ImmutableConfigId("t"), AuthoritativeStateBindingId("1" * 64))
+    assert ControlStateAuthoritativeDependency is AuthoritativeStateDependency
+    assert ControlStateAuthoritativeDependencySet is AuthoritativeStateDependencySet
+    assert dependency.locator == (REPO, ImmutableConfigId("p"), ImmutableConfigId("t"))
+    with pytest.raises(TypeError):
+        AuthoritativeStateDependency("1", ImmutableConfigId("p"), ImmutableConfigId("t"), AuthoritativeStateBindingId("1" * 64))
+    with pytest.raises(ValueError):
+        AuthoritativeStateDependencySet((dependency, dependency))
+
+
+def test_closed_request_has_exactly_two_fields_and_rejects_other_github_request_types():
+    assert tuple(field.name for field in fields(ReadCandidatePullRequestSet)) == ("repository_id", "head_ref")
+    with pytest.raises(TypeError):
+        GitHubStateReader.read_candidate_pull_request_set(reader(pages=[])[1], ReadRepositoryIdentity(REPO), ImmutableConfigId("p"))
+
+
+def test_reader_complete_set_order_is_canonical_and_binding_moves_with_every_observed_member():
+    request = ReadCandidatePullRequestSet(REPO, GitRef("refs/heads/autodev/candidates/" + "3" * 64))
+    profile, unordered = reader(pages=[page([item(2), item(1)]), page([item(1), item(2)])], profile="pr")
+    first = unordered.read_candidate_pull_request_set(request, profile.profile_id)
+    profile, ordered = reader(pages=[page([item(1), item(2)]), page([item(2), item(1)])], profile="pr")
+    second = ordered.read_candidate_pull_request_set(request, profile.profile_id)
+    assert tuple(entry.number.value for entry in first.observations) == (1, 2)
+    assert first.binding_id == second.binding_id
+    for changed in (item(head=GitSha("c" * 40)), item(base=GitSha("c" * 40)), item(base_ref="refs/heads/release"), item(2)):
+        profile, changed_reader = reader(pages=[page([changed]), page([changed])], profile="pr")
+        changed_result = changed_reader.read_candidate_pull_request_set(request, profile.profile_id)
+        assert changed_result.binding_id != first.binding_id
+
+
+def test_target_identity_is_repeatable_and_moves_with_each_frozen_input():
+    def resolve(*, profile_id="event", transport_id="transport", owner="o", target_id=TARGET, epoch=EPOCH):
+        profile, state_reader = reader(pages=[], profile=profile_id, transport=transport_id, owner=owner)
+        result = resolve_current_semantic_target_context(
+            target((ImmutableConfigId(profile_id),), target_id=target_id, epoch=epoch),
+            source(((ImmutableConfigId(profile_id), profile, state_reader),)),
+        )
+        assert result.status is SemanticContextResolutionStatus.RESOLVED
+        return result.target_context_id
+    original = resolve()
+    assert resolve() == original
+    assert resolve(profile_id="other") != original
+    assert resolve(transport_id="other") != original
+    assert resolve(owner="moved") != original
+    assert resolve(target_id=TargetRegistrationId(RawSha256("5" * 64))) != original
+    assert resolve(epoch=PolicyEpochIdentity(TrustedManifestId(RawSha256("5" * 64)))) != original
+
+
+def test_pr_identity_is_repeatable_and_moves_with_contract_candidate_set_profile_and_transport():
+    def resolve(*, number=1, contract_id=CONTRACT, raw=RawSha256("4" * 64), materialization="3", profile_name="pr", transport="transport"):
+        branch = "refs/heads/autodev/candidates/" + materialization * 64
+        observed = item(number)
+        observed["head_ref"] = branch
+        complete_page = {**page([observed]), "head_ref": branch}
+        profile, state_reader = reader(pages=[complete_page, complete_page], profile=profile_name, transport=transport)
+        policy = mint(TrustedSemanticPullRequestObservationPolicy, profile_id=profile.profile_id,
+            policy_epoch_identity=EPOCH, target_registration_id=TARGET, repository_id=REPO,
+            transport_config_id=ImmutableConfigId(transport))
+        contract = mint(__import__("autodev_control.trusted.contract", fromlist=["AdmittedIssueContract"]).AdmittedIssueContract,
+            target_registration_id=TARGET, contract_id=contract_id, contract_raw_sha256=raw,
+            base_sha=BASE, integration_ref=CanonicalBranchRef("refs/heads/main"))
+        materialization_record = mint(AdmittedCandidateMaterialization, target_registration_id=TARGET,
+            repository_id=REPO, contract_id=contract_id, contract_raw_sha256=raw, policy_epoch_identity=EPOCH,
+            base_commit=BASE, candidate_commit=HEAD,
+            materialization_id=CandidateMaterializationId(RawSha256(materialization * 64)))
+        value = resolve_current_semantic_pull_request_context(target(), contract, materialization_record,
+            source(policy=policy, pr_reader=state_reader))
+        assert value.status is SemanticContextResolutionStatus.RESOLVED
+        return value.pull_request_identity
+    baseline = resolve()
+    assert resolve() == baseline
+    assert resolve(contract_id=ContractId("other")) != baseline
+    assert resolve(raw=RawSha256("5" * 64)) != baseline
+    assert resolve(materialization="5") != baseline
+    assert resolve(number=2) != baseline
+    assert resolve(profile_name="other") != baseline
+    assert resolve(transport="other") != baseline
+
+
+def test_pr_resolver_derives_closed_request_from_target_and_candidate_without_historical_or_g7_inputs():
+    seen = []
+    profile, state_reader = reader(pages=[page([item()]), page([item()])], profile="pr", record=seen)
+    policy = mint(TrustedSemanticPullRequestObservationPolicy, profile_id=profile.profile_id,
+                  policy_epoch_identity=EPOCH, target_registration_id=TARGET, repository_id=REPO,
+                  transport_config_id=ImmutableConfigId("transport"))
+    resolved, contract, materialization, _ = pr_inputs()
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization,
+        source(policy=policy, pr_reader=state_reader))
+    assert result.status is SemanticContextResolutionStatus.RESOLVED
+    observed = [request for request in seen if type(request) is ReadCandidatePullRequestSet]
+    assert len(observed) == 2
+    assert all(request.repository_id == resolved.registration.repository_id for request in observed)
+    assert all(request.head_ref == GitRef(materialization.candidate_branch.value) for request in observed)
+    implementation = inspect.getsource(resolve_current_semantic_pull_request_context)
+    assert "SemanticReviewEffectiveSubject" not in implementation
+    assert "ProtectedEffectMarker" not in implementation
+    assert "CreatedCandidatePrEffectSubject" not in implementation
