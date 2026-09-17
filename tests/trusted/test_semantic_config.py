@@ -10,7 +10,12 @@ from autodev_control.trusted.contract import EvaluatorMechanism, ResolvedTrusted
 from autodev_control.trusted.identity import ImmutableConfigId, RawSha256, SemanticEvaluatorResolutionId
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.resources import RootManagedResourceId
-from autodev_control.trusted.review import ToolMode
+from autodev_control.trusted.review import (
+    ToolMode, TrustedDisclosureAuthorizationBinding, TrustedReReviewAuthorization,
+    TrustedReviewInvocationRecord, TrustedReviewProfileAdmissionContext,
+)
+from autodev_control.trusted.evidence import TrustedVerdictSchemaContext
+import autodev_control.trusted.semantic_config as semantic_config
 from autodev_control.trusted.semantic_config import (
     MAX_PROVIDER_METADATA_REQUIREMENTS_PER_PROFILE,
     MAX_REQUIRED_TRUSTED_CONTEXTS_PER_SEMANTIC_EVALUATOR,
@@ -132,6 +137,46 @@ def test_canonical_collections_and_tool_restriction_fail_closed():
     denied = _resolve(tools)
     assert denied.reason is Reason.UNSUPPORTED_TOOL_MODE and denied.resolution is None
     assert ToolMode.PERMITTED_TOOLS.value == "PERMITTED_TOOLS"
+
+
+def test_profile_frozen_precedence_tool_mode_wins_over_later_policy_id():
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["tool_mode"] = "PERMITTED_TOOLS"; profile["rereview_policy_id"] = ""
+    result = _resolve(value)
+    assert (result.status, result.reason) == (Status.DENIED, Reason.UNSUPPORTED_TOOL_MODE)
+
+
+def test_profile_frozen_precedence_raw_limits_win_over_later_policy_ids():
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["raw_limits"]["max_bytes"] = 0; profile["rereview_policy_id"] = ""; profile["disclosure_policy_id"] = ""
+    assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
+
+
+def test_profile_frozen_precedence_service_constraints_win_over_later_policy_ids():
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["service_constraint_ids"] = ["z", "a"]; profile["rereview_policy_id"] = ""
+    assert _resolve(value).reason is Reason.NONCANONICAL_CONFIG
+
+
+def test_profile_frozen_precedence_provider_metadata_wins_over_later_policy_ids():
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["provider_metadata_requirement_ids"] = ["z", "a"]; profile["disclosure_policy_id"] = ""
+    assert _resolve(value).reason is Reason.NONCANONICAL_CONFIG
+
+
+def test_profile_frozen_precedence_rereview_is_checked_before_disclosure(monkeypatch):
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["rereview_policy_id"] = ""; profile["disclosure_policy_id"] = ""
+    original = semantic_config.ImmutableConfigId
+    observed = []
+
+    def ordered_identity(item):
+        observed.append(item)
+        return original(item)
+
+    monkeypatch.setattr(semantic_config, "ImmutableConfigId", ordered_identity)
+    assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
+    assert "" in observed and observed.count("") == 1
 
 
 def test_raw_limits_are_exact_decimals_and_invalid_values_fail():
@@ -315,14 +360,37 @@ def test_resource_digest_is_the_current_g1_selection_not_a_caller_resource_claim
     assert resolve_semantic_evaluator_config.__code__.co_argcount == 2
 
 
-def test_resolution_is_non_bearer_and_does_not_construct_downstream_authority():
+def test_resolution_is_non_bearer_and_cannot_construct_named_g5_authorities():
     result = _resolve()
     assert result.resolution is not None
+    profile = result.resolution.review_slots[0].profile
     with pytest.raises(TypeError):
         TrustedSemanticEvaluatorResolution()
-    # The pure result carries declarations only; it has no admission, invocation,
-    # disclosure, rereview, canonical-state, or provider operation fields.
-    assert not any(hasattr(result.resolution, field) for field in ("admit", "disclosure", "invocation", "canonical_state"))
+    # The selected nominal IDs cannot substitute for the caller-unmintable G5
+    # authority products: each must originate at its own trusted boundary.
+    with pytest.raises(TypeError):
+        TrustedVerdictSchemaContext(profile.verdict_schema_id, "1")
+    with pytest.raises(TypeError):
+        TrustedReviewProfileAdmissionContext(profile.config_id)
+    with pytest.raises(TypeError):
+        TrustedDisclosureAuthorizationBinding(profile.disclosure_policy_id)
+    with pytest.raises(TypeError):
+        TrustedReReviewAuthorization(profile.rereview_policy_id)
+    with pytest.raises(TypeError):
+        TrustedReviewInvocationRecord(result.resolution.review_slots[0])
+
+
+def test_independence_binding_is_configured_identity_not_invocation_authority():
+    resolution = _resolve().resolution
+    assert resolution is not None
+    slot = resolution.review_slots[0]
+    assert type(slot.independence_binding) is RawSha256
+    # Possession of the configured digest cannot mint trusted invocation
+    # provenance or a downstream authorization record.
+    with pytest.raises(TypeError):
+        TrustedReviewInvocationRecord(slot.independence_binding)
+    with pytest.raises(TypeError):
+        TrustedReReviewAuthorization(slot.independence_binding)
 
 
 def test_semantic_config_size_limit_is_applied_only_after_digest_verification():

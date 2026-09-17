@@ -169,22 +169,51 @@ def _parse_positive_decimal(value: object, maximum: int) -> int | None:
 def _profile(value: object, config_id: ImmutableConfigId) -> tuple[ReviewerProfileBinding | None, SemanticEvaluatorConfigResolutionReason | None]:
     if not _fields(value, _PROFILE_FIELDS):
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
-    if any(type(value[name]) is not str for name in ("profile_id", "service_id", "verdict_schema_id", "tool_mode", "rereview_policy_id", "disclosure_policy_id")) or type(value["raw_limits"]) is not MappingProxyType or type(value["service_constraint_ids"]) is not tuple or type(value["provider_metadata_requirement_ids"]) is not tuple:
+    # First apply JSON field types in the frozen profile-field order.  The
+    # following value checks deliberately repeat that order; do not coalesce
+    # later policy IDs with earlier profile facts.
+    if type(value["profile_id"]) is not str:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["service_id"]) is not str:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["verdict_schema_id"]) is not str:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["raw_limits"]) is not MappingProxyType:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["tool_mode"]) is not str:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["service_constraint_ids"]) is not tuple:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["provider_metadata_requirement_ids"]) is not tuple:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["rereview_policy_id"]) is not str:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(value["disclosure_policy_id"]) is not str:
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     try:
         profile_id = ReviewerProfileId(value["profile_id"])
+    except (TypeError, ValueError):
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    try:
         service_id = ReviewerServiceId(value["service_id"])
+    except (TypeError, ValueError):
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    try:
         verdict_schema_id = ImmutableConfigId(value["verdict_schema_id"])
-        rereview_policy_id = ImmutableConfigId(value["rereview_policy_id"])
-        disclosure_policy_id = ImmutableConfigId(value["disclosure_policy_id"])
     except (TypeError, ValueError):
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     limits = value["raw_limits"]
     if not _fields(limits, _RAW_LIMIT_FIELDS):
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(limits["max_bytes"]) is not Decimal:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if type(limits["max_depth"]) is not Decimal:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     maximum_bytes = _parse_positive_decimal(limits["max_bytes"], ABSOLUTE_MAX_BYTES)
+    if maximum_bytes is None:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     maximum_depth = _parse_positive_decimal(limits["max_depth"], ABSOLUTE_MAX_DEPTH)
-    if maximum_bytes is None or maximum_depth is None:
+    if maximum_depth is None:
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     try:
         tool_mode = ToolMode(value["tool_mode"])
@@ -193,13 +222,27 @@ def _profile(value: object, config_id: ImmutableConfigId) -> tuple[ReviewerProfi
     if tool_mode is not ToolMode.NO_TOOLS:
         return None, SemanticEvaluatorConfigResolutionReason.UNSUPPORTED_TOOL_MODE
     services = _identity_array(value["service_constraint_ids"], ReviewerServiceConstraintId)
-    metadata = _identity_array(value["provider_metadata_requirement_ids"], ProviderMetadataRequirementId)
-    if services is None or metadata is None:
+    if services is None:
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
-    if len(set(services)) != len(services) or len(set(metadata)) != len(metadata) or not _canonical(services) or not _canonical(metadata):
+    if len(set(services)) != len(services) or not _canonical(services):
         return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
-    if len(services) > MAX_REVIEWER_SERVICE_CONSTRAINTS_PER_PROFILE or len(metadata) > MAX_PROVIDER_METADATA_REQUIREMENTS_PER_PROFILE:
+    if len(services) > MAX_REVIEWER_SERVICE_CONSTRAINTS_PER_PROFILE:
         return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
+    metadata = _identity_array(value["provider_metadata_requirement_ids"], ProviderMetadataRequirementId)
+    if metadata is None:
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    if len(set(metadata)) != len(metadata) or not _canonical(metadata):
+        return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
+    if len(metadata) > MAX_PROVIDER_METADATA_REQUIREMENTS_PER_PROFILE:
+        return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
+    try:
+        rereview_policy_id = ImmutableConfigId(value["rereview_policy_id"])
+    except (TypeError, ValueError):
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    try:
+        disclosure_policy_id = ImmutableConfigId(value["disclosure_policy_id"])
+    except (TypeError, ValueError):
+        return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
     return ReviewerProfileBinding(profile_id, config_id, service_id, verdict_schema_id, ParseLimits(maximum_bytes, maximum_depth), tool_mode, services, metadata, rereview_policy_id, disclosure_policy_id), None
 
 
