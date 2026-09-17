@@ -224,17 +224,9 @@ def _profile(value: object, config_id: ImmutableConfigId) -> tuple[ReviewerProfi
     services = _identity_array(value["service_constraint_ids"], ReviewerServiceConstraintId)
     if services is None:
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
-    if len(set(services)) != len(services) or not _canonical(services):
-        return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
-    if len(services) > MAX_REVIEWER_SERVICE_CONSTRAINTS_PER_PROFILE:
-        return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
     metadata = _identity_array(value["provider_metadata_requirement_ids"], ProviderMetadataRequirementId)
     if metadata is None:
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
-    if len(set(metadata)) != len(metadata) or not _canonical(metadata):
-        return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
-    if len(metadata) > MAX_PROVIDER_METADATA_REQUIREMENTS_PER_PROFILE:
-        return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
     try:
         rereview_policy_id = ImmutableConfigId(value["rereview_policy_id"])
     except (TypeError, ValueError):
@@ -243,6 +235,17 @@ def _profile(value: object, config_id: ImmutableConfigId) -> tuple[ReviewerProfi
         disclosure_policy_id = ImmutableConfigId(value["disclosure_policy_id"])
     except (TypeError, ValueError):
         return None, SemanticEvaluatorConfigResolutionReason.CONFIG_GRAMMAR_INVALID
+    # All field lexical/enum/value checks have now passed.  Only now perform
+    # the distinct duplicate/canonical phase, in frozen collection order.
+    if len(set(services)) != len(services) or not _canonical(services):
+        return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
+    if len(set(metadata)) != len(metadata) or not _canonical(metadata):
+        return None, SemanticEvaluatorConfigResolutionReason.NONCANONICAL_CONFIG
+    # Bounds are a final cross-field/bounded-work phase, after canonicality.
+    if len(services) > MAX_REVIEWER_SERVICE_CONSTRAINTS_PER_PROFILE:
+        return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
+    if len(metadata) > MAX_PROVIDER_METADATA_REQUIREMENTS_PER_PROFILE:
+        return None, SemanticEvaluatorConfigResolutionReason.RESOLUTION_LIMIT_EXCEEDED
     return ReviewerProfileBinding(profile_id, config_id, service_id, verdict_schema_id, ParseLimits(maximum_bytes, maximum_depth), tool_mode, services, metadata, rereview_policy_id, disclosure_policy_id), None
 
 

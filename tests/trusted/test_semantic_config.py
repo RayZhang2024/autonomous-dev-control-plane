@@ -152,15 +152,38 @@ def test_profile_frozen_precedence_raw_limits_win_over_later_policy_ids():
     assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
 
 
-def test_profile_frozen_precedence_service_constraints_win_over_later_policy_ids():
+def test_profile_phase_lexical_policy_id_wins_over_noncanonical_service_constraints():
     value = _config(); profile = value["review_slots"][0]["profile"]
     profile["service_constraint_ids"] = ["z", "a"]; profile["rereview_policy_id"] = ""
+    assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
+
+
+def test_profile_phase_lexical_policy_id_wins_over_noncanonical_provider_metadata():
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile["provider_metadata_requirement_ids"] = ["z", "a"]; profile["disclosure_policy_id"] = ""
+    assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
+
+
+@pytest.mark.parametrize("field", ["service_constraint_ids", "provider_metadata_requirement_ids"])
+def test_profile_phase_lexical_collection_failure_precedes_later_policy_id(field):
+    value = _config(); profile = value["review_slots"][0]["profile"]
+    profile[field] = [""]; profile["rereview_policy_id"] = ""
+    assert _resolve(value).reason is Reason.CONFIG_GRAMMAR_INVALID
+
+
+@pytest.mark.parametrize("field", ["service_constraint_ids", "provider_metadata_requirement_ids"])
+def test_profile_phase_canonical_collection_failure_follows_all_lexical_fields(field):
+    value = _config(); value["review_slots"][0]["profile"][field] = ["z", "a"]
     assert _resolve(value).reason is Reason.NONCANONICAL_CONFIG
 
 
-def test_profile_frozen_precedence_provider_metadata_wins_over_later_policy_ids():
+@pytest.mark.parametrize("field", ["service_constraint_ids", "provider_metadata_requirement_ids"])
+def test_profile_phase_bounds_follow_canonical_validation(field):
     value = _config(); profile = value["review_slots"][0]["profile"]
-    profile["provider_metadata_requirement_ids"] = ["z", "a"]; profile["disclosure_policy_id"] = ""
+    prefix = "service" if field == "service_constraint_ids" else "metadata"
+    profile[field] = [f"{prefix}-{index:03}" for index in range(65)]
+    assert _resolve(value).reason is Reason.RESOLUTION_LIMIT_EXCEEDED
+    profile[field] = list(reversed(profile[field]))
     assert _resolve(value).reason is Reason.NONCANONICAL_CONFIG
 
 
