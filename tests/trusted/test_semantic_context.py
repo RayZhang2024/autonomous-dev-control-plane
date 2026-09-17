@@ -30,11 +30,11 @@ def mint(cls, **fields):
     return value
 
 
-def reader(*, pages, profile="event", transport="transport"):
+def reader(*, pages, profile="event", transport="transport", permitted=(REPO,)):
     binding = mint(TrustedGitHubReadTransportBinding, config_id=ImmutableConfigId(transport),
         expected_api_host_identity=ImmutableConfigId("host"), authentication_mode_identity=ImmutableConfigId("auth"),
         service_identity=__import__("autodev_control.trusted.scope", fromlist=["ServicePrincipalId"]).ServicePrincipalId("reader"),
-        permitted_repository_ids=(REPO,), transport_profile_id=ImmutableConfigId("read"))
+        permitted_repository_ids=permitted, transport_profile_id=ImmutableConfigId("read"))
     transport_value = object.__new__(AuthenticatedGitHubReadTransport)
     values = list(pages)
     def execute(request, cursor):
@@ -71,6 +71,25 @@ def item(number=1, *, head=HEAD, base=BASE, base_ref="refs/heads/main"):
 def page(items):
     return {"repository_id": REPO.value, "head_ref": "refs/heads/autodev/candidates/" + "3" * 64,
             "items": items, "next_cursor": None, "complete": True}
+
+
+def pr_inputs(*, pages=None, policy_fields=None, contract_fields=None, materialization_fields=None,
+              target_value=None, reader_kwargs=None):
+    profile, state_reader = reader(pages=pages or [page([item()]), page([item()])], profile="pr", **(reader_kwargs or {}))
+    policy_fields = {"profile_id": profile.profile_id, "policy_epoch_identity": EPOCH,
+                     "target_registration_id": TARGET, "repository_id": REPO,
+                     "transport_config_id": ImmutableConfigId("transport"), **(policy_fields or {})}
+    policy = mint(TrustedSemanticPullRequestObservationPolicy, **policy_fields)
+    raw = RawSha256("4" * 64)
+    contract = mint(__import__("autodev_control.trusted.contract", fromlist=["AdmittedIssueContract"]).AdmittedIssueContract,
+                    **{"target_registration_id": TARGET, "contract_id": CONTRACT, "contract_raw_sha256": raw,
+                       "base_sha": BASE, "integration_ref": CanonicalBranchRef("refs/heads/main"), **(contract_fields or {})})
+    materialization = mint(AdmittedCandidateMaterialization,
+                           **{"target_registration_id": TARGET, "repository_id": REPO, "contract_id": CONTRACT,
+                              "contract_raw_sha256": raw, "policy_epoch_identity": EPOCH, "base_commit": BASE,
+                              "candidate_commit": HEAD, "materialization_id": CandidateMaterializationId(RawSha256("3" * 64)),
+                              **(materialization_fields or {})})
+    return target_value or target(), contract, materialization, source(policy=policy, pr_reader=state_reader)
 
 
 def test_target_uses_registration_profiles_and_ignores_unrelated_sources():
@@ -242,3 +261,63 @@ def test_pr_result_and_page_bounds_are_exactly_64_then_incomplete_at_65():
     pages65 = [dict(page([]), complete=False, next_cursor=f"c{index}") for index in range(64)] + [page([item(1)])]
     profile, overflow_reader = reader(pages=pages65, profile="pr")
     assert overflow_reader.read_candidate_pull_request_set(request, profile.profile_id).failure is StateReadFailure.INCOMPLETE
+
+
+@pytest.mark.parametrize("policy_fields, reader_kwargs", [
+    ({"target_registration_id": TargetRegistrationId(RawSha256("5" * 64))}, {}),
+    ({"policy_epoch_identity": PolicyEpochIdentity(TrustedManifestId(RawSha256("5" * 64)))}, {}),
+    ({"repository_id": GitHubRepositoryId("2")}, {}),
+    ({"transport_config_id": ImmutableConfigId("other")}, {}),
+    ({}, {"permitted": ()}),
+])
+def test_pr_policy_and_reader_continuity_contradictions_are_source_invalid(policy_fields, reader_kwargs):
+    inputs = pr_inputs(policy_fields=policy_fields, reader_kwargs=reader_kwargs)
+    result = resolve_current_semantic_pull_request_context(*inputs)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.SOURCE_INVALID
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+def test_pr_missing_source_policy_or_reader_is_indeterminate():
+    resolved, contract, materialization, present = pr_inputs()
+    assert resolve_current_semantic_pull_request_context(resolved, contract, materialization, None).reason is CurrentSemanticPullRequestContextReason.SOURCE_UNAVAILABLE
+    assert resolve_current_semantic_pull_request_context(resolved, contract, materialization, source()).reason is CurrentSemanticPullRequestContextReason.SOURCE_UNAVAILABLE
+    assert resolve_current_semantic_pull_request_context(resolved, contract, materialization,
+        mint(TrustedSemanticContextObservationSource, target_bindings=(), pull_request_policy=present.pull_request_policy, pull_request_reader=None)).reason is CurrentSemanticPullRequestContextReason.SOURCE_UNAVAILABLE
+
+
+def test_pr_complete_cardinality_has_no_favorable_tie_break():
+    resolved, contract, materialization, current = pr_inputs(pages=[page([]), page([])])
+    assert resolve_current_semantic_pull_request_context(resolved, contract, materialization, current).reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_UNAVAILABLE
+    resolved, contract, materialization, current = pr_inputs(pages=[page([item(2), item(1)]), page([item(1), item(2)])])
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+@pytest.mark.parametrize("pages, reason", [
+    ([{"repository_id": REPO.value}], CurrentSemanticPullRequestContextReason.PR_OBSERVATION_UNAVAILABLE),
+    ([dict(page([]), complete=False, next_cursor=None)], CurrentSemanticPullRequestContextReason.PR_OBSERVATION_INCOMPLETE),
+    ([page([item(1)]), page([item(2)])], CurrentSemanticPullRequestContextReason.PR_OBSERVATION_MOVED),
+    ([page([dict(item(), head_repository_id="2")])], CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT),
+])
+def test_pr_failure_mapping_never_preserves_partial_context(pages, reason):
+    resolved, contract, materialization, current = pr_inputs(pages=pages)
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.reason is reason
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+@pytest.mark.parametrize("contract_fields, materialization_fields", [
+    ({"target_registration_id": TargetRegistrationId(RawSha256("5" * 64))}, {}),
+    ({}, {"target_registration_id": TargetRegistrationId(RawSha256("5" * 64))}),
+    ({}, {"repository_id": GitHubRepositoryId("2")}),
+    ({"contract_id": ContractId("other")}, {}),
+    ({"base_sha": GitSha("c" * 40)}, {}),
+])
+def test_pr_pre_read_contract_candidate_target_continuity_fails_before_transport(contract_fields, materialization_fields):
+    resolved, contract, materialization, current = pr_inputs(contract_fields=contract_fields, materialization_fields=materialization_fields)
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
