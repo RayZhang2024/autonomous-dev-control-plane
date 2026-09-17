@@ -25,8 +25,9 @@ from .state_reader import (
 )
 
 MAX_CURRENT_SEMANTIC_TARGET_CONTEXT_DEPENDENCIES = 64
-MAX_CURRENT_SEMANTIC_PR_DISCOVERY_PAGES = 64
-MAX_CURRENT_SEMANTIC_PR_DISCOVERY_RESULTS = 64
+# The G6 PR read owns its bounded enumeration constants.  Re-exporting their
+# names here documents B1's frozen boundary without creating a second limit.
+from .state_reader import MAX_CURRENT_SEMANTIC_PR_DISCOVERY_PAGES, MAX_CURRENT_SEMANTIC_PR_DISCOVERY_RESULTS
 _SOURCE_KEY = object()
 
 
@@ -102,6 +103,7 @@ class CurrentSemanticPullRequestContextResolution:
 
 @dataclass(frozen=True, slots=True, init=False)
 class TrustedSemanticTargetObservationBinding:
+    required_profile_id: ImmutableConfigId
     profile: AuthoritativeObservationProfile
     reader: GitHubStateReader
 
@@ -181,7 +183,11 @@ def resolve_current_semantic_target_context(
         return _target_failure(SemanticContextResolutionStatus.DENIED, CurrentSemanticTargetContextReason.SOURCE_INVALID)
     dependencies: list[AuthoritativeStateDependency] = []
     for required_id in required:
-        candidates = tuple(item for item in source.target_bindings if type(getattr(item, "profile", None)) is AuthoritativeObservationProfile and item.profile.profile_id == required_id)
+        # Selection uses the root-installed selector, never the profile it
+        # carries.  This preserves a contradiction for deterministic denial.
+        candidates = tuple(item for item in source.target_bindings
+                           if type(getattr(item, "required_profile_id", None)) is ImmutableConfigId
+                           and item.required_profile_id == required_id)
         if not candidates:
             return _target_failure(SemanticContextResolutionStatus.INDETERMINATE, CurrentSemanticTargetContextReason.TARGET_PROFILE_SOURCE_UNAVAILABLE)
         if len(candidates) != 1:
@@ -190,7 +196,10 @@ def resolve_current_semantic_target_context(
         reader_binding = _reader_binding(binding.reader)
         if reader_binding is None:
             return _target_failure(SemanticContextResolutionStatus.DENIED, CurrentSemanticTargetContextReason.SOURCE_INVALID)
-        if (binding.profile.profile_id != required_id or resolved_target.registration.repository_id not in reader_binding.permitted_repository_ids):
+        if (type(getattr(binding, "profile", None)) is not AuthoritativeObservationProfile
+                or binding.required_profile_id != required_id
+                or binding.profile.profile_id != required_id
+                or resolved_target.registration.repository_id not in reader_binding.permitted_repository_ids):
             return _target_failure(SemanticContextResolutionStatus.DENIED, CurrentSemanticTargetContextReason.TARGET_PROFILE_BINDING_MISMATCH)
         result = binding.reader.read_authoritative(resolved_target.registration.repository_id, binding.profile)
         if result.status is not AuthoritativeStateReadStatus.SUCCESS:

@@ -18,6 +18,8 @@ from .scope import CanonicalGitPath, GitHubRepositoryId, ServicePrincipalId
 
 G6_MAX_CHANGED_FILE_PAGES = 1024
 G6_MAX_CHANGED_FILES = 100_000
+MAX_CURRENT_SEMANTIC_PR_DISCOVERY_PAGES = 64
+MAX_CURRENT_SEMANTIC_PR_DISCOVERY_RESULTS = 64
 
 
 def _positive(value: object, name: str) -> int:
@@ -701,7 +703,7 @@ class GitHubStateReader:
         try:
             while True:
                 pages += 1
-                if pages > 64:
+                if pages > MAX_CURRENT_SEMANTIC_PR_DISCOVERY_PAGES:
                     return StateReadFailure.INCOMPLETE
                 raw = self._transport.read(request, cursor)
                 if type(raw) is not dict or set(raw) != {"repository_id", "head_ref", "items", "next_cursor", "complete"}:
@@ -717,14 +719,18 @@ class GitHubStateReader:
                     if observed.number in seen_numbers:
                         return StateReadFailure.INCOMPLETE
                     seen_numbers.add(observed.number)
-                    if (observed.state == "open" and not observed.merged
+                    # The authenticated adapter is the closed query boundary.
+                    # Returning a non-member contradicts that boundary; it is
+                    # not safe to silently discard the item.
+                    if not (observed.state == "open" and not observed.merged
                             and observed.base_repository_id == request.repository_id
                             and observed.head_repository_id == request.repository_id
                             and observed.head_ref == request.head_ref
                             and observed.merge_sha is None):
-                        observations.append(observed)
-                        if len(observations) > 64:
-                            return StateReadFailure.INCOMPLETE
+                        return StateReadFailure.MISMATCH
+                    observations.append(observed)
+                    if len(observations) > MAX_CURRENT_SEMANTIC_PR_DISCOVERY_RESULTS:
+                        return StateReadFailure.INCOMPLETE
                 next_cursor = raw["next_cursor"]
                 if next_cursor is not None and (type(next_cursor) is not str or not next_cursor or next_cursor in seen_cursors):
                     return StateReadFailure.INCOMPLETE

@@ -56,7 +56,9 @@ def target(event_ids=(ImmutableConfigId("event"),)):
 
 
 def source(bindings=(), policy=None, pr_reader=None):
-    items = tuple(mint(TrustedSemanticTargetObservationBinding, profile=profile, reader=reader) for profile, reader in bindings)
+    items = tuple(mint(TrustedSemanticTargetObservationBinding, required_profile_id=selector,
+                       profile=profile, reader=reader)
+                  for selector, profile, reader in bindings)
     return mint(TrustedSemanticContextObservationSource, target_bindings=items, pull_request_policy=policy, pull_request_reader=pr_reader)
 
 
@@ -74,7 +76,7 @@ def page(items):
 def test_target_uses_registration_profiles_and_ignores_unrelated_sources():
     needed, needed_reader = reader(pages=[])
     extra, extra_reader = reader(pages=[], profile="extra")
-    result = resolve_current_semantic_target_context(target(), source(((needed, needed_reader), (extra, extra_reader))))
+    result = resolve_current_semantic_target_context(target(), source(((ImmutableConfigId("event"), needed, needed_reader), (ImmutableConfigId("extra"), extra, extra_reader))))
     assert result.status is SemanticContextResolutionStatus.RESOLVED
     assert len(result.dependencies) == 1 and result.dependencies[0].observation_profile_id == ImmutableConfigId("event")
     expected = contract_json_value_digest(("autodev.current-semantic-target-context/v1", REPO.value, TARGET.raw_sha256.value,
@@ -85,8 +87,17 @@ def test_target_uses_registration_profiles_and_ignores_unrelated_sources():
 def test_target_missing_duplicate_and_empty_sources_fail_closed_in_frozen_domains():
     profile, state_reader = reader(pages=[])
     assert resolve_current_semantic_target_context(target(), source()).reason is CurrentSemanticTargetContextReason.TARGET_PROFILE_SOURCE_UNAVAILABLE
-    assert resolve_current_semantic_target_context(target(), source(((profile, state_reader), (profile, state_reader)))).reason is CurrentSemanticTargetContextReason.SOURCE_INVALID
+    assert resolve_current_semantic_target_context(target(), source(((ImmutableConfigId("event"), profile, state_reader), (ImmutableConfigId("event"), profile, state_reader)))).reason is CurrentSemanticTargetContextReason.SOURCE_INVALID
     assert resolve_current_semantic_target_context(target(()), source()).reason is CurrentSemanticTargetContextReason.TARGET_PROFILE_SET_UNAVAILABLE
+
+
+def test_target_selector_profile_mismatch_is_denied_not_reclassified_as_missing():
+    wrong_profile, state_reader = reader(pages=[], profile="other")
+    result = resolve_current_semantic_target_context(
+        target(), source(((ImmutableConfigId("event"), wrong_profile, state_reader),))
+    )
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticTargetContextReason.TARGET_PROFILE_BINDING_MISMATCH
 
 
 def test_target_limit_allows_64_and_denies_65_before_reading():
@@ -97,7 +108,7 @@ def test_target_limit_allows_64_and_denies_65_before_reading():
 def test_target_exactly_64_sources_resolve_in_canonical_dependency_order():
     profile, state_reader = reader(pages=[])
     ids = tuple(ImmutableConfigId(f"p{i:02}") for i in range(64))
-    bindings = tuple((mint(AuthoritativeObservationProfile, profile_id=item, registered_fact_descriptors=profile.registered_fact_descriptors), state_reader) for item in reversed(ids))
+    bindings = tuple((item, mint(AuthoritativeObservationProfile, profile_id=item, registered_fact_descriptors=profile.registered_fact_descriptors), state_reader) for item in reversed(ids))
     result = resolve_current_semantic_target_context(target(ids), source(bindings))
     assert result.status is SemanticContextResolutionStatus.RESOLVED
     assert tuple(item.observation_profile_id for item in result.dependencies) == ids
@@ -117,7 +128,7 @@ def test_target_read_failure_mapping_never_keeps_partial_dependency_or_identity(
     # Reader's authoritative descriptor is malformed for its exact target repository.
     bad = mint(AuthoritativeObservationProfile, profile_id=profile.profile_id,
                registered_fact_descriptors=())
-    result = resolve_current_semantic_target_context(target(), source(((bad, state_reader),)))
+    result = resolve_current_semantic_target_context(target(), source(((ImmutableConfigId("event"), bad, state_reader),)))
     assert result.status is SemanticContextResolutionStatus.INDETERMINATE
     assert result.reason is CurrentSemanticTargetContextReason.TARGET_OBSERVATION_UNAVAILABLE
     assert result.state_read_failure is StateReadFailure.INCOMPLETE
@@ -197,3 +208,37 @@ def test_pr_enumeration_duplicate_and_malformed_pages_fail_closed_without_bindin
     profile, malformed_reader = reader(pages=[{"repository_id": REPO.value}], profile="pr")
     malformed = malformed_reader.read_candidate_pull_request_set(request, profile.profile_id)
     assert malformed.failure is StateReadFailure.MALFORMED_RESPONSE and malformed.binding_id is None
+
+
+@pytest.mark.parametrize("changes", [
+    {"state": "closed"}, {"merged": True, "state": "closed", "merge_sha": "d" * 40},
+    {"base_repository_id": "2"}, {"head_repository_id": "2"},
+    {"head_ref": "refs/heads/other"}, {"merge_sha": "d" * 40},
+])
+def test_pr_adapter_contract_rejects_every_nonmember_instead_of_silent_filtering(changes):
+    raw = item()
+    raw.update(changes)
+    profile, state_reader = reader(pages=[page([raw])], profile="pr")
+    result = state_reader.read_candidate_pull_request_set(
+        ReadCandidatePullRequestSet(REPO, GitRef("refs/heads/autodev/candidates/" + "3" * 64)), profile.profile_id)
+    assert result.status is AuthoritativeStateReadStatus.FAILURE
+    assert result.failure is StateReadFailure.MISMATCH and result.binding_id is None
+
+
+def test_pr_result_and_page_bounds_are_exactly_64_then_incomplete_at_65():
+    request = ReadCandidatePullRequestSet(REPO, GitRef("refs/heads/autodev/candidates/" + "3" * 64))
+    items64 = [item(number=index + 1) for index in range(64)]
+    profile, reader64 = reader(pages=[page(items64), page(items64)], profile="pr")
+    assert reader64.read_candidate_pull_request_set(request, profile.profile_id).status is AuthoritativeStateReadStatus.SUCCESS
+    items65 = [item(number=index + 1) for index in range(65)]
+    profile, reader65 = reader(pages=[page(items65)], profile="pr")
+    assert reader65.read_candidate_pull_request_set(request, profile.profile_id).failure is StateReadFailure.INCOMPLETE
+    pages64 = [dict(page([item(1)]), complete=False, next_cursor=f"c{index}") for index in range(63)] + [page([item(1)])]
+    # The duplicate number itself makes this incomplete before the page limit;
+    # use empty intermediate pages to exercise the exact page bound.
+    pages64 = [dict(page([]), complete=False, next_cursor=f"c{index}") for index in range(63)] + [page([item(1)])]
+    profile, pages_reader = reader(pages=pages64 + pages64, profile="pr")
+    assert pages_reader.read_candidate_pull_request_set(request, profile.profile_id).status is AuthoritativeStateReadStatus.SUCCESS
+    pages65 = [dict(page([]), complete=False, next_cursor=f"c{index}") for index in range(64)] + [page([item(1)])]
+    profile, overflow_reader = reader(pages=pages65, profile="pr")
+    assert overflow_reader.read_candidate_pull_request_set(request, profile.profile_id).failure is StateReadFailure.INCOMPLETE
