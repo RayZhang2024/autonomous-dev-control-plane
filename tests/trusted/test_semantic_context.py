@@ -444,3 +444,51 @@ def test_pr_resolver_derives_closed_request_from_target_and_candidate_without_hi
     assert "SemanticReviewEffectiveSubject" not in implementation
     assert "ProtectedEffectMarker" not in implementation
     assert "CreatedCandidatePrEffectSubject" not in implementation
+
+
+@pytest.mark.parametrize("snapshot_fields", [
+    {"repository_id": GitHubRepositoryId("2")},
+    {"observation_profile_id": ImmutableConfigId("other")},
+    {"transport_config_id": ImmutableConfigId("other")},
+], ids=("repository", "profile", "transport"))
+def test_target_post_read_snapshot_identity_contradictions_are_denied(monkeypatch, snapshot_fields):
+    profile, state_reader = reader(pages=[])
+    snapshot = AuthoritativeStateSnapshot(
+        **{"repository_id": REPO, "observation_profile_id": profile.profile_id,
+           "transport_config_id": ImmutableConfigId("transport"),
+           "observations": (NormalizedGitHubObservation("repository", (REPO.value, "o", "r")),),
+           **snapshot_fields})
+    result_value = AuthoritativeStateReadResult(
+        AuthoritativeStateReadStatus.SUCCESS, snapshot, authoritative_state_binding(snapshot))
+    monkeypatch.setattr(GitHubStateReader, "read_authoritative", lambda *_: result_value)
+    result = resolve_current_semantic_target_context(target(), source(((ImmutableConfigId("event"), profile, state_reader),)))
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticTargetContextReason.TARGET_PROFILE_BINDING_MISMATCH
+    assert result.target_context_id is None and result.dependencies == ()
+
+
+def test_manual_authenticated_current_pr_needs_no_g7_provenance_and_grants_none():
+    """B1 admits current facts, not a protected-effect authority token."""
+    resolved, contract, materialization, current = pr_inputs()
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.RESOLVED
+    assert result.pull_request_identity is not None and len(result.dependencies) == 1
+    # The resolver result offers no operation, capability, marker, merge or
+    # publication constructor; its only result fields are factual context.
+    assert tuple(field.name for field in fields(CurrentSemanticPullRequestContextResolution)) == (
+        "status", "reason", "pull_request_identity", "dependencies", "state_read_failure")
+    implementation = inspect.getsource(resolve_current_semantic_pull_request_context)
+    for prohibited in ("ProtectedEffectMarker", "CreatedCandidatePrEffectSubject", "MergeCapability",
+                       "TargetPublicationCapability", "OperationRecord", "EvidenceRecord",
+                       "SemanticReviewAssignment", "SemanticReviewEffectiveSubject", "TaskRecord"):
+        assert prohibited not in implementation
+
+
+def test_b1_module_has_no_canonical_persistence_cache_or_write_authority_surface():
+    exported = vars(contexts)
+    for prohibited in ("InMemoryCanonicalStateBackend", "CanonicalTransaction", "FixtureGitPlatform",
+                       "reserve_operation", "start_operation", "publish_candidate", "merge_candidate",
+                       "complete_task", "EvidenceRecord", "SemanticReviewAssignment"):
+        assert prohibited not in exported
+    assert not any(("cache" in name.lower() or "registry" in name.lower()) and not name.startswith("__")
+                   for name in exported)
