@@ -53,9 +53,11 @@ def reader(*, pages, profile="event", transport="transport", permitted=(REPO,), 
     return mint(AuthoritativeObservationProfile, profile_id=ImmutableConfigId(profile), registered_fact_descriptors=(descriptor,)), GitHubStateReader(binding, transport_value)
 
 
-def target(event_ids=(ImmutableConfigId("event"),), *, target_id=TARGET, epoch=EPOCH):
+def target(event_ids=(ImmutableConfigId("event"),), *, target_id=TARGET, epoch=EPOCH,
+           integration_refs=(CanonicalBranchRef("refs/heads/main"),), merge_present=True):
     registration = mint(AdmittedTargetRegistration, repository_id=REPO, event_state_profile_ids=event_ids,
-        merge=MergeConfiguration(__import__("autodev_control.trusted.scope", fromlist=["ServicePrincipalId"]).ServicePrincipalId("merge"), ImmutableConfigId("merge"), (CanonicalBranchRef("refs/heads/main"),)))
+        merge=(MergeConfiguration(__import__("autodev_control.trusted.scope", fromlist=["ServicePrincipalId"]).ServicePrincipalId("merge"), ImmutableConfigId("merge"), integration_refs)
+               if merge_present else None))
     return mint(ResolvedTargetRegistration, registration=registration, target_registration_id=target_id,
                 root_config_id=ImmutableConfigId("root"), policy_epoch_identity=epoch)
 
@@ -492,3 +494,76 @@ def test_b1_module_has_no_canonical_persistence_cache_or_write_authority_surface
         assert prohibited not in exported
     assert not any(("cache" in name.lower() or "registry" in name.lower()) and not name.startswith("__")
                    for name in exported)
+
+
+def test_pr_discovered_wrong_base_sha_is_denied_after_complete_set_read():
+    resolved, contract, materialization, current = pr_inputs(
+        pages=[page([item(base=GitSha("c" * 40))]), page([item(base=GitSha("c" * 40))])])
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+def test_pr_contract_integration_ref_mismatch_follows_allowed_ref_continuity():
+    release = CanonicalBranchRef("refs/heads/release")
+    resolved, contract, materialization, current = pr_inputs(
+        target_value=target(integration_refs=(CanonicalBranchRef("refs/heads/main"), release)),
+        pages=[page([item(base_ref=release.value)]), page([item(base_ref=release.value)])])
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+def test_pr_missing_merge_configuration_is_denied_after_discovery():
+    resolved, contract, materialization, current = pr_inputs(target_value=target(merge_present=False))
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
+
+
+@pytest.mark.parametrize("materialization_fields", [
+    {"contract_raw_sha256": RawSha256("5" * 64)},
+    {"policy_epoch_identity": PolicyEpochIdentity(TrustedManifestId(RawSha256("5" * 64)))},
+], ids=("contract-raw", "policy-epoch"))
+def test_pr_pre_read_raw_and_epoch_continuity_do_not_execute_external_query(materialization_fields):
+    seen = []
+    resolved, contract, materialization, current = pr_inputs(materialization_fields=materialization_fields,
+        reader_kwargs={"record": seen})
+    result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, current)
+    assert result.status is SemanticContextResolutionStatus.DENIED
+    assert result.reason is CurrentSemanticPullRequestContextReason.PR_CONTEXT_CONFLICT
+    assert result.pull_request_identity is None and result.dependencies == ()
+    assert not any(type(request) is ReadCandidatePullRequestSet for request in seen)
+
+
+def test_historical_target_identity_is_not_current_authority_or_source_substitute():
+    # The resolver accepts only current target/source inputs.  A historical
+    # G5 identity cannot be supplied and missing current source remains fatal.
+    assert tuple(inspect.signature(resolve_current_semantic_target_context).parameters) == ("resolved_target", "source")
+    result = resolve_current_semantic_target_context(target(), None)
+    assert result.reason is CurrentSemanticTargetContextReason.SOURCE_UNAVAILABLE
+    assert result.target_context_id is None and result.dependencies == ()
+    assert "SemanticReviewEffectiveSubject" not in inspect.getsource(resolve_current_semantic_target_context)
+
+
+def test_target_and_pr_context_resolvers_do_not_read_the_other_dimension():
+    profile, target_reader = reader(pages=[])
+    target_result = resolve_current_semantic_target_context(
+        target(), mint(TrustedSemanticContextObservationSource,
+                       target_bindings=(mint(TrustedSemanticTargetObservationBinding, required_profile_id=ImmutableConfigId("event"),
+                                             profile=profile, reader=target_reader),),
+                       pull_request_policy=object(), pull_request_reader=object()))
+    assert target_result.status is SemanticContextResolutionStatus.RESOLVED
+    target_reads = []
+    bad_profile, bad_target_reader = reader(pages=[], record=target_reads)
+    resolved, contract, materialization, pr_source = pr_inputs()
+    independent = mint(TrustedSemanticContextObservationSource,
+        target_bindings=(mint(TrustedSemanticTargetObservationBinding, required_profile_id=ImmutableConfigId("event"),
+                              profile=bad_profile, reader=bad_target_reader),),
+        pull_request_policy=pr_source.pull_request_policy, pull_request_reader=pr_source.pull_request_reader)
+    pr_result = resolve_current_semantic_pull_request_context(resolved, contract, materialization, independent)
+    assert pr_result.status is SemanticContextResolutionStatus.RESOLVED
+    assert not any(type(request) is ReadRepositoryIdentity for request in target_reads)
