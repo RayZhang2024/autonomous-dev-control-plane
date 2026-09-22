@@ -7,7 +7,7 @@ persists evidence nor calls reviewers, providers, GitHub, or protected effects.
 from dataclasses import dataclass
 from enum import Enum
 
-from .identity import GitSha, ImmutableConfigId, RawSha256
+from .identity import CandidateMaterializationId, GitSha, ImmutableConfigId, RawSha256, SemanticEvaluatorObligationId
 from .manifest import PolicyEpochIdentity
 from .operation import AdmissionEventId, CandidateId, EvidenceId, OperationId, OperationRecord, OperationState
 from .parsing import ParseLimits
@@ -96,6 +96,17 @@ class EvidenceAdmissionReasonCode(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticReviewEvidenceBinding:
+    """Semantic-only provenance; never a generic evidence authority."""
+    obligation_id: SemanticEvaluatorObligationId
+    candidate_materialization_id: CandidateMaterializationId
+
+    def __post_init__(self) -> None:
+        if type(self.obligation_id) is not SemanticEvaluatorObligationId or type(self.candidate_materialization_id) is not CandidateMaterializationId:
+            raise TypeError("semantic review binding has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceSubject:
     repository_id: GitHubRepositoryId
     task_id: TaskId
@@ -117,6 +128,7 @@ class EvidenceSubject:
     profile_id: ReviewerProfileId
     profile_config_id: ImmutableConfigId
     verdict_schema_id: ImmutableConfigId
+    semantic_review_binding: SemanticReviewEvidenceBinding | None = None
 
     def __post_init__(self) -> None:
         from .review import MaterialIdentity, TrustedContextId
@@ -142,6 +154,8 @@ class EvidenceSubject:
         ):
             if type(values) is not tuple or any(type(item) is not expected for item in values) or len(set(values)) != len(values):
                 raise TypeError(f"{name} must be an exact duplicate-free tuple")
+        if self.semantic_review_binding is not None and type(self.semantic_review_binding) is not SemanticReviewEvidenceBinding:
+            raise TypeError("semantic_review_binding has wrong exact type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +225,11 @@ class EvidenceRecord:
                  (self.payload, SemanticEvidencePayload))
         if any(type(value) is not expected for value, expected in exact):
             raise TypeError("evidence record field has wrong exact type")
+        if self.evidence_class is EvidenceClass.SEMANTIC_REVIEW:
+            if self.subject.semantic_review_binding is None:
+                raise ValueError("semantic evidence requires exact semantic provenance")
+        elif self.subject.semantic_review_binding is not None:
+            raise ValueError("non-semantic evidence cannot carry semantic provenance")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -320,6 +339,7 @@ def _echo_matches(echo, subject: EvidenceSubject) -> bool:
 def _effective_subject_matches_evidence_subject(
     effective: SemanticReviewEffectiveSubject, subject: EvidenceSubject,
 ) -> bool:
+    semantic = subject.semantic_review_binding
     return (
         effective.repository_id == subject.repository_id
         and effective.task_id == subject.task_id
@@ -336,6 +356,11 @@ def _effective_subject_matches_evidence_subject(
         and effective.requirement_ids == subject.requirement_ids
         and effective.required_material_ids == subject.required_material_ids
         and effective.required_context_ids == subject.required_context_ids
+        and semantic is not None
+        and effective.obligation_id is not None
+        and effective.candidate_materialization_id is not None
+        and semantic.obligation_id == effective.obligation_id
+        and semantic.candidate_materialization_id == effective.candidate_materialization_id
     )
 
 
@@ -440,6 +465,23 @@ def admit_semantic_review(request: SemanticEvidenceAdmissionRequest | None) -> E
     assignment = request.assignment
     if assignment is None:
         return _result(EvidenceAdmissionReasonCode.REQUEST_BINDING_MISMATCH)
+    binding = request.subject.semantic_review_binding
+    if (
+        binding is None
+        or assignment.obligation_id is None
+        or assignment.candidate_materialization_id is None
+        or request.effective_subject.obligation_id is None
+        or request.effective_subject.candidate_materialization_id is None
+        or not (
+            binding.obligation_id == assignment.obligation_id == request.effective_subject.obligation_id
+        )
+        or not (
+            binding.candidate_materialization_id
+            == assignment.candidate_materialization_id
+            == request.effective_subject.candidate_materialization_id
+        )
+    ):
+        return _result(EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH)
     if assignment.partition_rule is not ReviewPartitionRule.SINGLE_REVIEW_PACKAGE:
         return _result(EvidenceAdmissionReasonCode.UNSUPPORTED_REVIEW_PARTITIONING)
     assignment_requirements = tuple(item.requirement_id for item in assignment.requirements)

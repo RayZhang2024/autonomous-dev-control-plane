@@ -53,6 +53,7 @@ def subject():
         policy_epoch_identity=EPOCH, base=GitSha("a" * 40), target_context_id=TargetContextId("target"), pr_id=PullRequestIdentity("pr"),
         requirement_ids=(SemanticRequirementId("r1"),), required_material_ids=(MaterialIdentity("m1"),),
         required_context_ids=(TrustedContextId("c1"),), composition_rule_id=CompositionRuleId("composition"),
+        assignment_id=None, obligation_id=None, candidate_materialization_id=None,
     )
 
 

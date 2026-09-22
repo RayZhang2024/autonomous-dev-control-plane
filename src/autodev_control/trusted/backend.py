@@ -90,6 +90,21 @@ class ResolvedTargetRegistration:
         raise TypeError("resolved target registration must come from root/admin configuration")
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class CanonicalCurrentSemanticReviewInputs:
+    """One-occurrence read used solely by the #32 derived-view boundary."""
+    canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding
+    contract: AdmittedIssueContract
+    authorization: AdmittedAuthorization
+    task: TaskRecord
+    candidate: CandidateRecord | None
+    materialization: AdmittedCandidateMaterialization | None
+    resolved_target: ResolvedTargetRegistration
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("current semantic review inputs come from canonical state")
+
+
 @dataclass(frozen=True, slots=True)
 class TaskOperationMembershipRecord:
     task_id: TaskId
@@ -1074,6 +1089,39 @@ class InMemoryCanonicalStateBackend:
                 tuple(self._state.operations[item] for item in membership.operation_ids),
                 tuple(self._state.evidence[item.evidence_id] for item in task.supporting_evidence_refs),
             )
+
+    def read_current_semantic_review_inputs(
+        self, task_id: TaskId,
+    ) -> CanonicalCurrentSemanticReviewInputs | None:
+        """Read all #32 canonical facts under one generation fence."""
+        if type(task_id) is not TaskId:
+            raise TypeError("exact TaskId required")
+        with self._lock:
+            task = self._state.tasks.get(task_id)
+            if task is None:
+                return None
+            contract = self._state.contracts.get(task.contract_id)
+            authorization = self._state.authorizations.get(task.authorization_id)
+            target = self._resolved_targets.get(task.target_registration_id)
+            candidate = self._state.candidates.get(task.current_candidate_id)
+            materialization = None if candidate is None else self._state.candidate_materializations.get(candidate.materialization_id)
+            if contract is None or authorization is None or target is None:
+                return None
+            result = object.__new__(CanonicalCurrentSemanticReviewInputs)
+            for name, value in (
+                ("canonical_state_occurrence_binding", CanonicalStateOccurrenceBinding(BackendGeneration(self._generation))),
+                ("contract", contract), ("authorization", authorization), ("task", task),
+                ("candidate", candidate), ("materialization", materialization), ("resolved_target", target),
+            ):
+                object.__setattr__(result, name, value)
+            return result
+
+    def read_evidence(self, evidence_id: EvidenceId) -> EvidenceRecord | None:
+        """Exact canonical evidence lookup for structural #32 reconstruction."""
+        if type(evidence_id) is not EvidenceId:
+            raise TypeError("exact EvidenceId required")
+        with self._lock:
+            return self._state.evidence.get(evidence_id)
 
     def read_authorization(self, authorization_id: AuthorizationId) -> AdmittedAuthorization | None:
         """Return the exact immutable canonical authorization for trusted orchestration."""

@@ -417,6 +417,11 @@ def test_independence_binding_is_configured_identity_not_invocation_authority():
 
 
 def test_semantic_config_size_limit_is_applied_only_after_digest_verification():
-    raw = b"{" + b" " * (SEMANTIC_EVALUATOR_CONFIG_MAX_BYTES + 1) + b"}"
-    result = resolve_semantic_evaluator_config(_basic(raw), raw)
+    valid = _raw(_config())
+    exact = valid + b" " * (SEMANTIC_EVALUATOR_CONFIG_MAX_BYTES - len(valid))
+    assert len(exact) == SEMANTIC_EVALUATOR_CONFIG_MAX_BYTES
+    assert resolve_semantic_evaluator_config(_basic(exact), exact).status is Status.RESOLVED
+    over = exact + b" "
+    assert len(over) == SEMANTIC_EVALUATOR_CONFIG_MAX_BYTES + 1
+    result = resolve_semantic_evaluator_config(_basic(over), over)
     assert (result.status, result.reason) == (Status.DENIED, Reason.RESOLUTION_LIMIT_EXCEEDED)

@@ -6,7 +6,7 @@ import pytest
 
 from autodev_control.trusted.backend import BackendGeneration, CanonicalStateOccurrenceBinding
 from autodev_control.trusted.evidence import *
-from autodev_control.trusted.identity import GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256
+from autodev_control.trusted.identity import CandidateMaterializationId, GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256, SemanticEvaluatorObligationId, SemanticEvaluatorResolutionId
 from autodev_control.trusted.manifest import PolicyEpochIdentity, TrustedManifestId
 from autodev_control.trusted.operation import AdmissionEventId, CandidateId, EvidenceId, OperationId, OperationIntent, OperationRecord, OperationState
 from autodev_control.trusted.parsing import ParseLimits
@@ -53,6 +53,9 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
     )
     slot = ReviewSlot(ReviewSlotId("slot"), profile, RAW)
     composition = SemanticReviewCompositionRule(CompositionRuleId("composition"), CompositionMode.SINGLE_REQUIRED_INVOCATION, (slot,))
+    materialization_id = CandidateMaterializationId(RAW)
+    obligation_id = SemanticEvaluatorObligationId(RAW)
+    resolution_id = SemanticEvaluatorResolutionId(RAW)
     effective = mint(
         SemanticReviewEffectiveSubject, subject_id=SemanticReviewEffectiveSubjectId("subject"), repository_id=GitHubRepositoryId("1"),
         task_id=TaskId("task"), candidate_id=CandidateId("candidate"), contract_id=ContractId("contract"),
@@ -60,7 +63,8 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         target_registration_id=TargetRegistrationId(RAW), policy_epoch_identity=EPOCH, base=GitSha("a" * 40),
         target_context_id=TargetContextId("target"), pr_id=PullRequestIdentity("pr"), requirement_ids=(SemanticRequirementId("r1"),),
         required_material_ids=(MaterialIdentity("m"),), required_context_ids=(TrustedContextId("c"),),
-        composition_rule_id=composition.composition_rule_id,
+        composition_rule_id=composition.composition_rule_id, assignment_id=AssignmentIdentity("assignment"),
+        obligation_id=obligation_id, candidate_materialization_id=materialization_id,
     )
     subject = EvidenceSubject(
         effective.repository_id, effective.task_id, effective.contract_id, RAW,
@@ -69,6 +73,7 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         effective.requirement_ids, effective.required_material_ids, effective.required_context_ids,
         ReviewInvocationId("inv"), slot.slot_id,
         profile.profile_id, profile.config_id, profile.verdict_schema_id,
+        SemanticReviewEvidenceBinding(obligation_id, materialization_id),
     )
     assignment = mint(
         SemanticReviewAssignment, assignment_id=AssignmentIdentity("assignment"), repository_id=subject.repository_id,
@@ -77,7 +82,8 @@ def fixture(raw=None, operation_state=OperationState.SUCCEEDED, disclosure=Discl
         candidate_id=subject.candidate_id, requirements=(SemanticRequirement(SemanticRequirementId("r1"), RAW),),
         material_assignments=(RequirementMaterialAssignment(SemanticRequirementId("r1"), subject.required_material_ids, subject.required_context_ids, ()),),
         required_context_ids=subject.required_context_ids, composition_rule=composition,
-        partition_rule=ReviewPartitionRule.SINGLE_REVIEW_PACKAGE,
+        partition_rule=ReviewPartitionRule.SINGLE_REVIEW_PACKAGE, obligation_id=obligation_id,
+        candidate_materialization_id=materialization_id, semantic_evaluator_resolution_id=resolution_id,
     )
     manifest = ReviewInputManifest(
         ReviewInputManifestId("manifest"), subject.invocation_id, CanonicalRequestId("request"),
@@ -195,6 +201,39 @@ def test_admits_approved_and_carries_exact_history_cas_binding():
     assert result.decision is EvidenceAdmissionDecision.ADMIT
     assert result.expected_evidence_history_membership_binding == EvidenceHistoryMembershipBindingId("H0")
     assert result.proposed_evidence_record.payload.aggregate is SemanticVerdict.APPROVED
+
+
+def test_semantic_admission_rejects_missing_issue32_semantic_provenance():
+    request = fixture()
+    assert admit_semantic_review(replace(
+        request, subject=replace(request.subject, semantic_review_binding=None),
+    )).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize("field", ("obligation_id", "candidate_materialization_id"))
+def test_semantic_admission_rejects_issue32_provenance_movement(field):
+    request = fixture()
+    binding = request.subject.semantic_review_binding
+    replacement = (
+        SemanticEvaluatorObligationId(RawSha256("8" * 64))
+        if field == "obligation_id" else CandidateMaterializationId(RawSha256("8" * 64))
+    )
+    assert admit_semantic_review(replace(
+        request, subject=replace(request.subject, semantic_review_binding=replace(binding, **{field: replacement})),
+    )).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize("field", ("obligation_id", "candidate_materialization_id"))
+def test_semantic_admission_rejects_assignment_provenance_movement(field):
+    request = fixture()
+    replacement = (
+        SemanticEvaluatorObligationId(RawSha256("9" * 64))
+        if field == "obligation_id" else CandidateMaterializationId(RawSha256("9" * 64))
+    )
+    moved_assignment = minted_copy(request.assignment, **{field: replacement})
+    assert request.subject.semantic_review_binding.obligation_id == request.effective_subject.obligation_id
+    assert request.subject.semantic_review_binding.candidate_materialization_id == request.effective_subject.candidate_materialization_id
+    assert admit_semantic_review(replace(request, assignment=moved_assignment)).reason_code is EvidenceAdmissionReasonCode.SUBJECT_BINDING_MISMATCH
 
 
 def test_succeeded_changes_required_is_valid_admitted_failure_evidence():
