@@ -13,10 +13,11 @@ from autodev_control.trusted.authorization import (
 from autodev_control.trusted.backend import *
 from autodev_control.trusted.evidence import (
     EvidenceClass, EvidenceRecord, EvidenceSubject, SemanticEvidencePayload,
+    SemanticReviewEvidenceBinding,
     EvidenceSupersessionRecord, TrustedAdmittedEvidenceRecord,
     TrustedSupersessionAuthorization, build_evidence_supersession_record,
 )
-from autodev_control.trusted.identity import CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256
+from autodev_control.trusted.identity import CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId, OperationStartBindingId, RawSha256, SemanticEvaluatorObligationId, SemanticEvaluatorResolutionId
 from autodev_control.trusted.materialization import (
     FixtureGitCommit, FixtureGitObjectStore, FixtureGitTree, FixtureGitTreeEntry,
     GitObjectKind, TrustedCandidateMaterializationContext,
@@ -143,6 +144,8 @@ def operation(name="operation", *, candidate_id=None, evidence=(), repair=False,
 
 
 def effective_subject(subject_id="subject"):
+    obligation_id = SemanticEvaluatorObligationId(ID_RAW)
+    materialization_id = CandidateMaterializationId(ID_RAW)
     return mint(
         SemanticReviewEffectiveSubject,
         subject_id=SemanticReviewEffectiveSubjectId(subject_id), repository_id=REPOSITORY,
@@ -152,6 +155,8 @@ def effective_subject(subject_id="subject"):
         policy_epoch_identity=EPOCH, base=BASE, target_context_id=TargetContextId("target"),
         pr_id=PullRequestIdentity("pr"), requirement_ids=(), required_material_ids=(),
         required_context_ids=(), composition_rule_id=CompositionRuleId("composition"),
+        assignment_id=AssignmentIdentity("assignment"), obligation_id=obligation_id,
+        candidate_materialization_id=materialization_id,
     )
 
 
@@ -164,6 +169,7 @@ def evidence(subject=None, evidence_id="evidence"):
         subject.candidate_id, BASE, subject.target_context_id, subject.pr_id,
         (), (), (), invocation, slot, ReviewerProfileId("profile"),
         ImmutableConfigId("profile-config"), ImmutableConfigId("schema"),
+        SemanticReviewEvidenceBinding(subject.obligation_id, subject.candidate_materialization_id),
     )
     payload = SemanticEvidencePayload(
         subject.subject_id, slot, invocation, ReviewEnvelopeId("envelope"),
@@ -189,6 +195,30 @@ def initialized_backend(*, task_epoch=EPOCH):
     result = apply(store, CreateContract(CONTRACT_RECORD), CreateAuthorization(admitted_authorization()), CreateTaskAndInitialOperationMembership(task(epoch=task_epoch)))
     assert result.status is CanonicalWriteStatus.APPLIED
     return store
+
+
+def test_current_semantic_review_read_returns_one_exact_canonical_occurrence_tuple():
+    store = initialized_backend()
+    before = store.occurrence
+    initial = store.read_current_semantic_review_inputs(TASK)
+    assert initial is not None
+    assert initial.canonical_state_occurrence_binding == before
+    assert initial.contract is CONTRACT_RECORD
+    assert initial.task.task_id == TASK
+    assert initial.authorization.authorization_id == AUTH
+    assert initial.candidate is None and initial.materialization is None
+    assert initial.resolved_target.target_registration_id == TARGET
+
+    candidate = adopt_canonical_candidate(store)
+    later = store.read_current_semantic_review_inputs(TASK)
+    assert later is not None
+    assert later.canonical_state_occurrence_binding == store.occurrence
+    assert later.canonical_state_occurrence_binding != initial.canonical_state_occurrence_binding
+    assert later.candidate is candidate
+    assert later.materialization is not None
+    assert later.materialization.materialization_id == candidate.materialization_id
+    # The first immutable read remains an exact historical occurrence, never a mixed tuple.
+    assert initial.candidate is None and initial.materialization is None
 
 
 def admitted_candidate_pair(candidate_id=CandidateId("candidate"), *,

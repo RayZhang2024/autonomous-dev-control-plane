@@ -6,12 +6,12 @@ review invocation, disclosure, persistence, provider access, or external effect.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 
-from .identity import GitSha, ImmutableConfigId, LogicalIdentifier, RawSha256
+from .identity import CandidateMaterializationId, GitSha, ImmutableConfigId, LogicalIdentifier, RawSha256, SemanticEvaluatorObligationId, SemanticEvaluatorResolutionId
 from .manifest import PolicyEpochIdentity
 from .operation import (
     AdmissionEventId, CandidateId, EvidenceId, OperationId,
@@ -610,6 +610,11 @@ class SemanticReviewAssignment:
     required_context_ids: tuple[TrustedContextId, ...]
     composition_rule: SemanticReviewCompositionRule
     partition_rule: ReviewPartitionRule
+    # These are optional only for pre-#32 historical fixture/provenance values.
+    # Contract-derived #32 construction requires all three exact identities.
+    obligation_id: SemanticEvaluatorObligationId | None = field(default=None)
+    candidate_materialization_id: CandidateMaterializationId | None = field(default=None)
+    semantic_evaluator_resolution_id: SemanticEvaluatorResolutionId | None = field(default=None)
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("assignment must come from trusted contract/policy composition")
@@ -634,6 +639,9 @@ class SemanticReviewEffectiveSubject:
     required_material_ids: tuple[MaterialIdentity, ...]
     required_context_ids: tuple[TrustedContextId, ...]
     composition_rule_id: CompositionRuleId
+    assignment_id: AssignmentIdentity | None = field(default=None)
+    obligation_id: SemanticEvaluatorObligationId | None = field(default=None)
+    candidate_materialization_id: CandidateMaterializationId | None = field(default=None)
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("effective subject must come from trusted composition")
