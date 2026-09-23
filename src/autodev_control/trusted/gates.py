@@ -40,7 +40,9 @@ from .contract import (
     load_candidate_issue_contract,
 )
 from .evidence import (
-    EvidenceAdmissionDecision, SemanticEvidenceAdmissionRequest, admit_semantic_review,
+    EvidenceAdmissionDecision, EvidenceClass, SemanticEvidenceAdmissionRequest,
+    SemanticEvidenceCurrentnessStatus, consume_current_semantic_evidence,
+    admit_semantic_review,
 )
 from .decision import Decision
 from .errors import G4FailureCode
@@ -78,16 +80,21 @@ from .scope import (
 )
 from .state import (
     CancellationRequestId, CancellationStatus, ConditionStatus, EvidenceBindingRef,
-    OperationRevisionBinding, RepairBudget, TaskEvaluationInput,
+    OperationRevisionBinding, RepairBudget, TaskEvaluationInput, TaskState,
     _compose_candidate_applicability, _compose_completion_aggregate,
     adopt_candidate, evaluate_task, initial_task_proposal, reserve_task_operation,
     revise_supporting_evidence, set_cancellation, start_operation as decide_start_operation,
 )
+from .current_semantic_review import (
+    CurrentSemanticReviewResolutionStatus, TrustedSemanticConfigByteReader,
+    resolve_current_semantic_review,
+)
+from .semantic_context import TrustedSemanticContextObservationSource
+from .state_reader import AuthoritativeStateDependency, AuthoritativeStateDependencySet
 from .manifest import PolicyEpochIdentity
 from .operation import AdmissionEventId, CandidateId, DecisionEventId
 from .state_reader import (
-    AuthoritativeObservationProfile, AuthoritativeStateDependency,
-    AuthoritativeStateDependencySet, AuthoritativeStateSnapshot,
+    AuthoritativeObservationProfile, AuthoritativeStateSnapshot,
     GitHubPullRequestNumber, GitHubStateReader, RegisteredStateFactDescriptor,
     TrustedGitHubReadTransportBinding,
 )
@@ -123,6 +130,64 @@ class GateResultCode(Enum):
     INDETERMINATE = "INDETERMINATE"
     AUDIT_FAILURE_BEFORE_COMMIT = "AUDIT_FAILURE_BEFORE_COMMIT"
     AUDIT_FAILURE_AFTER_COMMIT = "AUDIT_FAILURE_AFTER_COMMIT"
+
+
+class TaskSemanticDenialCode(Enum):
+    NEXT_INTEGRATION_OPERATION_INVALID = "NEXT_INTEGRATION_OPERATION_INVALID"
+    SEMANTIC_CONTRACT_UNSATISFIED = "SEMANTIC_CONTRACT_UNSATISFIED"
+    SEMANTIC_CONTEXT_INDETERMINATE = "SEMANTIC_CONTEXT_INDETERMINATE"
+    REQUIRED_SEMANTIC_EVIDENCE_NOT_CURRENT = "REQUIRED_SEMANTIC_EVIDENCE_NOT_CURRENT"
+    REQUIRED_SEMANTIC_EVIDENCE_NOT_PROGRESSION_SUPPORT = "REQUIRED_SEMANTIC_EVIDENCE_NOT_PROGRESSION_SUPPORT"
+
+
+class ProtectedStartSemanticDenialCode(Enum):
+    REQUIRED_EVIDENCE_NOT_CURRENT = "REQUIRED_EVIDENCE_NOT_CURRENT"
+    REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION = "REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION"
+    REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE = "REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE"
+
+
+class _TaskSemanticDenied(ValueError):
+    __slots__ = ("code",)
+
+    def __init__(self, code: TaskSemanticDenialCode) -> None:
+        if type(code) is not TaskSemanticDenialCode:
+            raise TypeError("semantic task denial requires closed code")
+        super().__init__(code.value)
+        self.code = code
+
+
+def _canonical_semantic_dependency_union(
+    g1_base_dependency: AuthoritativeStateDependency,
+    semantic_dependencies: tuple[AuthoritativeStateDependency, ...],
+) -> tuple[AuthoritativeStateDependency, ...] | None:
+    """Union exact G1 and #32 dependency facts without repairing either input."""
+    if (type(g1_base_dependency) is not AuthoritativeStateDependency
+            or type(semantic_dependencies) is not tuple):
+        return None
+    try:
+        # #32 owns canonicalization of its set.  Reject malformed lower-layer
+        # input before the one permitted cross-layer exact-duplicate collapse.
+        AuthoritativeStateDependencySet(semantic_dependencies)
+    except (TypeError, ValueError):
+        return None
+    by_locator: dict[tuple, AuthoritativeStateDependency] = {}
+    for item in (g1_base_dependency, *semantic_dependencies):
+        if type(item) is not AuthoritativeStateDependency:
+            return None
+        previous = by_locator.get(item.locator)
+        if previous is not None:
+            if previous.expected_binding_id != item.expected_binding_id:
+                return None
+            continue
+        by_locator[item.locator] = item
+    canonical = tuple(by_locator[key] for key in sorted(
+        by_locator, key=lambda locator: tuple(value.value for value in locator)
+    ))
+    try:
+        AuthoritativeStateDependencySet(canonical)
+    except (TypeError, ValueError):
+        return None
+    return canonical
 
 
 class ProtectedEffectSubject(Enum):
@@ -419,6 +484,7 @@ class ControlStateCommitRequest:
     command_kind: TrustedControlCommandKind
     transaction: CanonicalTransaction
     required_authoritative_binding_ids: tuple[AuthoritativeStateBindingId, ...]
+    required_authoritative_dependencies: tuple[AuthoritativeStateDependency, ...]
     _key: object
 
     def __init__(self, *_: object, **__: object) -> None:
@@ -431,6 +497,7 @@ class GateResult:
     canonical_result: CanonicalWriteResult | None = None
     continuation: LiveProtectedEffectContinuation | None = None
     failure_code: G4FailureCode | None = None
+    semantic_denial_code: ProtectedStartSemanticDenialCode | None = None
 
     def __post_init__(self) -> None:
         if type(self.code) is not GateResultCode:
@@ -441,6 +508,11 @@ class GateResult:
             raise TypeError("continuation has wrong exact type")
         if self.failure_code is not None and type(self.failure_code) is not G4FailureCode:
             raise TypeError("failure code has wrong exact type")
+        if (self.semantic_denial_code is not None
+                and type(self.semantic_denial_code) is not ProtectedStartSemanticDenialCode):
+            raise TypeError("semantic denial code has wrong exact type")
+        if self.failure_code is not None and self.semantic_denial_code is not None:
+            raise ValueError("G4 failure and semantic denial are mutually exclusive")
 
 
 class _DeterministicStartDenied(ValueError):
@@ -1155,7 +1227,8 @@ class TrustedControlCommandBoundary:
     ) -> ControlStateCommitRequest:
         if type(command) is TaskEvaluationInput:
             raise TypeError("callers cannot submit trusted TaskEvaluationInput")
-        return self._controller.evaluate_task(command)
+        request = self._controller.evaluate_task(command)
+        return self._runtime._veto_task_transition(command, request)
 
     def set_cancellation(self, *args, **kwargs) -> ControlStateCommitRequest:
         return self._controller.set_cancellation(*args, **kwargs)
@@ -1174,7 +1247,7 @@ class FixtureProtectedGateRuntime:
     """Holds fixture authority; a new instance is a process restart boundary."""
 
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
-                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_object_store", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
+                 "registry", "_lock", "_nonce", "_controller_key", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_semantic_contexts", "_object_store", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
                  platform: FixtureGitPlatform, audit: FixtureGateAudit,
@@ -1196,6 +1269,7 @@ class FixtureProtectedGateRuntime:
         self._contract_contexts: dict[str, TrustedIssueContractAdmissionContext] = {}
         self._evidence_contexts: dict[ImmutableConfigId, SemanticEvidenceAdmissionRequest] = {}
         self._completion_contexts: dict[ImmutableConfigId, TrustedCompletionEvaluationContext] = {}
+        self._semantic_contexts: dict[TaskId, tuple] = {}
         if object_store is not None and type(object_store) is not FixtureGitObjectStore:
             raise TypeError("fixture Git-object store has wrong exact type")
         self._object_store = object_store
@@ -1398,6 +1472,208 @@ class FixtureProtectedGateRuntime:
                 raise ValueError("completion context identity conflict")
             self._completion_contexts[context.context_id] = context
 
+    def register_semantic_consumption_context(
+        self, task_id: TaskId, applicability_context: TrustedIssueContractApplicabilityContext,
+        byte_reader: TrustedSemanticConfigByteReader | None,
+        semantic_context_source: TrustedSemanticContextObservationSource | None,
+        g1_base_dependency: AuthoritativeStateDependency,
+    ) -> None:
+        """Install root-assembled #29 inputs; none cross an untrusted command."""
+        if (type(task_id) is not TaskId
+                or type(applicability_context) is not TrustedIssueContractApplicabilityContext
+                or (byte_reader is not None and type(byte_reader) is not TrustedSemanticConfigByteReader)
+                or (semantic_context_source is not None
+                    and type(semantic_context_source) is not TrustedSemanticContextObservationSource)
+                or type(g1_base_dependency) is not AuthoritativeStateDependency):
+            raise TypeError("exact trusted semantic-consumption environment required")
+        observation = applicability_context.base_observation
+        if (observation is None
+                or observation.authoritative_state_binding_id
+                != g1_base_dependency.expected_binding_id):
+            raise ValueError("G1 base dependency must bind the exact G1 base observation")
+        with self._lock:
+            self._semantic_contexts[task_id] = (
+                applicability_context, byte_reader, semantic_context_source,
+                g1_base_dependency,
+            )
+
+    def _resolve_semantic_consumption(
+        self, task_id: TaskId, requested_evidence_ids: tuple[EvidenceId, ...],
+        expected_occurrence=None,
+    ):
+        environment = self._semantic_contexts.get(task_id)
+        if environment is None:
+            return None
+        applicability_context, byte_reader, context_source, base_dependency = environment
+        inputs = self.backend.read_current_semantic_review_inputs(task_id)
+        if inputs is None:
+            return None
+        if (expected_occurrence is not None
+                and inputs.canonical_state_occurrence_binding != expected_occurrence):
+            return None
+        base_observation = applicability_context.base_observation
+        if (base_observation is None
+                or base_observation.authoritative_state_binding_id
+                != base_dependency.expected_binding_id
+                or base_dependency.repository_id
+                != inputs.resolved_target.registration.repository_id):
+            return None
+        resolution = resolve_current_semantic_review(
+            inputs, applicability_context=applicability_context,
+            byte_reader=byte_reader, semantic_context_source=context_source,
+        )
+        subject_ids = tuple(
+            item.effective_subject.subject_id for item in resolution.obligation_outcomes
+            if item.status.value == "RESOLVED" and item.effective_subject is not None
+        ) if resolution.status is CurrentSemanticReviewResolutionStatus.RESOLVED else ()
+        snapshot = self.backend.read_semantic_consumption_snapshot(
+            task_id, inputs.canonical_state_occurrence_binding, subject_ids,
+            requested_evidence_ids,
+        )
+        if snapshot is None:
+            return None
+        try:
+            result = consume_current_semantic_evidence(
+                resolution, snapshot, requested_evidence_ids,
+                current_contract=inputs.contract,
+            )
+        except (TypeError, ValueError):
+            return None
+        canonical_dependencies = _canonical_semantic_dependency_union(
+            base_dependency, result.authoritative_dependencies,
+        )
+        if canonical_dependencies is None:
+            return None
+        return replace(result, authoritative_dependencies=canonical_dependencies)
+
+    def _veto_task_transition(
+        self, command: TaskEvaluationCommand, request: ControlStateCommitRequest,
+    ) -> ControlStateCommitRequest:
+        current = self.backend.read_task_working_set(command.task_id)
+        if (current is None
+                or current.canonical_state_occurrence_binding
+                != request.transaction.expected_state_occurrence):
+            raise _TaskSemanticDenied(TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE)
+        replacement = next((item.task for item in request.transaction.mutations
+                            if type(item) is ReplaceTask), None)
+        if replacement is None or replacement.state not in (
+            TaskState.INTEGRATION_READY, TaskState.COMPLETED
+        ):
+            return request
+        required_ids: tuple[EvidenceId, ...] = ()
+        selected_operation = None
+        if replacement.state is TaskState.INTEGRATION_READY:
+            selected_operation = next((item for item in current.operations
+                if item.intent.operation_id == replacement.next_integration_operation_id), None)
+            if (replacement.next_integration_operation_id is None
+                    or selected_operation is None
+                    or selected_operation.intent.effect_class
+                    is not OperationEffectClass.PROTECTED_OR_AUTHORITATIVE_EFFECT
+                    or type(selected_operation.intent.integration_binding) is not IntegrationBound):
+                raise _TaskSemanticDenied(
+                    TaskSemanticDenialCode.NEXT_INTEGRATION_OPERATION_INVALID
+                )
+            required_ids = selected_operation.intent.required_evidence_ids
+        semantic = self._resolve_semantic_consumption(
+            command.task_id, required_ids, current.canonical_state_occurrence_binding,
+        )
+        if semantic is None:
+            raise _TaskSemanticDenied(TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE)
+        if semantic.contract_status is ConditionStatus.UNSATISFIED:
+            raise _TaskSemanticDenied(TaskSemanticDenialCode.SEMANTIC_CONTRACT_UNSATISFIED)
+        if semantic.contract_status is not ConditionStatus.SATISFIED:
+            raise _TaskSemanticDenied(TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE)
+        if replacement.state is TaskState.INTEGRATION_READY:
+            statuses = {item.evidence_id: item for item in semantic.evidence_currentness}
+            for evidence_id in required_ids:
+                # The evidence result is exact for every requested ID.  A missing
+                # lookup is treated as an indeterminate canonical inconsistency.
+                result = statuses.get(evidence_id)
+                if result is None:
+                    raise _TaskSemanticDenied(
+                        TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE
+                    )
+                if result.status is SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC:
+                    continue
+                if result.status is not SemanticEvidenceCurrentnessStatus.CURRENT:
+                    code = (TaskSemanticDenialCode.REQUIRED_SEMANTIC_EVIDENCE_NOT_CURRENT
+                            if result.status in (SemanticEvidenceCurrentnessStatus.STALE,
+                                                 SemanticEvidenceCurrentnessStatus.NOT_FOUND)
+                            else TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE)
+                    raise _TaskSemanticDenied(code)
+                if not any(evidence_id in item.progression_support_evidence_ids
+                           for item in semantic.obligation_results):
+                    raise _TaskSemanticDenied(
+                        TaskSemanticDenialCode.REQUIRED_SEMANTIC_EVIDENCE_NOT_PROGRESSION_SUPPORT
+                    )
+        object.__setattr__(request, "required_authoritative_binding_ids", tuple(
+            item.expected_binding_id for item in semantic.authoritative_dependencies
+        ))
+        object.__setattr__(request, "required_authoritative_dependencies",
+                           semantic.authoritative_dependencies)
+        return request
+
+    def _protected_start_semantic_denial(
+        self, operation: OperationRecord, subject: ProtectedEffectSubject,
+        expected_occurrence,
+        dependencies: ControlStateAuthoritativeDependencySet,
+    ) -> ProtectedStartSemanticDenialCode | None:
+        working = self.backend.read_task_working_set(operation.intent.task_id)
+        if (working is None
+                or working.canonical_state_occurrence_binding != expected_occurrence
+                or self.backend.occurrence != expected_occurrence):
+            return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        canonical_operation = next((
+            item for item in working.operations
+            if item.intent.operation_id == operation.intent.operation_id
+        ), None)
+        if canonical_operation != operation:
+            return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        forward = (
+            subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
+            and type(operation.intent.integration_binding) is IntegrationBound
+            and working.task.state is TaskState.INTEGRATION_READY
+            and working.task.next_integration_operation_id
+            == operation.intent.operation_id
+        )
+        if not operation.intent.required_evidence_ids and not forward:
+            return None
+        semantic = self._resolve_semantic_consumption(
+            operation.intent.task_id, operation.intent.required_evidence_ids,
+            expected_occurrence,
+        )
+        if (semantic is None or semantic.occurrence != expected_occurrence
+                or self.backend.occurrence != expected_occurrence):
+            return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        currentness = {item.evidence_id: item for item in semantic.evidence_currentness}
+        for evidence_id in operation.intent.required_evidence_ids:
+            result = currentness.get(evidence_id)
+            if result is None:
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+            if result.status in (SemanticEvidenceCurrentnessStatus.STALE,
+                                 SemanticEvidenceCurrentnessStatus.NOT_FOUND):
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT
+            if result.status is SemanticEvidenceCurrentnessStatus.INDETERMINATE:
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        if forward:
+            if semantic.contract_status is ConditionStatus.UNSATISFIED:
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION
+            if semantic.contract_status is not ConditionStatus.SATISFIED:
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+            for evidence_id in operation.intent.required_evidence_ids:
+                result = currentness.get(evidence_id)
+                if result is not None and result.status is SemanticEvidenceCurrentnessStatus.CURRENT:
+                    if not any(evidence_id in item.progression_support_evidence_ids
+                               for item in semantic.obligation_results):
+                        return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION
+        lease_dependencies = dependencies.dependencies
+        if any(item not in lease_dependencies for item in semantic.authoritative_dependencies):
+            return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        if (not self._dependencies_fresh_set(dependencies)
+                or self.backend.occurrence != expected_occurrence):
+            return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        return None
+
     def _compose_semantic_evidence_request(
         self, command: SemanticEvidenceCommand,
     ) -> SemanticEvidenceAdmissionRequest:
@@ -1531,6 +1807,9 @@ class FixtureProtectedGateRuntime:
             if required_bindings and frozenset(required_bindings) != frozenset(
                 item.expected_binding_id for item in lease.dependencies.dependencies
             ):
+                return GateResult(GateResultCode.LEASE_INVALID)
+            required_dependencies = getattr(request, "required_authoritative_dependencies", ())
+            if required_dependencies and required_dependencies != lease.dependencies.dependencies:
                 return GateResult(GateResultCode.LEASE_INVALID)
             if type(lease) is not ControlStateCommitLease or not self._dependencies_fresh(lease) or not self._is_active():
                 return GateResult(GateResultCode.LEASE_INVALID)
@@ -1967,6 +2246,24 @@ class FixtureProtectedGateRuntime:
                 )
                 self.registry.release(prepared.target_fence_token)
                 return GateResult(GateResultCode.REJECTED)
+            semantic_denial = self._protected_start_semantic_denial(
+                operation, subject,
+                request.transaction.expected_state_occurrence,
+                prepared.control_lease.dependencies,
+            )
+            if semantic_denial is not None:
+                if not self._release_durable_prepared(
+                    prepared.prepared_start, prepared.target_fence_token
+                ):
+                    self.registry.release(prepared.target_fence_token)
+                    return GateResult(GateResultCode.INDETERMINATE)
+                self.registry.release(prepared.target_fence_token)
+                return GateResult(
+                    GateResultCode.REJECTED,
+                    semantic_denial_code=semantic_denial,
+                )
+            object.__setattr__(request, "required_authoritative_dependencies",
+                               prepared.control_lease.dependencies.dependencies)
             fence = prepared.action_target_fence
             if (self.platform.read_ref(fence.repository_id, fence.ref) != fence.expected_sha
                     or (fence.base_ref is not None and self.platform.read_ref(
@@ -2454,6 +2751,7 @@ class FixtureProtectedGateRuntime:
         restarted._contract_contexts.update(self._contract_contexts)
         restarted._evidence_contexts.update(self._evidence_contexts)
         restarted._completion_contexts.update(self._completion_contexts)
+        restarted._semantic_contexts.update(self._semantic_contexts)
         return restarted
 
     def fail_after_start_commit_for_test(self) -> None:

@@ -4,6 +4,8 @@ Admission results are conditional non-bearer proposals.  This module neither
 persists evidence nor calls reviewers, providers, GitHub, or protected effects.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 
@@ -910,6 +912,7 @@ class SemanticCompositionResult:
     reason: SemanticCompositionReason
     requirement_statuses: tuple[SemanticRequirementStatus, ...]
     evidence_history_membership_binding: EvidenceHistoryMembershipBindingId
+    contributing_evidence_ids: tuple[EvidenceId, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.reason) is not SemanticCompositionReason:
@@ -918,6 +921,13 @@ class SemanticCompositionResult:
             raise TypeError("requirement_statuses must be an exact immutable tuple")
         if type(self.evidence_history_membership_binding) is not EvidenceHistoryMembershipBindingId:
             raise TypeError("composition result must bind exact canonical evidence membership")
+        if (type(self.contributing_evidence_ids) is not tuple
+                or any(type(item) is not EvidenceId for item in self.contributing_evidence_ids)
+                or len(set(self.contributing_evidence_ids)) != len(self.contributing_evidence_ids)):
+            raise TypeError("composition contributors must be an exact duplicate-free tuple")
+        if (self.reason is not SemanticCompositionReason.COMPOSED
+                and self.contributing_evidence_ids):
+            raise ValueError("non-composed results cannot carry evidence contributors")
 
 
 def semantic_status_for_verdict(verdict: SemanticVerdict) -> ConditionStatus:
@@ -1019,4 +1029,379 @@ def compose_semantic_evidence(
         else:
             status = ConditionStatus.SATISFIED
         statuses.append(SemanticRequirementStatus(requirement_id, status))
-    return SemanticCompositionResult(SemanticCompositionReason.COMPOSED, tuple(statuses), binding)
+    contributors = tuple(grouped[slot_id][0].evidence_id for slot_id in required_slots)
+    return SemanticCompositionResult(
+        SemanticCompositionReason.COMPOSED, tuple(statuses), binding, contributors
+    )
+
+
+class SemanticEvidenceCurrentnessStatus(Enum):
+    CURRENT = "CURRENT"
+    STALE = "STALE"
+    INDETERMINATE = "INDETERMINATE"
+    NOT_SEMANTIC = "NOT_SEMANTIC"
+    NOT_FOUND = "NOT_FOUND"
+
+
+class SemanticEvidenceCurrentnessReason(Enum):
+    CURRENT = "CURRENT"
+    NOT_FOUND = "NOT_FOUND"
+    NOT_SEMANTIC = "NOT_SEMANTIC"
+    CURRENT_REVIEW_UNAVAILABLE = "CURRENT_REVIEW_UNAVAILABLE"
+    OBLIGATION_MISMATCH = "OBLIGATION_MISMATCH"
+    SLOT_CHANGED = "SLOT_CHANGED"
+    SUBJECT_STALE = "SUBJECT_STALE"
+    SUPERSEDED = "SUPERSEDED"
+    CANONICAL_SNAPSHOT_INCOMPLETE = "CANONICAL_SNAPSHOT_INCOMPLETE"
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEvidenceCurrentnessResult:
+    evidence_id: EvidenceId
+    status: SemanticEvidenceCurrentnessStatus
+    reason: SemanticEvidenceCurrentnessReason
+    applicability_reason: EvidenceApplicabilityReason | None = None
+    applicability_code: object | None = None
+
+    def __post_init__(self) -> None:
+        if (type(self.evidence_id) is not EvidenceId
+                or type(self.status) is not SemanticEvidenceCurrentnessStatus
+                or type(self.reason) is not SemanticEvidenceCurrentnessReason):
+            raise TypeError("semantic evidence currentness result has wrong exact type")
+        if (self.applicability_reason is not None
+                and type(self.applicability_reason) is not EvidenceApplicabilityReason):
+            raise TypeError("applicability diagnostic has wrong exact type")
+        if self.applicability_code is not None:
+            from .contract import IssueContractApplicabilityCode
+            if type(self.applicability_code) is not IssueContractApplicabilityCode:
+                raise TypeError("G1 applicability diagnostic has wrong exact type")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentSemanticObligationConsumption:
+    obligation_id: SemanticEvaluatorObligationId
+    status: ConditionStatus
+    progression_support_evidence_ids: tuple[EvidenceId, ...]
+    composition_result: SemanticCompositionResult | None
+
+    def __post_init__(self) -> None:
+        if (type(self.obligation_id) is not SemanticEvaluatorObligationId
+                or type(self.status) is not ConditionStatus):
+            raise TypeError("semantic obligation consumption has wrong exact identity/status")
+        if (type(self.progression_support_evidence_ids) is not tuple
+                or any(type(item) is not EvidenceId
+                       for item in self.progression_support_evidence_ids)
+                or len(set(self.progression_support_evidence_ids)
+                       ) != len(self.progression_support_evidence_ids)):
+            raise TypeError("progression support must be an exact duplicate-free tuple")
+        if (self.composition_result is not None
+                and type(self.composition_result) is not SemanticCompositionResult):
+            raise TypeError("composition result has wrong exact type")
+        if self.status is not ConditionStatus.SATISFIED and self.progression_support_evidence_ids:
+            raise ValueError("only satisfied obligations may carry progression support")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentSemanticConsumptionResult:
+    occurrence: object
+    contract_status: ConditionStatus
+    obligation_results: tuple[CurrentSemanticObligationConsumption, ...]
+    authoritative_dependencies: tuple
+    evidence_currentness: tuple[SemanticEvidenceCurrentnessResult, ...] = ()
+
+    def __post_init__(self) -> None:
+        from .backend import CanonicalStateOccurrenceBinding
+        from .state_reader import AuthoritativeStateDependency
+        if (type(self.occurrence) is not CanonicalStateOccurrenceBinding
+                or type(self.contract_status) is not ConditionStatus):
+            raise TypeError("semantic consumption occurrence/status has wrong exact type")
+        if (type(self.obligation_results) is not tuple
+                or any(type(item) is not CurrentSemanticObligationConsumption
+                       for item in self.obligation_results)):
+            raise TypeError("obligation results must be an exact tuple")
+        if (type(self.authoritative_dependencies) is not tuple
+                or any(type(item) is not AuthoritativeStateDependency
+                       for item in self.authoritative_dependencies)):
+            raise TypeError("semantic dependencies must be an exact tuple")
+        from .state_reader import AuthoritativeStateDependencySet
+        try:
+            AuthoritativeStateDependencySet(self.authoritative_dependencies)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("semantic dependencies must remain canonical") from exc
+        if (type(self.evidence_currentness) is not tuple
+                or any(type(item) is not SemanticEvidenceCurrentnessResult
+                       for item in self.evidence_currentness)):
+            raise TypeError("evidence currentness results must be an exact tuple")
+
+
+def consume_current_semantic_evidence(
+    current_resolution: object, snapshot: object,
+    requested_evidence_ids: tuple[EvidenceId, ...] = (),
+    current_contract: object | None = None,
+) -> CurrentSemanticConsumptionResult:
+    """Derive G5 currentness/composition from one #32 view and one G6 snapshot."""
+    from .backend import (
+        CanonicalSemanticConsumptionSnapshot, CanonicalStateOccurrenceBinding,
+    )
+    from .current_semantic_review import (
+        CurrentSemanticReviewResolutionResult,
+        CurrentSemanticReviewResolutionStatus,
+        SemanticEvaluatorObligationResolutionStatus,
+        build_current_semantic_evidence_subject,
+    )
+    from .contract import AdmittedIssueContract
+    from .review import SemanticReviewEffectiveSubject
+
+    if type(snapshot) is not CanonicalSemanticConsumptionSnapshot:
+        raise TypeError("exact canonical semantic facts snapshot required")
+    if (type(requested_evidence_ids) is not tuple
+            or any(type(item) is not EvidenceId for item in requested_evidence_ids)
+            or len(set(requested_evidence_ids)) != len(requested_evidence_ids)):
+        raise TypeError("requested evidence IDs must be exact and duplicate-free")
+    if type(current_resolution) is not CurrentSemanticReviewResolutionResult:
+        raise TypeError("exact #32 current-review result required")
+    if type(current_contract) is not AdmittedIssueContract:
+        raise TypeError("exact current canonical admitted contract required")
+    occurrence = current_resolution.occurrence
+    if (type(occurrence) is not CanonicalStateOccurrenceBinding
+            or occurrence != snapshot.canonical_state_occurrence_binding):
+        raise ValueError("#32 and G6 snapshots do not share one canonical occurrence")
+    if tuple(item.evidence_id for item in snapshot.requested_evidence) != requested_evidence_ids:
+        raise ValueError("G6 snapshot does not bind the exact requested EvidenceIds")
+
+    def empty_result(status: ConditionStatus) -> CurrentSemanticConsumptionResult:
+        curr = tuple(SemanticEvidenceCurrentnessResult(
+            evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+            SemanticEvidenceCurrentnessReason.CURRENT_REVIEW_UNAVAILABLE,
+        ) for evidence_id in requested_evidence_ids)
+        return CurrentSemanticConsumptionResult(
+            occurrence, status, (), (), curr
+        )
+
+    if current_resolution.status is not CurrentSemanticReviewResolutionStatus.RESOLVED:
+        status = ConditionStatus.INDETERMINATE
+        if current_resolution.status is CurrentSemanticReviewResolutionStatus.NOT_APPLICABLE:
+            return CurrentSemanticConsumptionResult(
+                occurrence, status, (), (), tuple(SemanticEvidenceCurrentnessResult(
+                    evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                    SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
+                    applicability_code=current_resolution.applicability_code,
+                ) for evidence_id in requested_evidence_ids),
+            )
+        return empty_result(status)
+
+    by_subject = {item.subject_id: item for item in snapshot.histories}
+    if len(by_subject) != len(snapshot.histories):
+        return empty_result(ConditionStatus.INDETERMINATE)
+    obligations = current_resolution.obligation_outcomes
+    if any(
+        outcome.effective_subject is not None
+        and outcome.effective_subject.task_id != snapshot.task_id
+        for outcome in obligations
+    ):
+        return empty_result(ConditionStatus.INDETERMINATE)
+    resolved_subject_ids = tuple(
+        outcome.effective_subject.subject_id for outcome in obligations
+        if outcome.status is SemanticEvaluatorObligationResolutionStatus.RESOLVED
+        and outcome.effective_subject is not None
+    )
+    if resolved_subject_ids != tuple(item.subject_id for item in snapshot.histories):
+        return empty_result(ConditionStatus.INDETERMINATE)
+
+    obligation_results: list[CurrentSemanticObligationConsumption] = []
+    composition_by_obligation: dict[SemanticEvaluatorObligationId, SemanticCompositionResult] = {}
+    for outcome in obligations:
+        if outcome.status is not SemanticEvaluatorObligationResolutionStatus.RESOLVED:
+            obligation_results.append(CurrentSemanticObligationConsumption(
+                outcome.obligation_id, ConditionStatus.INDETERMINATE, (), None
+            ))
+            continue
+        resolved = outcome.resolved_obligation
+        if (resolved is None or type(resolved.effective_subject) is not SemanticReviewEffectiveSubject):
+            obligation_results.append(CurrentSemanticObligationConsumption(
+                outcome.obligation_id, ConditionStatus.INDETERMINATE, (), None
+            ))
+            continue
+        history_snapshot = by_subject.get(resolved.effective_subject.subject_id)
+        if history_snapshot is None:
+            obligation_results.append(CurrentSemanticObligationConsumption(
+                outcome.obligation_id, ConditionStatus.INDETERMINATE, (), None
+            ))
+            continue
+        history = history_snapshot.history
+        if history is None:
+            obligation_results.append(CurrentSemanticObligationConsumption(
+                outcome.obligation_id, ConditionStatus.UNSATISFIED, (), None
+            ))
+            continue
+        if history.effective_subject != resolved.effective_subject:
+            obligation_results.append(CurrentSemanticObligationConsumption(
+                outcome.obligation_id, ConditionStatus.INDETERMINATE, (), None
+            ))
+            continue
+        canonical_snapshot = object.__new__(TrustedCanonicalSemanticEvidenceSnapshot)
+        object.__setattr__(canonical_snapshot, "effective_subject", resolved.effective_subject)
+        object.__setattr__(canonical_snapshot, "membership_binding", history.membership_binding_id)
+        object.__setattr__(canonical_snapshot, "complete_admitted_records", history_snapshot.records)
+        composition_context = object.__new__(TrustedSemanticCompositionContext)
+        object.__setattr__(composition_context, "effective_subject", resolved.effective_subject)
+        object.__setattr__(composition_context, "composition_rule",
+                           resolved.assignment.composition_rule)
+        composition = compose_semantic_evidence(
+            canonical_snapshot, composition_context, history_snapshot.supersessions
+        )
+        composition_by_obligation[outcome.obligation_id] = composition
+        if composition.reason is SemanticCompositionReason.COMPOSED:
+            if any(item.status is ConditionStatus.SATISFIED
+                   for item in composition.requirement_statuses) and all(
+                       item.status is ConditionStatus.SATISFIED
+                       for item in composition.requirement_statuses
+                   ):
+                status = ConditionStatus.SATISFIED
+                support = composition.contributing_evidence_ids
+            elif any(item.status is ConditionStatus.UNSATISFIED
+                     for item in composition.requirement_statuses):
+                status, support = ConditionStatus.UNSATISFIED, ()
+            else:
+                status, support = ConditionStatus.INDETERMINATE, ()
+        elif composition.reason is SemanticCompositionReason.REQUIRED_SLOT_MISSING:
+            status, support = ConditionStatus.UNSATISFIED, ()
+        else:
+            status, support = ConditionStatus.INDETERMINATE, ()
+        obligation_results.append(CurrentSemanticObligationConsumption(
+            outcome.obligation_id, status, support, composition
+        ))
+
+    if not obligations:
+        contract_status = ConditionStatus.SATISFIED
+    elif any(item.status is ConditionStatus.UNSATISFIED for item in obligation_results):
+        contract_status = ConditionStatus.UNSATISFIED
+    elif any(item.status is ConditionStatus.INDETERMINATE for item in obligation_results):
+        contract_status = ConditionStatus.INDETERMINATE
+    else:
+        contract_status = ConditionStatus.SATISFIED
+
+    lookup = {item.evidence_id: item.record for item in snapshot.requested_evidence}
+    outcome_by_id = {item.obligation_id: item for item in obligations}
+    currentness: list[SemanticEvidenceCurrentnessResult] = []
+    for evidence_id in requested_evidence_ids:
+        record = lookup[evidence_id]
+        if record is None:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_FOUND,
+                SemanticEvidenceCurrentnessReason.NOT_FOUND,
+            )); continue
+        if record.evidence_class is not EvidenceClass.SEMANTIC_REVIEW:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC,
+                SemanticEvidenceCurrentnessReason.NOT_SEMANTIC,
+            )); continue
+        binding = record.subject.semantic_review_binding
+        if binding is None:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.OBLIGATION_MISMATCH,
+            )); continue
+        outcome = outcome_by_id.get(binding.obligation_id)
+        if outcome is None:
+            if (record.subject.contract_id != current_contract.contract_id
+                    or record.subject.contract_raw_sha256
+                    != current_contract.contract_raw_sha256):
+                currentness.append(SemanticEvidenceCurrentnessResult(
+                    evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                    SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
+                    EvidenceApplicabilityReason.CONTRACT_CHANGED,
+                )); continue
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.OBLIGATION_MISMATCH,
+            )); continue
+        if outcome.status is not SemanticEvaluatorObligationResolutionStatus.RESOLVED:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.CURRENT_REVIEW_UNAVAILABLE,
+            )); continue
+        resolved = outcome.resolved_obligation
+        assert resolved is not None
+        if binding.candidate_materialization_id != resolved.effective_subject.candidate_materialization_id:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
+                EvidenceApplicabilityReason.CANDIDATE_CHANGED,
+            )); continue
+        slots = tuple(item for item in resolved.trusted_evaluator_resolution.review_slots
+                      if item.slot_id == record.payload.slot_id)
+        if len(slots) != 1:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                SemanticEvidenceCurrentnessReason.SLOT_CHANGED,
+                EvidenceApplicabilityReason.REVIEW_SLOT_CHANGED,
+            )); continue
+        current_subject = build_current_semantic_evidence_subject(
+            resolved, slots[0], record.payload.invocation_id
+        )
+        applicability = evaluate_evidence_applicability(record, current_subject)
+        if applicability.decision is EvidenceApplicabilityDecision.STALE:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
+                applicability.reason,
+            )); continue
+        history_snapshot = by_subject.get(resolved.effective_subject.subject_id)
+        history_record = (None if history_snapshot is None else next((
+            item for item in history_snapshot.records
+            if item.evidence_id == evidence_id
+        ), None))
+        if (history_snapshot is None or history_snapshot.history is None
+                or history_record != record):
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.CANONICAL_SNAPSHOT_INCOMPLETE,
+            )); continue
+        if record.subject != current_subject:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.OBLIGATION_MISMATCH,
+            )); continue
+        if applicability.decision is EvidenceApplicabilityDecision.INDETERMINATE:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.CURRENT_REVIEW_UNAVAILABLE,
+                applicability.reason,
+            )); continue
+        composition = composition_by_obligation.get(binding.obligation_id)
+        if composition is None:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.CURRENT_REVIEW_UNAVAILABLE,
+            )); continue
+        if composition.reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE:
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
+                SemanticEvidenceCurrentnessReason.CANONICAL_SNAPSHOT_INCOMPLETE,
+            )); continue
+        if (composition.reason is SemanticCompositionReason.COMPOSED
+                and evidence_id not in composition.contributing_evidence_ids):
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                SemanticEvidenceCurrentnessReason.SUPERSEDED,
+            )); continue
+        if (composition.reason in (
+                SemanticCompositionReason.COMPOSED,
+                SemanticCompositionReason.REQUIRED_SLOT_MISSING,
+            ) and any(item.earlier_evidence_id == evidence_id
+                      for item in history_snapshot.supersessions)):
+            currentness.append(SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                SemanticEvidenceCurrentnessReason.SUPERSEDED,
+            )); continue
+        currentness.append(SemanticEvidenceCurrentnessResult(
+            evidence_id, SemanticEvidenceCurrentnessStatus.CURRENT,
+            SemanticEvidenceCurrentnessReason.CURRENT,
+            EvidenceApplicabilityReason.APPLICABLE,
+        ))
+
+    return CurrentSemanticConsumptionResult(
+        occurrence, contract_status, tuple(obligation_results),
+        current_resolution.authoritative_dependencies, tuple(currentness),
+    )

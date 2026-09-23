@@ -18,7 +18,8 @@ from autodev_control.trusted.authorization import (
 from autodev_control.trusted.backend import (
     BackendGeneration, CanonicalStateOccurrenceBinding, CanonicalTransaction,
     CanonicalWriteStatus, CreateAuthorization, CreateContract,
-    InMemoryCanonicalStateBackend, ResolvedTargetRegistration,
+    InMemoryCanonicalStateBackend, ReplaceTask, ResolvedTargetRegistration,
+    TaskRevisionEquals,
     canonical_json_bytes,
 )
 from autodev_control.trusted.fixture_platform import (
@@ -27,6 +28,8 @@ from autodev_control.trusted.fixture_platform import (
     PublishedCandidateRefEffectSubject, build_protected_effect_marker,
 )
 from autodev_control.trusted.gates import *
+from autodev_control.trusted.gates import _TaskSemanticDenied
+import autodev_control.trusted.gates as gates_module
 from autodev_control.trusted.identity import (
     CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId,
     LogicalIdentifier, MutationInventoryId, PreparedProtectedStartId,
@@ -34,7 +37,7 @@ from autodev_control.trusted.identity import (
 )
 from autodev_control.trusted.operation import (
     AdmissionEventId, AuthoritativeStateBindingId, CandidateId,
-    CompletionRuleSetId, IntegrationBound, NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
+    CompletionRuleSetId, EvidenceId, IntegrationBound, NotIntegrationBound, OperationActionId, OperationEffectClass, OperationId,
     OperationIdempotencyKey, OperationPurpose, OperationState, OperationSubjectId,
     TrustedOperationClassification, construct_trusted_operation_intent,
 )
@@ -206,6 +209,37 @@ def install_fixture_dependencies(value, *names):
         item.transport_config_id.value,
     ))
     return ControlStateAuthoritativeDependencySet(tuple(dependencies))
+
+
+def register_zero_semantic_environment(value):
+    """Root fixture assembly for G4 regression cases with no semantic evaluators."""
+    working = value.backend.read_task_working_set(TASK)
+    dependencies = install_fixture_dependencies(value, "semantic-base")
+    base = dependencies.dependencies[0]
+    contract = value.backend.read_contract(working.task.contract_id)
+    resolved = value.backend.read_resolved_target_registration(TARGET)
+    admission = trusted_admission_context_for_fixture(
+        contract.raw_bytes, resolved.registration, EPOCH,
+        base.expected_binding_id, base.expected_binding_id,
+    )
+    context = mint(
+        TrustedIssueContractApplicabilityContext,
+        policy_epoch_identity=admission.policy_epoch_identity,
+        schema_binding=admission.schema_binding,
+        resolved_target=admission.resolved_target,
+        base_observation=admission.base_observation,
+        evaluator_resolutions=admission.evaluator_resolutions,
+        runtime_resolutions=admission.runtime_resolutions,
+        root_context=admission.root_context,
+        repair_policy_context=admission.repair_policy_context,
+        operation_approval_enforcement_available=(
+            admission.operation_approval_enforcement_available
+        ),
+    )
+    value.register_semantic_consumption_context(
+        TASK, context, None, None, base,
+    )
+    return dependencies
 
 
 def marker(operation="one", result="result"):
@@ -706,12 +740,13 @@ def adopt_recorded_candidate(value, materialization):
     return admitted
 
 
-def reserve_protected(value, name, candidate_id, *, integration_binding=None):
+def reserve_protected(value, name, candidate_id, *, integration_binding=None,
+                      required_evidence_ids=()):
     command = OperationReservationCommand(
         operation_id=OperationId(name),
         idempotency_key=OperationIdempotencyKey("key-" + name),
         action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
-        required_evidence_ids=(),
+        required_evidence_ids=required_evidence_ids,
         integration_binding=(
             NotIntegrationBound() if integration_binding is None else integration_binding
         ),
@@ -765,6 +800,966 @@ def test_three_capabilities_are_distinct_and_principal_bound():
     assert value.control_capability is not value.publication_capability
     assert value.publication_capability.service_identity == ServicePrincipalId("publication")
     assert value.merge_capability.service_identity == ServicePrincipalId("merge")
+
+
+def test_issue29_semantic_denial_domains_are_exact_and_separate_from_g4():
+    assert {item.value for item in TaskSemanticDenialCode} == {
+        "NEXT_INTEGRATION_OPERATION_INVALID",
+        "SEMANTIC_CONTRACT_UNSATISFIED",
+        "SEMANTIC_CONTEXT_INDETERMINATE",
+        "REQUIRED_SEMANTIC_EVIDENCE_NOT_CURRENT",
+        "REQUIRED_SEMANTIC_EVIDENCE_NOT_PROGRESSION_SUPPORT",
+    }
+    assert {item.value for item in ProtectedStartSemanticDenialCode} == {
+        "REQUIRED_EVIDENCE_NOT_CURRENT",
+        "REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION",
+        "REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE",
+    }
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GateResult(
+            GateResultCode.REJECTED,
+            failure_code=G4FailureCode.ACTION_PRECONDITION_CONFLICT,
+            semantic_denial_code=(
+                ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+            ),
+        )
+
+
+def _issue29_semantic_publication_runtime(
+    *, stale_schema=True, verdict_name="approved", config_available=True,
+    extra_evaluation_ids=(),
+):
+    from tests.trusted.test_current_semantic_review import (
+        _canonical_inputs, _current_applicability_context,
+        _semantic_config_bytes, _semantic_contract,
+        _trusted_reader, REPOSITORY,
+    )
+    from tests.trusted.test_semantic_consumption import _resolved_backend_with_current_evidence
+
+    config_bytes = _semantic_config_bytes()
+    contract, _, _ = _semantic_contract(
+        config_bytes=config_bytes, extra_evaluation_ids=extra_evaluation_ids,
+    )
+    target_template = registration()
+    target = mint(
+        AdmittedTargetRegistration,
+        **{
+            **{name: getattr(target_template, name)
+               for name in target_template.__dataclass_fields__},
+            "target_registration_id": contract.target_registration_id,
+            "repository_id": REPOSITORY,
+            "policy_epoch_identity": contract.admission_policy_epoch_identity,
+        },
+    )
+    resolved_template = _canonical_inputs(contract).resolved_target
+    resolved_target = mint(
+        type(resolved_template),
+        **{
+            **{name: getattr(resolved_template, name)
+               for name in resolved_template.__dataclass_fields__},
+            "registration": target,
+            "target_registration_id": contract.target_registration_id,
+            "policy_epoch_identity": contract.admission_policy_epoch_identity,
+        },
+    )
+    store, _, record, _ = _resolved_backend_with_current_evidence(
+        contract=contract, config_bytes=config_bytes, resolved_target=resolved_target,
+        verdict_name=verdict_name,
+    )
+    platform = FixtureGitPlatform()
+    materialization = store.read_candidate_materialization(
+        store.read_candidate(record.subject.candidate_id).materialization_id
+    )
+    candidate_tree = (GitTreeEntry(
+        CanonicalGitPath("candidate-.txt"), GitObjectKind.BLOB,
+        "100644", GitSha("1" * 40),
+    ),)
+    platform.seed_commit(materialization.base, (), (), materialization.base_tree)
+    platform.seed_commit(
+        materialization.commit, (materialization.base,), candidate_tree,
+        materialization.result_tree,
+    )
+    binding = GateRuntimeBinding(
+        RootContextId(RawSha256("2" * 64)), FixtureRuntimeGeneration(10),
+        ServicePrincipalId("control-semantic-start"),
+        target.target_publication.service_identity,
+        target.merge.service_identity,
+    )
+    value = FixtureProtectedGateRuntime(
+        binding, store, platform, FixtureGateAudit(),
+    )
+    profile_id, transport_id = (
+        ImmutableConfigId("semantic-base-observation"),
+        ImmutableConfigId("semantic-base-transport"),
+    )
+    transport_binding = object.__new__(TrustedGitHubReadTransportBinding)
+    for name, item in {
+        "config_id": transport_id,
+        "expected_api_host_identity": ImmutableConfigId("semantic-host"),
+        "authentication_mode_identity": ImmutableConfigId("semantic-auth"),
+        "service_identity": ServicePrincipalId("semantic-reader"),
+        "permitted_repository_ids": (REPOSITORY,),
+        "transport_profile_id": ImmutableConfigId("semantic-read-profile"),
+    }.items():
+        object.__setattr__(transport_binding, name, item)
+    descriptor = object.__new__(RegisteredStateFactDescriptor)
+    object.__setattr__(descriptor, "descriptor_id", LogicalIdentifier("repository"))
+    object.__setattr__(descriptor, "request", ReadRepositoryIdentity(REPOSITORY))
+    profile = object.__new__(AuthoritativeObservationProfile)
+    object.__setattr__(profile, "profile_id", profile_id)
+    object.__setattr__(profile, "registered_fact_descriptors", (descriptor,))
+    transport = object.__new__(AuthenticatedGitHubReadTransport)
+    object.__setattr__(transport, "_binding", transport_binding)
+    object.__setattr__(transport, "_executor", lambda request, cursor: {
+        "repository_id": REPOSITORY.value, "owner": "semantic-owner", "name": "repo",
+    })
+    value.register_fixture_authoritative_source(profile, transport_binding, AuthoritativeStateSnapshot(
+        REPOSITORY, profile_id, transport_id,
+        (NormalizedGitHubObservation(
+            "repository", (REPOSITORY.value, "semantic-owner", "repo"),
+        ),),
+    ))
+    base_binding = authoritative_state_binding(
+        value.platform.authoritative_snapshot(REPOSITORY, profile_id, transport_id)
+    )
+    base_dependency = AuthoritativeStateDependency(
+        REPOSITORY, profile_id, transport_id, base_binding,
+    )
+    context = _current_applicability_context(contract)
+    base_observation = mint(
+        type(context.base_observation),
+        **{
+            **{name: getattr(context.base_observation, name)
+               for name in context.base_observation.__dataclass_fields__},
+            "authoritative_state_binding_id": base_binding,
+        },
+    )
+    if stale_schema:
+        stale_epoch = PolicyEpochIdentity(TrustedManifestId(RawSha256("d" * 64)))
+        context_schema_binding = mint(
+            type(context.schema_binding),
+            **{
+                **{name: getattr(context.schema_binding, name)
+                   for name in context.schema_binding.__dataclass_fields__},
+                "policy_epoch_identity": stale_epoch,
+            },
+        )
+    else:
+        context_schema_binding = context.schema_binding
+    context = mint(
+        type(context),
+        **{
+            **{name: getattr(context, name) for name in context.__dataclass_fields__},
+            "base_observation": base_observation,
+            "schema_binding": context_schema_binding,
+        },
+    )
+    value.register_semantic_consumption_context(
+        record.subject.task_id,
+        context, _trusted_reader(contract, config_bytes) if config_available else None,
+        None, base_dependency,
+    )
+    return value, materialization, target, base_dependency, record
+
+
+@pytest.mark.parametrize(("stale_schema", "config_available", "authoritative_cancellation", "semantic_code"), [
+    (True, True, False, ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT),
+    (False, False, False, ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE),
+    (True, True, True, None),
+])
+def test_issue29_g4_first_start_precedence_for_semantic_evidence(
+    stale_schema, config_available, authoritative_cancellation, semantic_code,
+):
+    value, materialization, target, dependencies, record = (
+        _issue29_semantic_publication_runtime(
+            stale_schema=stale_schema, config_available=config_available,
+        )
+    )
+    command = OperationReservationCommand(
+        operation_id=OperationId("stale-semantic-publication"),
+        idempotency_key=OperationIdempotencyKey("stale-semantic-publication-key"),
+        action_id=OperationActionId("stale-semantic-publication-action"),
+        subject_id=OperationSubjectId("stale-semantic-publication-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=NotIntegrationBound(),
+        is_repair_attempt=False,
+    )
+    request = value.boundary.reserve_operation(record.subject.task_id, command)
+    assert ControlStateGate(value).commit(
+        request, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    if authoritative_cancellation:
+        cancellation = value.boundary.set_cancellation(
+            record.subject.task_id, CancellationStatus.AUTHORITATIVE,
+            CancellationRequestId("semantic-start-cancellation"),
+        )
+        assert ControlStateGate(value).commit(
+            cancellation, independent_lease(value),
+        ).code is GateResultCode.COMMITTED
+    working = value.backend.read_task_working_set(record.subject.task_id)
+    operation = next(item for item in working.operations
+                     if item.intent.operation_id == command.operation_id)
+    fence = ActionTargetFence(
+        record.subject.repository_id, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    dependency_set = ControlStateAuthoritativeDependencySet((dependencies,))
+    lease = value.acquire_control_lease(value.control_capability, dependency_set)
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, lease, value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    result = value.commit_protected_start(
+        prepared, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert result.code is GateResultCode.REJECTED
+    if authoritative_cancellation:
+        assert result.failure_code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
+        assert result.semantic_denial_code is None
+    else:
+        assert result.failure_code is None
+        assert result.semantic_denial_code is semantic_code
+    after = value.backend.read_task_working_set(record.subject.task_id)
+    stored = next(item for item in after.operations
+                  if item.intent.operation_id == command.operation_id)
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.backend.occurrence == working.canonical_state_occurrence_binding
+    assert value.platform.marker(
+        command.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.read_ref(
+        record.subject.repository_id, materialization.candidate_branch,
+    ) is None
+
+
+def test_issue29_stale_semantic_evidence_blocks_public_pr_creation_start():
+    value, materialization, target, dependency, record = (
+        _issue29_semantic_publication_runtime(stale_schema=False)
+    )
+    backend = value.backend
+    task_id = record.subject.task_id
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+
+    def reserve_and_commit(name, evidence_id):
+        command = OperationReservationCommand(
+            operation_id=OperationId(name),
+            idempotency_key=OperationIdempotencyKey(name + "-key"),
+            action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
+            required_evidence_ids=(evidence_id,),
+            integration_binding=NotIntegrationBound(), is_repair_attempt=False,
+        )
+        request = value.boundary.reserve_operation(task_id, command)
+        assert ControlStateGate(value).commit(
+            request, independent_lease(value),
+        ).code is GateResultCode.COMMITTED
+        return next(item for item in backend.read_task_working_set(task_id).operations
+                    if item.intent.operation_id == command.operation_id)
+
+    publish = reserve_and_commit("issue29-pr-prepublish", record.evidence_id)
+    publish_control = value.acquire_control_lease(value.control_capability, dependencies)
+    publish_prepared = value.prepare_protected_start(
+        publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            record.subject.repository_id, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), publish_control, value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    publish_start = value.commit_protected_start(
+        publish_prepared, publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert publish_start.code is GateResultCode.START_COMMITTED
+    assert TargetPublicationGate(value).perform(
+        publish_start.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    create_pr = reserve_and_commit("issue29-stale-pr", record.evidence_id)
+    pr_prepared = value.prepare_protected_start(
+        create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION,
+        ActionTargetFence(
+            record.subject.repository_id, materialization.candidate_branch,
+            materialization.commit, value.platform.snapshot().generation,
+            REF, materialization.base,
+        ), value.acquire_control_lease(value.control_capability, dependencies),
+        value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+        base_ref=REF, provenance_operation_id=publish.intent.operation_id,
+    )
+
+    applicability, reader, context_source, base_dependency = value._semantic_contexts[task_id]
+    old_epoch = PolicyEpochIdentity(TrustedManifestId(RawSha256("d" * 64)))
+    stale_binding = mint(
+        type(applicability.schema_binding),
+        **{
+            **{name: getattr(applicability.schema_binding, name)
+               for name in applicability.schema_binding.__dataclass_fields__},
+            "policy_epoch_identity": old_epoch,
+        },
+    )
+    stale_context = mint(
+        type(applicability),
+        **{
+            **{name: getattr(applicability, name)
+               for name in applicability.__dataclass_fields__},
+            "schema_binding": stale_binding,
+        },
+    )
+    value._semantic_contexts[task_id] = (
+        stale_context, reader, context_source, base_dependency,
+    )
+    before = backend.read_task_working_set(task_id)
+    start = value.commit_protected_start(
+        pr_prepared, create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION,
+    )
+    assert start.code is GateResultCode.REJECTED
+    assert start.failure_code is None
+    assert start.semantic_denial_code is ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT
+    assert start.continuation is None
+    after = backend.read_task_working_set(task_id)
+    stored = next(item for item in after.operations
+                  if item.intent.operation_id == create_pr.intent.operation_id)
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert backend.occurrence == before.canonical_state_occurrence_binding
+    assert value.platform.marker(
+        create_pr.intent.operation_id,
+        ProtectedEffectSubject.PULL_REQUEST_CREATION.value,
+    ) is None
+    assert value.platform.snapshot().pull_requests == ()
+
+
+def test_issue29_base_movement_blocks_publication_requiring_exact_semantic_evidence():
+    value, materialization, target, dependency, record = (
+        _issue29_semantic_publication_runtime(stale_schema=False)
+    )
+    task_id = record.subject.task_id
+    command = OperationReservationCommand(
+        operation_id=OperationId("issue29-base-movement-publication"),
+        idempotency_key=OperationIdempotencyKey("issue29-base-movement-publication-key"),
+        action_id=OperationActionId("issue29-base-movement-publication-action"),
+        subject_id=OperationSubjectId("issue29-base-movement-publication-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=NotIntegrationBound(), is_repair_attempt=False,
+    )
+    reserve = value.boundary.reserve_operation(task_id, command)
+    assert ControlStateGate(value).commit(
+        reserve, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    operation = next(item for item in value.backend.read_task_working_set(task_id).operations
+                     if item.intent.operation_id == command.operation_id)
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            record.subject.repository_id, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), value.acquire_control_lease(value.control_capability, dependencies),
+        value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    applicability, reader, context_source, base_dependency = value._semantic_contexts[task_id]
+    moved_base = mint(
+        type(applicability.base_observation),
+        **{
+            **{name: getattr(applicability.base_observation, name)
+               for name in applicability.base_observation.__dataclass_fields__},
+            "sha": type(applicability.base_observation.sha)("d" * 40),
+        },
+    )
+    moved_context = mint(
+        type(applicability),
+        **{
+            **{name: getattr(applicability, name)
+               for name in applicability.__dataclass_fields__},
+            "base_observation": moved_base,
+        },
+    )
+    value._semantic_contexts[task_id] = (
+        moved_context, reader, context_source, base_dependency,
+    )
+    before = value.backend.read_task_working_set(task_id)
+    result = value.commit_protected_start(
+        prepared, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert result.code is GateResultCode.REJECTED
+    assert result.failure_code is None
+    assert result.semantic_denial_code is (
+        ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT
+    )
+    assert result.continuation is None
+    after = value.backend.read_task_working_set(task_id)
+    stored = next(item for item in after.operations
+                  if item.intent.operation_id == command.operation_id)
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert after == before
+    assert value.platform.marker(
+        command.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.read_ref(
+        record.subject.repository_id, materialization.candidate_branch,
+    ) is None
+
+
+@pytest.mark.parametrize("movement", ("canonical", "authoritative"))
+def test_issue29_state_movement_after_freshness_prevents_start_commit(monkeypatch, movement):
+    value, materialization, target, dependency, evidence = (
+        _issue29_semantic_publication_runtime(stale_schema=False)
+    )
+    task_id = evidence.subject.task_id
+    command = OperationReservationCommand(
+        operation_id=OperationId("issue29-occurrence-race-publication"),
+        idempotency_key=OperationIdempotencyKey("issue29-occurrence-race-key"),
+        action_id=OperationActionId("issue29-occurrence-race-action"),
+        subject_id=OperationSubjectId("issue29-occurrence-race-subject"),
+        required_evidence_ids=(evidence.evidence_id,),
+        integration_binding=NotIntegrationBound(), is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    working = value.backend.read_task_working_set(task_id)
+    operation = next(item for item in working.operations
+                     if item.intent.operation_id == command.operation_id)
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            evidence.subject.repository_id, materialization.candidate_branch,
+            None, value.platform.snapshot().generation,
+        ), value.acquire_control_lease(value.control_capability, dependencies),
+        value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    original = gates_module.FixtureProtectedGateRuntime._protected_start_semantic_denial
+
+    def move_after_semantic_check(runtime_value, *args):
+        result = original(runtime_value, *args)
+        assert result is None
+        if movement == "canonical":
+            cancellation = value.boundary.set_cancellation(
+                task_id, CancellationStatus.REQUESTED,
+                CancellationRequestId("issue29-post-check-occurrence-move"),
+            )
+            assert ControlStateGate(value).commit(
+                cancellation, independent_lease(value),
+            ).code is GateResultCode.COMMITTED
+        else:
+            current = value.platform.authoritative_snapshot(*dependency.locator)
+            moved = replace(
+                current,
+                observations=(NormalizedGitHubObservation(
+                    "repository",
+                    (dependency.repository_id.value, "moved-owner", "repo"),
+                ),),
+            )
+            # Model provider-side movement during the narrow post-check window.
+            with value.platform._lock:
+                value.platform._authoritative[dependency.locator] = moved
+        return result
+
+    monkeypatch.setattr(
+        gates_module.FixtureProtectedGateRuntime,
+        "_protected_start_semantic_denial", move_after_semantic_check,
+    )
+    before_start = value.backend.read_task_working_set(task_id)
+    result = value.commit_protected_start(
+        prepared, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    if movement == "canonical":
+        assert result.code is GateResultCode.REJECTED
+        assert result.canonical_result.status is CanonicalWriteStatus.CAS_CONFLICT
+    else:
+        assert result.code is GateResultCode.LEASE_INVALID
+        assert value.backend.occurrence == before_start.canonical_state_occurrence_binding
+    assert result.continuation is None
+    after = value.backend.read_task_working_set(task_id)
+    stored = next(item for item in after.operations
+                  if item.intent.operation_id == command.operation_id)
+    if movement == "canonical":
+        assert after.task.cancellation_status is CancellationStatus.REQUESTED
+        assert after.canonical_state_occurrence_binding != before_start.canonical_state_occurrence_binding
+    else:
+        assert after.canonical_state_occurrence_binding == before_start.canonical_state_occurrence_binding
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.platform.marker(
+        command.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert value.platform.read_ref(
+        evidence.subject.repository_id, materialization.candidate_branch,
+    ) is None
+
+
+def test_issue29_semantic_pass_then_external_target_conflict_preserves_g7_result(monkeypatch):
+    value, materialization, target, dependency, evidence = (
+        _issue29_semantic_publication_runtime(stale_schema=False)
+    )
+    command = OperationReservationCommand(
+        operation_id=OperationId("issue29-target-conflict-publication"),
+        idempotency_key=OperationIdempotencyKey("issue29-target-conflict-key"),
+        action_id=OperationActionId("issue29-target-conflict-action"),
+        subject_id=OperationSubjectId("issue29-target-conflict-subject"),
+        required_evidence_ids=(evidence.evidence_id,),
+        integration_binding=NotIntegrationBound(), is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(evidence.subject.task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    working = value.backend.read_task_working_set(evidence.subject.task_id)
+    operation = next(item for item in working.operations
+                     if item.intent.operation_id == command.operation_id)
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            evidence.subject.repository_id, materialization.candidate_branch,
+            None, value.platform.snapshot().generation,
+        ), value.acquire_control_lease(value.control_capability, dependencies),
+        value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    original = gates_module.FixtureProtectedGateRuntime._protected_start_semantic_denial
+
+    def move_external_ref_after_semantics(runtime_value, *args):
+        result = original(runtime_value, *args)
+        assert result is None
+        # Deliberately model an external/untrusted target mutation that races
+        # the final target-fence recheck, bypassing the fixture's local lock.
+        with value.platform._lock:
+            value.platform._refs[(
+                evidence.subject.repository_id, materialization.candidate_branch,
+            )] = GitSha("f" * 40)
+            value.platform._generation += 1
+        return result
+
+    monkeypatch.setattr(
+        gates_module.FixtureProtectedGateRuntime,
+        "_protected_start_semantic_denial", move_external_ref_after_semantics,
+    )
+    result = value.commit_protected_start(
+        prepared, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    assert result.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
+    assert result.failure_code is G4FailureCode.ACTION_PRECONDITION_CONFLICT
+    assert result.semantic_denial_code is None
+    assert result.continuation is None
+    stored = next(item for item in value.backend.read_task_working_set(
+        evidence.subject.task_id
+    ).operations if item.intent.operation_id == command.operation_id)
+    assert stored.state is OperationState.CONFLICT
+    assert stored.start_binding_id is None
+    assert value.platform.read_ref(
+        evidence.subject.repository_id, materialization.candidate_branch,
+    ) == GitSha("f" * 40)
+    assert value.platform.marker(
+        command.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+
+@pytest.mark.parametrize(("required_ids", "denial", "movement"), [
+    (("evidence",), ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT, "before"),
+    ((), ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE, "before"),
+    (("evidence",), None, "after"),
+    (("evidence",), ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION,
+     "historical-unsatisfied"),
+])
+def test_issue29_persisted_ready_forward_start_revalidates_semantics(
+    required_ids, denial, movement,
+):
+    value, materialization, target, dependency, evidence = (
+        _issue29_semantic_publication_runtime(
+            stale_schema=False,
+            verdict_name=("changes_required" if movement == "historical-unsatisfied"
+                          else "approved"),
+        )
+    )
+    task_id = evidence.subject.task_id
+    repository_id = evidence.subject.repository_id
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+
+    def reserve(name, evidence_ids, binding):
+        command = OperationReservationCommand(
+            operation_id=OperationId(name),
+            idempotency_key=OperationIdempotencyKey(name + "-key"),
+            action_id=OperationActionId(name), subject_id=OperationSubjectId(name),
+            required_evidence_ids=evidence_ids, integration_binding=binding,
+            is_repair_attempt=False,
+        )
+        request = value.boundary.reserve_operation(task_id, command)
+        assert ControlStateGate(value).commit(
+            request, independent_lease(value),
+        ).code is GateResultCode.COMMITTED
+        working = value.backend.read_task_working_set(task_id)
+        return next(item for item in working.operations
+                    if item.intent.operation_id == command.operation_id)
+
+    value.platform.seed_ref(repository_id, REF, materialization.base)
+    publish = reserve(
+        "issue29-ready-publish", (evidence.evidence_id,), NotIntegrationBound(),
+    )
+    publish_start = start_protected(
+        value, publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            repository_id, materialization.candidate_branch, None,
+            value.platform.snapshot().generation,
+        ), materialization, target=target, dependencies=dependencies,
+    )
+    assert publish_start.code is GateResultCode.START_COMMITTED
+    assert TargetPublicationGate(value).perform(
+        publish_start.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    create_pr = reserve(
+        "issue29-ready-pr", (evidence.evidence_id,), NotIntegrationBound(),
+    )
+    pr_start = start_protected(
+        value, create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION,
+        ActionTargetFence(
+            repository_id, materialization.candidate_branch, materialization.commit,
+            value.platform.snapshot().generation, REF, materialization.base,
+        ), materialization, target=target, base_ref=REF,
+        provenance_operation_id=publish.intent.operation_id,
+        dependencies=dependencies,
+    )
+    assert pr_start.code is GateResultCode.START_COMMITTED
+    assert TargetPublicationGate(value).perform(
+        pr_start.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    required_evidence_ids = (
+        (evidence.evidence_id,) if required_ids else ()
+    )
+    forward = reserve(
+        "issue29-ready-forward", required_evidence_ids,
+        IntegrationBound(GitRef(REF.value)),
+    )
+    task = value.backend.read_task_working_set(task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("persisted-ready-semantic-context"),
+        task_id=task_id, completion_rule_set_id=CompletionRuleSetId("persisted-ready-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(forward.intent.operation_id,),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    evaluation = TaskEvaluationCommand(
+        task_id, context.context_id, (), (), forward.intent.operation_id,
+    )
+    if movement == "historical-unsatisfied":
+        # G4 can produce and persist readiness independently of #29's post-G4
+        # veto; model that already-persisted state, then exercise the real
+        # protected-start boundary against newly enforced semantics.
+        ready_request = value.controller.evaluate_task(evaluation)
+    else:
+        ready_request = value.boundary.evaluate_task(evaluation)
+    assert ready_request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
+    ready_lease = value.acquire_control_lease(value.control_capability, dependencies)
+    assert ControlStateGate(value).commit(ready_request, ready_lease).code is GateResultCode.COMMITTED
+    ready_working = value.backend.read_task_working_set(task_id)
+    assert ready_working.task.next_integration_operation_id == forward.intent.operation_id
+
+    prepared = value.prepare_protected_start(
+        forward, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        ActionTargetFence(
+            repository_id, REF, materialization.base,
+            value.platform.snapshot().generation,
+        ), value.acquire_control_lease(value.control_capability, dependencies),
+        value.merge_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+        provenance_operation_id=create_pr.intent.operation_id,
+    )
+
+    def move_semantic_context():
+        applicability, reader, context_source, base_dependency = value._semantic_contexts[task_id]
+        stale_epoch = PolicyEpochIdentity(TrustedManifestId(RawSha256("e" * 64)))
+        stale_binding = mint(
+            type(applicability.schema_binding),
+            **{
+                **{name: getattr(applicability.schema_binding, name)
+                   for name in applicability.schema_binding.__dataclass_fields__},
+                "policy_epoch_identity": stale_epoch,
+            },
+        )
+        stale_context = mint(
+            type(applicability),
+            **{
+                **{name: getattr(applicability, name)
+                   for name in applicability.__dataclass_fields__},
+                "schema_binding": stale_binding,
+            },
+        )
+        value._semantic_contexts[task_id] = (
+            stale_context, reader, context_source, base_dependency,
+        )
+
+    before = value.backend.read_task_working_set(task_id)
+    if movement == "before":
+        # Simulate a newly stale current schema immediately after durable
+        # preparation and before the consequential start commit.
+        move_semantic_context()
+    elif movement == "historical-unsatisfied":
+        semantic = value._resolve_semantic_consumption(
+            task_id, required_evidence_ids, value.backend.occurrence,
+        )
+        assert semantic.contract_status is ConditionStatus.UNSATISFIED
+        assert semantic.evidence_currentness[0].status is SemanticEvidenceCurrentnessStatus.CURRENT
+        assert semantic.obligation_results[0].progression_support_evidence_ids == ()
+    start = value.commit_protected_start(
+        prepared, forward, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+    )
+    if movement == "before":
+        assert start.code is GateResultCode.REJECTED
+        assert start.failure_code is None
+        assert start.semantic_denial_code is denial
+        assert start.continuation is None
+    elif movement == "after":
+        assert start.code is GateResultCode.START_COMMITTED
+        assert start.semantic_denial_code is None
+        assert start.continuation is not None
+        started = next(item for item in value.backend.read_task_working_set(task_id).operations
+                       if item.intent.operation_id == forward.intent.operation_id)
+        assert started.state is OperationState.PERFORMING
+        original_start_binding = started.start_binding_id
+        move_semantic_context()
+        after_movement = value.backend.read_task_working_set(task_id)
+        retained = next(item for item in after_movement.operations
+                        if item.intent.operation_id == forward.intent.operation_id)
+        assert retained.state is OperationState.PERFORMING
+        assert retained.start_binding_id == original_start_binding
+        assert value.platform.marker(
+            forward.intent.operation_id,
+            ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+        ) is None
+        return
+    else:
+        assert start.code is GateResultCode.REJECTED
+        assert start.failure_code is None
+        assert start.semantic_denial_code is denial
+        assert start.continuation is None
+    after = value.backend.read_task_working_set(task_id)
+    stored = next(item for item in after.operations
+                  if item.intent.operation_id == forward.intent.operation_id)
+    assert after.task.state is TaskState.INTEGRATION_READY
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.backend.occurrence == before.canonical_state_occurrence_binding
+    assert value.platform.marker(
+        forward.intent.operation_id,
+        ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+    ) is None
+    assert value.platform.read_ref(repository_id, REF) == materialization.base
+
+
+@pytest.mark.parametrize(("verdict_name", "include_dependency"), [
+    ("changes_required", True),
+    ("approved", False),
+])
+def test_issue29_start_freshness_and_dependency_lease_are_orthogonal(
+    verdict_name, include_dependency,
+):
+    value, materialization, target, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, verdict_name=verdict_name,
+    )
+    command = OperationReservationCommand(
+        operation_id=OperationId("current-negative-semantic-publication"),
+        idempotency_key=OperationIdempotencyKey("current-negative-semantic-publication-key"),
+        action_id=OperationActionId("current-negative-semantic-publication-action"),
+        subject_id=OperationSubjectId("current-negative-semantic-publication-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=NotIntegrationBound(),
+        is_repair_attempt=False,
+    )
+    reserve = value.boundary.reserve_operation(record.subject.task_id, command)
+    assert ControlStateGate(value).commit(
+        reserve, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    working = value.backend.read_task_working_set(record.subject.task_id)
+    operation = next(item for item in working.operations
+                     if item.intent.operation_id == command.operation_id)
+    fence = ActionTargetFence(
+        record.subject.repository_id, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    dependencies = ControlStateAuthoritativeDependencySet((dependency,))
+    lease = (value.acquire_control_lease(value.control_capability, dependencies)
+             if include_dependency else independent_lease(value))
+    prepared = value.prepare_protected_start(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, lease, value.publication_capability, all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=target,
+    )
+    result = value.commit_protected_start(
+        prepared, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+    )
+    after = value.backend.read_task_working_set(record.subject.task_id)
+    started = next(item for item in after.operations
+                   if item.intent.operation_id == command.operation_id)
+    if include_dependency:
+        assert result.code is GateResultCode.START_COMMITTED
+        assert result.semantic_denial_code is None
+        assert result.continuation is not None
+        assert started.state is OperationState.PERFORMING
+        assert started.start_binding_id is not None
+    else:
+        assert result.code is GateResultCode.REJECTED
+        assert result.failure_code is None
+        assert result.semantic_denial_code is (
+            ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+        )
+        assert result.continuation is None
+        assert started.state is OperationState.RESERVED
+        assert started.start_binding_id is None
+        assert value.backend.occurrence == working.canonical_state_occurrence_binding
+    assert value.platform.marker(
+        command.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+
+def test_issue29_semantic_satisfaction_allows_g4_completion_with_exact_n_plus_f_lease():
+    value, _, _, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, verdict_name="approved",
+    )
+    task = value.backend.read_task_working_set(record.subject.task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-satisfied-completion-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("semantic-satisfied-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    request = value.boundary.evaluate_task(TaskEvaluationCommand(
+        task.task_id, context.context_id, (), (), None,
+    ))
+    assert request.transaction.mutations[0].task.state is TaskState.COMPLETED
+    assert request.required_authoritative_dependencies == (dependency,)
+    dependency_set = ControlStateAuthoritativeDependencySet((dependency,))
+    lease = value.acquire_control_lease(value.control_capability, dependency_set)
+    assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+    assert value.backend.read_task_working_set(task.task_id).task.state is TaskState.COMPLETED
+
+
+def test_issue29_authoritative_dependency_movement_after_resolution_prevents_completion_commit():
+    value, _, _, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, verdict_name="approved",
+    )
+    task = value.backend.read_task_working_set(record.subject.task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-moving-completion-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("semantic-moving-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    request = value.boundary.evaluate_task(TaskEvaluationCommand(
+        task.task_id, context.context_id, (), (), None,
+    ))
+    before = value.backend.read_task_working_set(task.task_id)
+    locator = value.platform.authoritative_snapshot(*dependency.locator)
+    moved_snapshot = AuthoritativeStateSnapshot(
+        locator.repository_id, locator.observation_profile_id, locator.transport_config_id,
+        (NormalizedGitHubObservation(
+            "repository", (locator.repository_id.value, "moved-owner", "repo"),
+        ),),
+    )
+    value.platform.replace_authoritative_snapshot(moved_snapshot)
+    lease = value.acquire_control_lease(
+        value.control_capability,
+        ControlStateAuthoritativeDependencySet((dependency,)),
+    )
+    assert lease is None
+    assert value.backend.read_task_working_set(task.task_id) == before
+    assert request.transaction.mutations[0].task.state is TaskState.COMPLETED
+
+
+def test_issue29_authoritative_dependency_movement_prevents_readiness_commit():
+    value, _, _, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, verdict_name="approved",
+    )
+    task = value.backend.read_task_working_set(record.subject.task_id).task
+    operation_command = OperationReservationCommand(
+        operation_id=OperationId("semantic-moving-readiness-operation"),
+        idempotency_key=OperationIdempotencyKey("semantic-moving-readiness-key"),
+        action_id=OperationActionId("semantic-moving-readiness-action"),
+        subject_id=OperationSubjectId("semantic-moving-readiness-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(task.task_id, operation_command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    completion = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-moving-readiness-context"),
+        task_id=task.task_id,
+        completion_rule_set_id=CompletionRuleSetId("semantic-moving-readiness-rule"),
+        contract_id=task.contract_id,
+        contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id,
+        admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(operation_command.operation_id,),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(completion)
+    request = value.boundary.evaluate_task(TaskEvaluationCommand(
+        task.task_id, completion.context_id, (), (), operation_command.operation_id,
+    ))
+    assert request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
+    assert request.required_authoritative_dependencies == (dependency,)
+    before = value.backend.read_task_working_set(task.task_id)
+    locator = value.platform.authoritative_snapshot(*dependency.locator)
+    moved_snapshot = AuthoritativeStateSnapshot(
+        locator.repository_id, locator.observation_profile_id, locator.transport_config_id,
+        (NormalizedGitHubObservation(
+            "repository", (locator.repository_id.value, "moved-owner", "repo"),
+        ),),
+    )
+    value.platform.replace_authoritative_snapshot(moved_snapshot)
+    lease = value.acquire_control_lease(
+        value.control_capability,
+        ControlStateAuthoritativeDependencySet((dependency,)),
+    )
+    assert lease is None
+    assert value.backend.read_task_working_set(task.task_id) == before
 
 
 @pytest.mark.parametrize("kind", [ControlStateCapability, TargetPublicationCapability, MergeCapability])
@@ -1881,10 +2876,14 @@ def test_evaluation_uses_all_root_managed_completion_facts_not_controller_defaul
         additional=ConditionStatus.SATISFIED, applicability=ConditionStatus.SATISFIED,
     )
     positive.register_completion_evaluation_context(complete)
+    semantic_dependencies = register_zero_semantic_environment(positive)
+    semantic_lease = positive.acquire_control_lease(
+        positive.control_capability, semantic_dependencies,
+    )
     assert ControlStateGate(positive).commit(
         positive.boundary.evaluate_task(TaskEvaluationCommand(
             TASK, complete.context_id, (), (), None,
-        )), independent_lease(positive),
+        )), semantic_lease,
     ).code is GateResultCode.COMMITTED
     assert positive.backend.read_task_working_set(TASK).task.state is TaskState.COMPLETED
 
@@ -1910,6 +2909,537 @@ def test_evaluation_uses_all_root_managed_completion_facts_not_controller_defaul
             )), independent_lease(value),
         ).code is GateResultCode.COMMITTED
         assert value.backend.read_task_working_set(TASK).task.state is expected_state
+
+
+def test_issue29_zero_semantic_obligations_keep_readiness_neutral_but_bind_g1_facts():
+    value = runtime()
+    initialize_task(value)
+    adopt_recorded_candidate(value, materialize(value))
+    dependencies = register_zero_semantic_environment(value)
+    operation = reserve_protected(
+        value, "forward-operation", None,
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+    )
+    context = completion_context(
+        value, "semantic-neutral-completion",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(operation.intent.operation_id,),
+    )
+    value.register_completion_evaluation_context(context)
+    request = value.boundary.evaluate_task(TaskEvaluationCommand(
+        TASK, context.context_id, (), (), operation.intent.operation_id,
+    ))
+    assert request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
+    assert request.required_authoritative_dependencies == dependencies.dependencies
+    lease = value.acquire_control_lease(value.control_capability, dependencies)
+    assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+    assert value.backend.read_task_working_set(TASK).task.state is TaskState.INTEGRATION_READY
+
+
+@pytest.mark.parametrize("additional_status", tuple(ConditionStatus))
+def test_issue29_leaves_each_existing_additional_completion_status_unchanged(
+    monkeypatch, additional_status,
+):
+    value = runtime()
+    initialize_task(value)
+    adopt_recorded_candidate(value, materialize(value))
+    dependencies = register_zero_semantic_environment(value)
+    context = completion_context(
+        value, f"issue29-additional-{additional_status.name}",
+        contract=ConditionStatus.SATISFIED,
+        additional=additional_status,
+        applicability=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    observed = []
+    original = gates_module._compose_completion_aggregate
+
+    def capture_additional_status(**kwargs):
+        observed.append(kwargs["additional_conditions_status"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        gates_module, "_compose_completion_aggregate", capture_additional_status,
+    )
+    command = TaskEvaluationCommand(TASK, context.context_id, (), (), None)
+    request = value.boundary.evaluate_task(command)
+    assert observed == [additional_status]
+    proposed = request.transaction.mutations[0].task
+    if proposed.state in (TaskState.COMPLETED, TaskState.INTEGRATION_READY):
+        assert dependencies is not None
+        lease = value.acquire_control_lease(
+            value.control_capability, dependencies,
+        )
+        assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+
+
+def test_issue29_readiness_rejects_non_integration_bound_next_operation_first():
+    value = runtime()
+    initialize_task(value)
+    materialization = adopt_recorded_candidate(value, materialize(value))
+    operation = reserve_protected(
+        value, "not-integration-bound", materialization.candidate_id,
+    )
+    context = completion_context(
+        value, "invalid-next-operation-context",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(operation.intent.operation_id,),
+    )
+    value.register_completion_evaluation_context(context)
+    before = value.backend.read_task_working_set(TASK)
+    occurrence = value.backend.occurrence
+    with pytest.raises(_TaskSemanticDenied) as denied:
+        value.boundary.evaluate_task(TaskEvaluationCommand(
+            TASK, context.context_id, (), (), operation.intent.operation_id,
+        ))
+    assert denied.value.code is TaskSemanticDenialCode.NEXT_INTEGRATION_OPERATION_INVALID
+    assert value.backend.read_task_working_set(TASK) == before
+    assert value.backend.occurrence == occurrence
+
+
+def test_issue29_occurrence_movement_between_current_review_and_g6_snapshot_fails_closed(monkeypatch):
+    value = runtime()
+    initialize_task(value)
+    register_zero_semantic_environment(value)
+    working = value.backend.read_task_working_set(TASK)
+    occurrence = working.canonical_state_occurrence_binding
+    original = gates_module.resolve_current_semantic_review
+
+    def resolve_then_advance(*args, **kwargs):
+        result = original(*args, **kwargs)
+        current = value.backend.read_task_working_set(TASK)
+        moved = replace(current.task, revision=current.task.revision + 1)
+        advanced = value.backend.apply(CanonicalTransaction(
+            current.canonical_state_occurrence_binding,
+            (TaskRevisionEquals(TASK, current.task.revision),),
+            (ReplaceTask(current.task.revision, moved),),
+        ))
+        assert advanced.status is CanonicalWriteStatus.APPLIED
+        return result
+
+    monkeypatch.setattr(gates_module, "resolve_current_semantic_review", resolve_then_advance)
+    assert value._resolve_semantic_consumption(TASK, (), occurrence) is None
+    assert value.backend.occurrence != occurrence
+
+
+def test_issue29_g1_base_dependency_must_match_exact_context_binding():
+    value = runtime()
+    initialize_task(value)
+    dependencies = register_zero_semantic_environment(value)
+    applicability, reader, source, base = value._semantic_contexts[TASK]
+    altered = replace(
+        base, expected_binding_id=AuthoritativeStateBindingId("not-the-g1-binding"),
+    )
+    with pytest.raises(ValueError, match="exact G1 base observation"):
+        value.register_semantic_consumption_context(
+            TASK, applicability, reader, source, altered,
+        )
+    assert value._semantic_contexts[TASK] == (
+        applicability, reader, source, dependencies.dependencies[0],
+    )
+
+
+def test_issue29_g1_and_65_semantic_dependencies_form_uncapped_exact_66_union():
+    base = dependency("base")
+    semantic = tuple(ControlStateAuthoritativeDependency(
+        REPO, ImmutableConfigId(f"semantic-observation-{index:02d}"),
+        ImmutableConfigId(f"semantic-transport-{index:02d}"),
+        AuthoritativeStateBindingId(f"semantic-binding-{index:02d}"),
+    ) for index in range(65))
+    canonical = gates_module._canonical_semantic_dependency_union(base, semantic)
+    assert canonical is not None
+    assert len(canonical) == 66
+    assert base in canonical
+    assert all(item in canonical for item in semantic)
+    # One cross-layer exact duplicate collapses, while contradictory locator
+    # bindings and malformed lower-layer ordering fail closed.
+    assert gates_module._canonical_semantic_dependency_union(base, (base,)) == (base,)
+    contradiction = replace(
+        base, expected_binding_id=AuthoritativeStateBindingId("other-binding"),
+    )
+    assert gates_module._canonical_semantic_dependency_union(base, (contradiction,)) is None
+    assert gates_module._canonical_semantic_dependency_union(
+        base, tuple(reversed(semantic[:2])),
+    ) is None
+
+
+def _issue29_semantic_gate_runtime(*, config_available=True):
+    from tests.trusted.test_current_semantic_review import (
+        _canonical_backend_with_candidate, _candidate, _current_applicability_context,
+        _materialization as semantic_materialization, _semantic_config_bytes,
+        _semantic_contract, _trusted_reader, REPOSITORY,
+    )
+
+    config_bytes = _semantic_config_bytes()
+    contract, _, _ = _semantic_contract(config_bytes=config_bytes)
+    materialization = semantic_materialization(
+        CandidateId("semantic-candidate"), contract_raw=contract.contract_raw_sha256,
+    )
+    candidate = _candidate(materialization, contract=contract)
+    backend = _canonical_backend_with_candidate(contract, candidate, materialization)
+    gate_binding = GateRuntimeBinding(
+        RootContextId(RawSha256("2" * 64)), FixtureRuntimeGeneration(9),
+        ServicePrincipalId("control-semantic"), ServicePrincipalId("publication-semantic"),
+        ServicePrincipalId("merge-semantic"),
+    )
+    value = FixtureProtectedGateRuntime(
+        gate_binding, backend, FixtureGitPlatform(), FixtureGateAudit(),
+    )
+    base = ControlStateAuthoritativeDependency(
+        REPOSITORY,
+        ImmutableConfigId("semantic-base-observation"),
+        ImmutableConfigId("semantic-base-transport"),
+        AuthoritativeStateBindingId("base-current"),
+    )
+    value.register_semantic_consumption_context(
+        candidate.task_id, _current_applicability_context(contract),
+        _trusted_reader(contract, config_bytes) if config_available else None,
+        None, base,
+    )
+    return value, backend, candidate
+
+
+def test_issue29_empty_readiness_evidence_cannot_bypass_unsatisfied_contract_semantics():
+    value, backend, candidate = _issue29_semantic_gate_runtime()
+    command = OperationReservationCommand(
+        operation_id=OperationId("semantic-forward-operation"),
+        idempotency_key=OperationIdempotencyKey("semantic-forward-key"),
+        action_id=OperationActionId("semantic-forward-action"),
+        subject_id=OperationSubjectId("semantic-forward-subject"),
+        required_evidence_ids=(),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reserve = value.boundary.reserve_operation(candidate.task_id, command)
+    assert ControlStateGate(value).commit(reserve, independent_lease(value)).code is GateResultCode.COMMITTED
+    working = backend.read_task_working_set(candidate.task_id)
+    operation = next(item for item in working.operations
+                     if item.intent.operation_id == command.operation_id)
+    task = working.task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-readiness-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("semantic-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(operation.intent.operation_id,),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    before = backend.read_task_working_set(candidate.task_id)
+    occurrence = backend.occurrence
+    with pytest.raises(_TaskSemanticDenied) as denied:
+        value.boundary.evaluate_task(TaskEvaluationCommand(
+            candidate.task_id, context.context_id, (), (), operation.intent.operation_id,
+        ))
+    assert denied.value.code is TaskSemanticDenialCode.SEMANTIC_CONTRACT_UNSATISFIED
+    assert operation.intent.required_evidence_ids == ()
+    assert backend.read_task_working_set(candidate.task_id) == before
+    assert backend.occurrence == occurrence
+
+
+def test_issue29_nonready_nonnext_integration_operation_does_not_receive_forward_semantic_veto():
+    value, backend, candidate = _issue29_semantic_gate_runtime()
+    command = OperationReservationCommand(
+        operation_id=OperationId("forward-semantic-denial"),
+        idempotency_key=OperationIdempotencyKey("forward-semantic-denial-key"),
+        action_id=OperationActionId("forward-semantic-denial-action"),
+        subject_id=OperationSubjectId("forward-semantic-denial-subject"),
+        required_evidence_ids=(),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(candidate.task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    operation = next(item for item in backend.read_task_working_set(candidate.task_id).operations
+                     if item.intent.operation_id == command.operation_id)
+    base_dependency = value._semantic_contexts[candidate.task_id][3]
+    denied = value._protected_start_semantic_denial(
+        operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        backend.occurrence,
+        ControlStateAuthoritativeDependencySet((base_dependency,)),
+    )
+    # It is IntegrationBound, but neither persisted INTEGRATION_READY nor
+    # exact next-operation identity holds.  G4 owns that denial; #29's
+    # stronger forward-only semantic rule must not be inferred from the flag.
+    assert denied is None
+
+
+def test_issue29_forward_start_accepts_only_current_progression_support():
+    value, _, _, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, verdict_name="approved",
+    )
+    command = OperationReservationCommand(
+        operation_id=OperationId("forward-semantic-supported"),
+        idempotency_key=OperationIdempotencyKey("forward-semantic-supported-key"),
+        action_id=OperationActionId("forward-semantic-supported-action"),
+        subject_id=OperationSubjectId("forward-semantic-supported-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(record.subject.task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    operation = next(item for item in value.backend.read_task_working_set(
+        record.subject.task_id
+    ).operations if item.intent.operation_id == command.operation_id)
+    assert value._protected_start_semantic_denial(
+        operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        value.backend.occurrence,
+        ControlStateAuthoritativeDependencySet((dependency,)),
+    ) is None
+
+
+@pytest.mark.parametrize(("extra_evaluation_ids", "config_available"), [
+    ((), True), ((), False), (("second-evaluator",), True),
+])
+def test_issue29_readiness_is_contract_wide_and_requires_exact_progression_support(
+    extra_evaluation_ids, config_available,
+):
+    value, _, _, dependency, record = _issue29_semantic_publication_runtime(
+        stale_schema=False, config_available=config_available,
+        extra_evaluation_ids=extra_evaluation_ids,
+    )
+    task = value.backend.read_task_working_set(record.subject.task_id).task
+    command = OperationReservationCommand(
+        operation_id=OperationId("semantic-readiness-operation"),
+        idempotency_key=OperationIdempotencyKey("semantic-readiness-key"),
+        action_id=OperationActionId("semantic-readiness-action"),
+        subject_id=OperationSubjectId("semantic-readiness-subject"),
+        required_evidence_ids=(record.evidence_id,),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(task.task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    operation = next(item for item in value.backend.read_task_working_set(task.task_id).operations
+                     if item.intent.operation_id == command.operation_id)
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-readiness-exact-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("semantic-readiness-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(operation.intent.operation_id,),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    before = value.backend.read_task_working_set(task.task_id)
+    occurrence = value.backend.occurrence
+    evaluation = TaskEvaluationCommand(
+        task.task_id, context.context_id, (), (), operation.intent.operation_id,
+    )
+    if extra_evaluation_ids or not config_available:
+        # The named EvidenceId satisfies the first obligation, but the second
+        # mandatory evaluator has no history.  G5 contract status must win over
+        # any favorable subset supplied by the operation.
+        with pytest.raises(_TaskSemanticDenied) as denied:
+            value.boundary.evaluate_task(evaluation)
+        expected = (TaskSemanticDenialCode.SEMANTIC_CONTRACT_UNSATISFIED
+                    if extra_evaluation_ids
+                    else TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE)
+        assert denied.value.code is expected
+        assert value.backend.read_task_working_set(task.task_id) == before
+        assert value.backend.occurrence == occurrence
+    else:
+        request = value.boundary.evaluate_task(evaluation)
+        assert request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
+        assert request.required_authoritative_dependencies == (dependency,)
+        lease = value.acquire_control_lease(
+            value.control_capability,
+            ControlStateAuthoritativeDependencySet((dependency,)),
+        )
+        assert ControlStateGate(value).commit(request, lease).code is GateResultCode.COMMITTED
+        assert value.backend.read_task_working_set(task.task_id).task.state is TaskState.INTEGRATION_READY
+        assert value.backend.read_task_working_set(task.task_id).task.next_integration_operation_id == operation.intent.operation_id
+        assert value._protected_start_semantic_denial(
+            operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+            value.backend.occurrence,
+            ControlStateAuthoritativeDependencySet((dependency,)),
+        ) is None
+
+
+def test_issue29_readiness_rejects_stale_superseded_required_evidence():
+    from tests.trusted.test_current_semantic_review import resolve_current_semantic_review
+    from tests.trusted.test_semantic_consumption import _append_superseding_approved_evidence
+
+    value, _, _, _, earlier = _issue29_semantic_publication_runtime(
+        stale_schema=False,
+    )
+    task_id = earlier.subject.task_id
+    current_inputs = value.backend.read_current_semantic_review_inputs(task_id)
+    applicability, reader, context_source, _ = value._semantic_contexts[task_id]
+    current_resolution = resolve_current_semantic_review(
+        current_inputs, applicability_context=applicability, byte_reader=reader,
+        semantic_context_source=context_source,
+    )
+    effective_subject = current_resolution.obligation_outcomes[0].effective_subject
+    later = _append_superseding_approved_evidence(
+        value.backend, current_resolution, earlier, effective_subject,
+    )
+    command = OperationReservationCommand(
+        operation_id=OperationId("readiness-with-superseded-evidence"),
+        idempotency_key=OperationIdempotencyKey("readiness-superseded-key"),
+        action_id=OperationActionId("readiness-superseded-action"),
+        subject_id=OperationSubjectId("readiness-superseded-subject"),
+        required_evidence_ids=(earlier.evidence_id,),
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    task = value.backend.read_task_working_set(task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("superseded-readiness-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("superseded-readiness-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(command.operation_id,),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    before = value.backend.read_task_working_set(task_id)
+    occurrence = value.backend.occurrence
+    with pytest.raises(_TaskSemanticDenied) as denied:
+        value.boundary.evaluate_task(TaskEvaluationCommand(
+            task_id, context.context_id, (), (), command.operation_id,
+        ))
+    assert denied.value.code is TaskSemanticDenialCode.REQUIRED_SEMANTIC_EVIDENCE_NOT_CURRENT
+    assert later.evidence_id != earlier.evidence_id
+    assert value.backend.read_task_working_set(task_id) == before
+    assert value.backend.occurrence == occurrence
+
+
+@pytest.mark.parametrize(("config_available", "expected_code"), [
+    (True, TaskSemanticDenialCode.SEMANTIC_CONTRACT_UNSATISFIED),
+    (False, TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE),
+])
+def test_issue29_semantic_completion_veto_preserves_g4_success_and_state(
+    config_available, expected_code,
+):
+    value, backend, candidate = _issue29_semantic_gate_runtime(
+        config_available=config_available,
+    )
+    task = backend.read_task_working_set(candidate.task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-completion-context"),
+        task_id=task.task_id, completion_rule_set_id=CompletionRuleSetId("semantic-completion-rule"),
+        contract_id=task.contract_id, contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id, admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    command = TaskEvaluationCommand(candidate.task_id, context.context_id, (), (), None)
+    g4_request = value.controller.evaluate_task(command)
+    assert g4_request.transaction.mutations[0].task.state is TaskState.COMPLETED
+    before = backend.read_task_working_set(candidate.task_id)
+    occurrence = backend.occurrence
+    with pytest.raises(_TaskSemanticDenied) as denied:
+        value.boundary.evaluate_task(command)
+    assert denied.value.code is expected_code
+    assert backend.read_task_working_set(candidate.task_id) == before
+    assert backend.occurrence == occurrence
+
+
+def test_issue29_preserves_g4_completion_inconsistency_before_semantic_veto(monkeypatch):
+    value, backend, candidate = _issue29_semantic_gate_runtime()
+    task = backend.read_task_working_set(candidate.task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-g4-inconsistency-context"),
+        task_id=task.task_id,
+        completion_rule_set_id=CompletionRuleSetId("semantic-g4-inconsistency-rule"),
+        contract_id=task.contract_id,
+        contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id,
+        admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.SATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    monkeypatch.setattr(
+        gates_module.FixtureProtectedGateRuntime, "_resolve_semantic_consumption",
+        lambda *_: pytest.fail("G4 completion inconsistency must precede semantic policy"),
+    )
+    with pytest.raises(ValueError, match="INCONSISTENT_TASK_EVALUATION"):
+        value.boundary.evaluate_task(TaskEvaluationCommand(
+            task.task_id, context.context_id,
+            (BlockingConditionId("completion-blocker"),), (), None,
+        ))
+    assert backend.read_task_working_set(task.task_id).task == task
+
+
+def test_issue29_ordinary_g4_proposal_does_not_resolve_semantics(monkeypatch):
+    value, backend, candidate = _issue29_semantic_gate_runtime()
+    task = backend.read_task_working_set(candidate.task_id).task
+    context = mint(
+        TrustedCompletionEvaluationContext,
+        context_id=ImmutableConfigId("semantic-ordinary-state-context"),
+        task_id=task.task_id,
+        completion_rule_set_id=CompletionRuleSetId("semantic-ordinary-state-rule"),
+        contract_id=task.contract_id,
+        contract_raw_sha256=task.contract_raw_sha256,
+        authorization_id=task.authorization_id,
+        admission_event_id=task.admission_event_id,
+        target_registration_id=task.target_registration_id,
+        policy_epoch_identity=task.last_evaluated_policy_epoch_identity,
+        candidate_id=task.current_candidate_id,
+        contract_acceptance_status=ConditionStatus.UNSATISFIED,
+        additional_trusted_completion_conditions_status=ConditionStatus.SATISFIED,
+        required_protected_operation_ids=(),
+        current_applicability_and_authority_status=ConditionStatus.SATISFIED,
+    )
+    value.register_completion_evaluation_context(context)
+    monkeypatch.setattr(
+        gates_module.FixtureProtectedGateRuntime, "_resolve_semantic_consumption",
+        lambda *_: pytest.fail("ordinary G4 state proposals have no #29 semantic policy"),
+    )
+    request = value.boundary.evaluate_task(TaskEvaluationCommand(
+        task.task_id, context.context_id,
+        (BlockingConditionId("semantic-ordinary-blocker"),), (), None,
+    ))
+    assert request.transaction.mutations[0].task.state is TaskState.BLOCKED
+    assert backend.read_task_working_set(task.task_id).task == task
 
 
 def test_evaluation_fails_closed_when_completion_context_is_missing_or_mismatched():

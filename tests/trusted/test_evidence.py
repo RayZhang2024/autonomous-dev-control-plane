@@ -552,6 +552,7 @@ def test_semantic_status_composition_conflict_and_structured_supersession():
     conflict = compose_semantic_evidence(snapshot, context)
     assert conflict.reason is SemanticCompositionReason.CONFLICTING_APPLICABLE_EVIDENCE
     assert conflict.evidence_history_membership_binding == EvidenceHistoryMembershipBindingId("canonical-H")
+    assert conflict.contributing_evidence_ids == ()
 
     early = mint(TrustedAdmittedEvidenceRecord, record=approved, membership_binding=EvidenceHistoryMembershipBindingId("H1"))
     late = mint(TrustedAdmittedEvidenceRecord, record=changed, membership_binding=EvidenceHistoryMembershipBindingId("H2"))
@@ -565,6 +566,7 @@ def test_semantic_status_composition_conflict_and_structured_supersession():
     composed = compose_semantic_evidence(snapshot, context, (relation,))
     assert composed.reason is SemanticCompositionReason.COMPOSED
     assert composed.requirement_statuses[0].status.name == "UNSATISFIED"
+    assert composed.contributing_evidence_ids == (changed.evidence_id,)
     assert approved.payload.aggregate is SemanticVerdict.APPROVED
 
     omitted_later = mint(
@@ -649,11 +651,16 @@ def test_two_slot_composition_uses_common_subject_and_exact_per_slot_profile(slo
     result = compose_semantic_evidence(snapshot, context)
     assert result.reason is SemanticCompositionReason.COMPOSED
     assert result.requirement_statuses[0].status.name == expected
+    assert result.contributing_evidence_ids == (
+        approved_a.evidence_id, record_b.evidence_id,
+    )
 
     changed_profile_b = replace(profile_b, config_id=ImmutableConfigId("profile-b-new-config"))
     changed_rule = SemanticReviewCompositionRule(rule.composition_rule_id, rule.mode, (slot_a, replace(slot_b, profile=changed_profile_b)))
     changed_context = mint(TrustedSemanticCompositionContext, effective_subject=request.effective_subject, composition_rule=changed_rule)
-    assert compose_semantic_evidence(snapshot, changed_context).reason is SemanticCompositionReason.REQUIRED_SLOT_MISSING
+    missing = compose_semantic_evidence(snapshot, changed_context)
+    assert missing.reason is SemanticCompositionReason.REQUIRED_SLOT_MISSING
+    assert missing.contributing_evidence_ids == ()
 
 
 @pytest.mark.parametrize(("verdict_value", "status"), [
