@@ -6,27 +6,24 @@ not a parallel test authority path.
 """
 
 from dataclasses import replace
+import hashlib
 import json
 
 import pytest
 
+import autodev_control.trusted.gates as gates_module
 from autodev_control.trusted.authorization import (
     OrdinaryRootProtectionState,
     admit_direct_authorization,
     load_candidate_authorization_proposal,
 )
+from autodev_control.trusted.contract import (
+    IssueContractApplicabilityCode,
+    derive_contract_authority_ceiling,
+    load_candidate_issue_contract,
+)
 from autodev_control.trusted.backend import (
-    CanonicalTransaction,
-    CanonicalWriteStatus,
-    CreateAuthorization,
-    CreateCandidate,
-    CreateEvidenceHistory,
-    CreateSemanticReviewOperationAndBinding,
-    CreateTaskAndInitialOperationMembership,
-    ReplaceOperation,
-    ReplaceTask,
-    ResolvedTargetRegistration,
-    ReviewAttemptBindingRecord,
+    canonical_json_bytes,
 )
 from autodev_control.trusted.decision import Decision
 from autodev_control.trusted.errors import (
@@ -38,7 +35,6 @@ from autodev_control.trusted.evidence import (
     EvidenceApplicabilityDecision,
     EvidenceApplicabilityReason,
     evaluate_evidence_applicability,
-    SemanticVerdict,
 )
 from autodev_control.trusted.gates import (
     ActionTargetFence,
@@ -50,31 +46,24 @@ from autodev_control.trusted.gates import (
     TargetPublicationGate,
     TaskEvaluationCommand,
 )
+from autodev_control.trusted.fixture_platform import (
+    ProtectedEffectMarkerPreimage,
+    PublishedCandidateRefEffectSubject,
+    build_protected_effect_marker,
+)
 from autodev_control.trusted.identity import (
-    CandidateMaterializationId,
+    GitRef,
     GitSha,
-    ImmutableConfigId,
-    OperationStartBindingId,
     RawSha256,
 )
-from autodev_control.trusted.materialization import (
-    MutationKind,
-    build_candidate_materialization,
-)
+from autodev_control.trusted.materialization import MutationKind
 from autodev_control.trusted.operation import (
-    AuthoritativeStateBindingId,
-    NotIntegrationBound,
     OperationActionId,
-    OperationEffectClass,
     OperationId,
     OperationIdempotencyKey,
-    OperationPurpose,
-    OperationRecord,
     OperationState,
     OperationSubjectId,
     CandidateId,
-    _compose_trusted_operation_classification,
-    construct_trusted_operation_intent,
 )
 from autodev_control.trusted.scope import (
     ChangeType,
@@ -86,17 +75,17 @@ from autodev_control.trusted.scope import (
     TaskId,
 )
 from autodev_control.trusted.state import (
-    RepairBudget,
-    CandidateRecord,
-    TaskRecord,
-)
-from autodev_control.trusted.state import (
-    CancellationRequestId, CancellationStatus, ConditionStatus, TaskState,
+    CancellationRequestId, CancellationStatus, ConditionStatus, RepairBudget,
+    TaskState,
 )
 
 from tests.trusted import test_authorization as authorization_fixture
 from tests.trusted import test_evidence as evidence_fixture
 from tests.trusted import test_gates as gates_fixture
+from tests.trusted.contract_fixtures import (
+    canonical_contract_fixture,
+    trusted_admission_context_for_fixture,
+)
 
 
 def _operation(runtime, operation_id):
@@ -110,7 +99,7 @@ def _publication_setup(name="g8-publication", *, target=None):
     runtime = gates_fixture.runtime(target)
     gates_fixture.initialize_task(runtime)
     materialization = gates_fixture.materialize(runtime)
-    gates_fixture.adopt_materialization(runtime, materialization)
+    materialization = gates_fixture.adopt_recorded_candidate(runtime, materialization)
     operation = gates_fixture.reserve_protected(runtime, name, materialization.candidate_id)
     fence = ActionTargetFence(
         gates_fixture.REPO, materialization.candidate_branch, None,
@@ -122,133 +111,99 @@ def _publication_setup(name="g8-publication", *, target=None):
 def _evaluate(runtime, context, *, blockers=()):
     """Use the public G6/G4 evaluation path for one exact trusted context."""
     runtime.register_completion_evaluation_context(context)
+    # G8 completion cases use the frozen no-semantic-evaluator contract fixture.
+    # Refresh the real #29 neutral resolution after all setup mutations so its
+    # G1 dependency and canonical occurrence are exact for this evaluation.
+    dependencies = gates_fixture.register_zero_semantic_environment(runtime)
     return ControlStateGate(runtime).commit(
         runtime.boundary.evaluate_task(TaskEvaluationCommand(
             gates_fixture.TASK, context.context_id, blockers, (), None,
-        )), gates_fixture.independent_lease(runtime),
+        )), runtime.acquire_control_lease(runtime.control_capability, dependencies),
     )
 
 
-def _persist_admitted_evidence_through_g5_boundary():
-    """Bootstrap canonical eligibility, then admit raw APPROVED evidence publicly."""
-    template = evidence_fixture.fixture()
-    subject = template.effective_subject
-    target_fields = {
-        field: getattr(gates_fixture.registration(), field)
-        for field in gates_fixture.AdmittedTargetRegistration.__dataclass_fields__
-    }
-    target_fields.update(
-        target_registration_id=subject.target_registration_id,
-        policy_epoch_identity=subject.policy_epoch_identity,
+def _exact_publication_marker(runtime, started, materialization, fence):
+    continuation = started.continuation
+    effect_subject = PublishedCandidateRefEffectSubject(
+        gates_fixture.REPO, materialization.candidate_branch,
+        GitRef(materialization.candidate_branch.value), materialization.commit,
     )
-    target = gates_fixture.mint(gates_fixture.AdmittedTargetRegistration, **target_fields)
-    resolved = gates_fixture.mint(
-        ResolvedTargetRegistration,
-        registration=target, target_registration_id=subject.target_registration_id,
-        root_config_id=ImmutableConfigId("g8-evidence-target-root"),
-        policy_epoch_identity=subject.policy_epoch_identity,
+    pre_identity = RawSha256(hashlib.sha256(
+        canonical_json_bytes(("pre", fence))
+    ).hexdigest())
+    post_identity = RawSha256(hashlib.sha256(
+        canonical_json_bytes(("post", effect_subject))
+    ).hexdigest())
+    action_digest = RawSha256(hashlib.sha256(canonical_json_bytes((
+        continuation.subject, continuation.action_id,
+        materialization.materialization_id, materialization.inventory.inventory_id,
+        effect_subject,
+    ))).hexdigest())
+    return build_protected_effect_marker(ProtectedEffectMarkerPreimage(
+        "autodev.protected-effect-marker/v1", continuation.subject.value,
+        continuation.operation_id, continuation.idempotency_key,
+        continuation.action_id, action_digest, materialization.materialization_id,
+        materialization.inventory.inventory_id, continuation.prepared_start_id,
+        runtime.binding.root_context_id, runtime.binding.runtime_generation.value,
+        runtime.publication_capability.service_identity, effect_subject,
+        pre_identity, post_identity,
+    ))
+
+
+def _current_semantic_runtime():
+    """Use the existing #32/#29 G7 fixture with canonical favorable evidence."""
+    runtime, materialization, target, base_dependency, evidence = (
+        gates_fixture._issue29_semantic_publication_runtime(stale_schema=False)
     )
-    template_runtime = gates_fixture.runtime()
-    runtime = gates_fixture.FixtureProtectedGateRuntime(
-        template_runtime.binding,
-        gates_fixture.InMemoryCanonicalStateBackend((resolved,)),
-        gates_fixture.FixtureGitPlatform(), gates_fixture.FixtureGateAudit(),
+    semantic = runtime._resolve_semantic_consumption(
+        evidence.subject.task_id, (evidence.evidence_id,), runtime.backend.occurrence,
     )
-    authorization_fields = {
-        field: getattr(gates_fixture.authorization(), field)
-        for field in gates_fixture.AdmittedAuthorization.__dataclass_fields__
-    }
-    authorization_fields.update(
-        authorization_id=subject.authorization_id,
-        task_id=subject.task_id, contract_id=subject.contract_id,
-        contract_raw_sha256=subject.contract_raw_sha256,
-        target_registration_id=subject.target_registration_id,
-        policy_epoch_identity=subject.policy_epoch_identity,
+    assert semantic is not None
+    assert semantic.contract_status is ConditionStatus.SATISFIED
+    assert len(semantic.obligation_results) == 1
+    assert semantic.obligation_results[0].status is ConditionStatus.SATISFIED
+    assert semantic.obligation_results[0].progression_support_evidence_ids == (
+        evidence.evidence_id,
     )
-    authorization = gates_fixture.mint(
-        gates_fixture.AdmittedAuthorization, **authorization_fields,
+    assert semantic.evidence_currentness[0].status.name == "CURRENT"
+    return runtime, materialization, target, base_dependency, evidence
+
+
+def _raw_contract(*, contract_id, task_id, operations, objective="fixture objective"):
+    raw, _, _ = canonical_contract_fixture(
+        contract_id=contract_id, task_id=task_id,
+        target_registration_id=gates_fixture.TARGET,
+        repository_id=gates_fixture.REPO,
+        policy_epoch_identity=gates_fixture.EPOCH,
+        base_sha=gates_fixture.SHA,
+        allowed_repository_scope=True,
+        requested_operations=operations,
     )
-    task = TaskRecord(
-        subject.task_id, 1, TaskState.ADMITTED,
-        subject.contract_id, subject.contract_raw_sha256,
-        subject.authorization_id, subject.task_admission_event_id,
-        subject.target_registration_id, subject.policy_epoch_identity,
-        None, None, (), RepairBudget(0),
+    value = json.loads(raw)
+    value["objective"] = objective
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _admit_raw_contract(runtime, raw, label):
+    dependencies = gates_fixture.install_fixture_dependencies(
+        runtime, label + "-base", label + "-issue",
     )
-    adopted_task = TaskRecord(
-        subject.task_id, 2, TaskState.EVALUATING,
-        subject.contract_id, subject.contract_raw_sha256,
-        subject.authorization_id, subject.task_admission_event_id,
-        subject.target_registration_id, subject.policy_epoch_identity,
-        subject.candidate_id, None, (), RepairBudget(0),
+    resolved = runtime.backend.read_resolved_target_registration(gates_fixture.TARGET)
+    assert resolved is not None
+    context = trusted_admission_context_for_fixture(
+        raw, resolved.registration, gates_fixture.EPOCH,
+        dependencies.dependencies[0].expected_binding_id,
+        dependencies.dependencies[1].expected_binding_id,
     )
-    candidate = CandidateRecord(
-        subject.candidate_id, subject.task_id, subject.base,
-        subject.contract_id, subject.contract_raw_sha256,
-        subject.authorization_id, subject.task_admission_event_id,
-        subject.target_registration_id, subject.policy_epoch_identity,
-        CandidateMaterializationId(RawSha256("a" * 64)), (),
-    )
-    intent = construct_trusted_operation_intent(
-        classification=_compose_trusted_operation_classification(
-            OperationEffectClass.NON_PROTECTED_EFFECT, OperationPurpose.NORMAL,
-        ),
-        operation_id=template.operation.intent.operation_id,
-        idempotency_key=OperationIdempotencyKey("g8-semantic-review"),
-        task_id=subject.task_id,
-        action_id=OperationActionId("g8-semantic-review"),
-        subject_id=OperationSubjectId("g8-semantic-review"),
-        candidate_id=subject.candidate_id,
-        contract_id=subject.contract_id,
-        contract_raw_sha256=subject.contract_raw_sha256,
-        authorization_id=subject.authorization_id,
-        admission_event_id=subject.task_admission_event_id,
-        target_registration_id=subject.target_registration_id,
-        policy_epoch_identity=subject.policy_epoch_identity,
-        authoritative_state_binding_id=AuthoritativeStateBindingId("g8-evidence"),
-        required_evidence_ids=(), integration_binding=NotIntegrationBound(),
-    )
-    assert runtime.backend.apply(CanonicalTransaction(
-        runtime.backend.occurrence, (), (
-            CreateAuthorization(authorization),
-            CreateTaskAndInitialOperationMembership(task),
-            CreateCandidate(candidate),
-            CreateEvidenceHistory(subject),
-            ReplaceTask(1, adopted_task),
-        ),
-    )).status is CanonicalWriteStatus.APPLIED
-    reserved = OperationRecord(intent, 1, OperationState.RESERVED)
-    attempt = ReviewAttemptBindingRecord(
-        subject, template.invocation.invocation_id, template.slot.slot_id,
-        reserved.intent.operation_id, template.invocation.canonical_request_id,
-    )
-    working = runtime.backend.read_task_working_set(subject.task_id)
-    assert runtime.backend.apply(CanonicalTransaction(
-        runtime.backend.occurrence, (), (
-            CreateSemanticReviewOperationAndBinding(
-                reserved, attempt, working.task.revision,
-                working.task_operation_membership.membership_binding_id,
-            ),
-        ),
-    )).status is CanonicalWriteStatus.APPLIED
-    succeeded = OperationRecord(
-        intent, 2, OperationState.SUCCEEDED,
-        start_binding_id=OperationStartBindingId(RawSha256("7" * 64)),
-    )
-    assert runtime.backend.apply(CanonicalTransaction(
-        runtime.backend.occurrence, (), (ReplaceOperation(1, succeeded),),
-    )).status is CanonicalWriteStatus.APPLIED
-    context_id = ImmutableConfigId("g8-approved-evidence")
-    runtime.register_semantic_evidence_context(context_id, template)
-    request = runtime.boundary.admit_semantic_evidence(
-        SemanticEvidenceCommand(context_id, template.raw_response),
-    )
+    runtime.register_contract_context(raw, context)
+    request = runtime.boundary.admit_contract(raw)
     assert ControlStateGate(runtime).commit(
-        request, gates_fixture.independent_lease(runtime),
+        request, runtime.acquire_control_lease(runtime.control_capability, dependencies),
     ).code is GateResultCode.COMMITTED
-    snapshot = runtime.backend.read_review_eligibility_snapshot(subject.subject_id)
-    assert len(snapshot.canonical_evidence_records) == 1
-    return runtime, snapshot.canonical_evidence_records[0]
+    parsed = load_candidate_issue_contract(raw)
+    contract = runtime.backend.read_contract(parsed.contract_id)
+    assert contract is not None
+    return contract
 
 
 def test_g8_01_admitted_evidence_with_stale_base_is_not_current_proof():
@@ -263,23 +218,236 @@ def test_g8_01_admitted_evidence_with_stale_base_is_not_current_proof():
     )
     assert result.decision is not EvidenceApplicabilityDecision.APPLICABLE
 
+    # Keep the low-level applicability assertion, then move the assembled
+    # current #32/#29 context to S2 and consume the exact canonical S1 record.
+    runtime, materialization, target, base_dependency, evidence = (
+        _current_semantic_runtime()
+    )
+    applicability, reader, context_source, dependency = runtime._semantic_contexts[
+        evidence.subject.task_id
+    ]
+    assert dependency == base_dependency
+    old_base = applicability.base_observation
+    moved_base = gates_fixture.mint(
+        type(old_base),
+        **{
+            **{name: getattr(old_base, name) for name in old_base.__dataclass_fields__},
+            "sha": GitSha("d" * 40),
+        },
+    )
+    moved_context = gates_fixture.mint(
+        type(applicability),
+        **{
+            **{name: getattr(applicability, name)
+               for name in applicability.__dataclass_fields__},
+            "base_observation": moved_base,
+        },
+    )
+    runtime.register_semantic_consumption_context(
+        evidence.subject.task_id, moved_context, reader, context_source,
+        base_dependency,
+    )
+    current = runtime._resolve_semantic_consumption(
+        evidence.subject.task_id, (evidence.evidence_id,), runtime.backend.occurrence,
+    )
+    assert current is not None
+    exact = current.evidence_currentness[0]
+    assert exact.evidence_id == evidence.evidence_id
+    assert exact.status.name == "STALE"
+    assert exact.applicability_code is IssueContractApplicabilityCode.BASE_CHANGED
+    assert current.obligation_results == ()
+    assert not any(
+        evidence.evidence_id in item.progression_support_evidence_ids
+        for item in current.obligation_results
+    )
+
+    # The real G4 readiness boundary cannot consume the stale evidence.
+    forward = gates_fixture.reserve_protected(
+        runtime, "g8-stale-base-readiness", materialization.candidate_id,
+        integration_binding=gates_fixture.IntegrationBound(
+            GitRef(target.merge.allowed_integration_refs[0].value)
+        ), required_evidence_ids=(evidence.evidence_id,),
+    )
+    ready_context = gates_fixture.completion_context(
+        runtime, "g8-stale-base-readiness-context",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(forward.intent.operation_id,),
+    )
+    runtime.register_completion_evaluation_context(ready_context)
+    with pytest.raises(gates_fixture._TaskSemanticDenied) as ready_denied:
+        runtime.boundary.evaluate_task(TaskEvaluationCommand(
+            evidence.subject.task_id, ready_context.context_id, (), (),
+            forward.intent.operation_id,
+        ))
+    assert ready_denied.value.code is gates_fixture.TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.INTEGRATION_READY
+
+    # The real G7 start path independently rejects the same stale EvidenceId.
+    fence = ActionTargetFence(
+        evidence.subject.repository_id, materialization.candidate_branch, None,
+        runtime.platform.snapshot().generation,
+    )
+    start_operation = gates_fixture.reserve_protected(
+        runtime, "g8-stale-base-start", materialization.candidate_id,
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    start = gates_fixture.start_protected(
+        runtime, start_operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization, target=target,
+        dependencies=gates_fixture.ControlStateAuthoritativeDependencySet(
+            (base_dependency,)
+        ),
+    )
+    assert start.code is GateResultCode.REJECTED
+    assert start.semantic_denial_code.name == "REQUIRED_EVIDENCE_NOT_CURRENT"
+    assert _operation(runtime, start_operation.intent.operation_id).start_binding_id is None
+    assert runtime.platform.marker(
+        start_operation.intent.operation_id, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+    # G4 completion also cannot be granted by the stale historical proof.
+    complete_context = gates_fixture.completion_context(
+        runtime, "g8-stale-base-completion-context",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+    )
+    runtime.register_completion_evaluation_context(complete_context)
+    with pytest.raises(gates_fixture._TaskSemanticDenied) as completion_denied:
+        runtime.boundary.evaluate_task(TaskEvaluationCommand(
+            evidence.subject.task_id, complete_context.context_id, (), (), None,
+        ))
+    assert completion_denied.value.code is gates_fixture.TaskSemanticDenialCode.SEMANTIC_CONTEXT_INDETERMINATE
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.COMPLETED
+
+
+def test_g8_01_stale_base_denies_persisted_forward_merge_start():
+    """An already-ready IntegrationBound operation rechecks exact evidence at start."""
+    runtime, materialization, target, base_dependency, evidence = (
+        _current_semantic_runtime()
+    )
+    dependencies = gates_fixture.ControlStateAuthoritativeDependencySet(
+        (base_dependency,)
+    )
+    repository_id = evidence.subject.repository_id
+    base_ref = target.merge.allowed_integration_refs[0]
+    runtime.platform.seed_ref(repository_id, base_ref, materialization.base)
+
+    publish = gates_fixture.reserve_protected(
+        runtime, "g8-stale-forward-publish", materialization.candidate_id,
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    publish_start = gates_fixture.start_protected(
+        runtime, publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            repository_id, materialization.candidate_branch, None,
+            runtime.platform.snapshot().generation,
+        ), materialization, target=target, dependencies=dependencies,
+    )
+    assert publish_start.code is GateResultCode.START_COMMITTED
+    assert TargetPublicationGate(runtime).perform(
+        publish_start.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    create_pr = gates_fixture.reserve_protected(
+        runtime, "g8-stale-forward-pr", materialization.candidate_id,
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    pr_start = gates_fixture.start_protected(
+        runtime, create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION,
+        ActionTargetFence(
+            repository_id, materialization.candidate_branch, materialization.commit,
+            runtime.platform.snapshot().generation, base_ref, materialization.base,
+        ), materialization, target=target, base_ref=base_ref,
+        provenance_operation_id=publish.intent.operation_id,
+        dependencies=dependencies,
+    )
+    assert pr_start.code is GateResultCode.START_COMMITTED
+    assert TargetPublicationGate(runtime).perform(
+        pr_start.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+
+    forward = gates_fixture.reserve_protected(
+        runtime, "g8-stale-forward-merge", materialization.candidate_id,
+        integration_binding=gates_fixture.IntegrationBound(GitRef(base_ref.value)),
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    ready_context = gates_fixture.completion_context(
+        runtime, "g8-stale-forward-ready-context",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(forward.intent.operation_id,),
+    )
+    runtime.register_completion_evaluation_context(ready_context)
+    ready_request = runtime.boundary.evaluate_task(TaskEvaluationCommand(
+        evidence.subject.task_id, ready_context.context_id, (), (),
+        forward.intent.operation_id,
+    ))
+    assert ready_request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
+    assert ControlStateGate(runtime).commit(
+        ready_request, runtime.acquire_control_lease(runtime.control_capability, dependencies),
+    ).code is GateResultCode.COMMITTED
+
+    applicability, reader, context_source, _ = runtime._semantic_contexts[
+        evidence.subject.task_id
+    ]
+    old_base = applicability.base_observation
+    moved_base = gates_fixture.mint(
+        type(old_base),
+        **{
+            **{name: getattr(old_base, name) for name in old_base.__dataclass_fields__},
+            "sha": GitSha("d" * 40),
+        },
+    )
+    moved_context = gates_fixture.mint(
+        type(applicability),
+        **{
+            **{name: getattr(applicability, name)
+               for name in applicability.__dataclass_fields__},
+            "base_observation": moved_base,
+        },
+    )
+    runtime.register_semantic_consumption_context(
+        evidence.subject.task_id, moved_context, reader, context_source,
+        base_dependency,
+    )
+    before_ref = runtime.platform.read_ref(repository_id, base_ref)
+    result = gates_fixture.start_protected(
+        runtime, forward, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        ActionTargetFence(
+            repository_id, base_ref, materialization.base,
+            runtime.platform.snapshot().generation,
+        ), materialization, target=target, base_ref=base_ref,
+        provenance_operation_id=create_pr.intent.operation_id,
+        dependencies=dependencies,
+    )
+    assert result.code is GateResultCode.REJECTED
+    assert result.semantic_denial_code.name == "REQUIRED_EVIDENCE_NOT_CURRENT"
+    stored = _operation(runtime, forward.intent.operation_id)
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert runtime.platform.marker(
+        forward.intent.operation_id, ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+    ) is None
+    assert runtime.platform.read_ref(repository_id, base_ref) == before_ref
+
 
 def test_g8_02_public_control_boundary_rejects_transferred_authorization():
     runtime = gates_fixture.runtime()
     gates_fixture.initialize_task(runtime)
-    request = runtime.boundary.create_task(
-        task_id=TaskId("g8-other-task"),
-        contract_id=ContractId("g8-other-contract"),
-        contract_raw_sha256=RawSha256("9" * 64),
-        authorization_id=gates_fixture.AUTH,
-        admission_event_id=gates_fixture.ADMISSION,
-        target_registration_id=gates_fixture.TARGET,
-        policy_epoch_identity=gates_fixture.EPOCH,
-        repair_budget=RepairBudget(1),
-    )
-    assert ControlStateGate(runtime).commit(
-        request, gates_fixture.independent_lease(runtime),
-    ).code is GateResultCode.REJECTED
+    with pytest.raises(ValueError, match="exact canonical contract and authorization"):
+        runtime.boundary.create_task(
+            task_id=TaskId("g8-other-task"),
+            contract_id=ContractId("g8-other-contract"),
+            contract_raw_sha256=RawSha256("9" * 64),
+            authorization_id=gates_fixture.AUTH,
+            admission_event_id=gates_fixture.ADMISSION,
+            target_registration_id=gates_fixture.TARGET,
+            policy_epoch_identity=gates_fixture.EPOCH,
+            repair_budget=RepairBudget(1),
+        )
     assert runtime.backend.read_task_working_set(TaskId("g8-other-task")) is None
 
 
@@ -310,7 +478,7 @@ def test_g8_03_tree_derived_out_of_scope_addition_cannot_start_publication():
     assert _operation(runtime, operation.intent.operation_id).state is OperationState.CONFLICT
 
 
-def test_g8_04_root_overlap_and_missing_context_use_frozen_admission_reasons():
+def _g8_root_admissions():
     target = authorization_fixture.admitted_target()
     proposal = authorization_fixture.load_proposal(target.target_registration_id)
     contract, policy, approval, issuer, root = authorization_fixture.direct_contexts(
@@ -328,9 +496,18 @@ def test_g8_04_root_overlap_and_missing_context_use_frozen_admission_reasons():
     unavailable = admit_direct_authorization(
         proposal, target, contract, policy, approval, issuer, None,
     )
-    assert overlap.decision is Decision.DENY
+    return overlap, unavailable
+
+
+def test_g8_04a_root_scope_overlap_is_denied():
+    overlap, _ = _g8_root_admissions()
     assert overlap.reason_code is AuthorizationAdmissionReasonCode.ROOT_SCOPE_OVERLAP
+    assert overlap.decision is Decision.DENY
     assert overlap.admitted_authorization is None
+
+
+def test_g8_04b_unavailable_root_context_escalates():
+    _, unavailable = _g8_root_admissions()
     assert unavailable.decision is Decision.ESCALATE
     assert unavailable.reason_code is AuthorizationAdmissionReasonCode.ROOT_CONTEXT_UNAVAILABLE
     assert unavailable.admitted_authorization is None
@@ -347,6 +524,44 @@ def test_g8_05_target_movement_before_start_conflicts_without_effect():
         fence, materialization,
     )
     assert result.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
+    assert result.failure_code is G4FailureCode.ACTION_PRECONDITION_CONFLICT
+    stored = _operation(runtime, operation.intent.operation_id)
+    assert stored.state is OperationState.CONFLICT
+    assert stored.start_binding_id is None
+    assert runtime.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
+    assert runtime.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    assert runtime.platform.read_ref(gates_fixture.REPO, materialization.candidate_branch) == GitSha("d" * 40)
+    assert not runtime.platform._markers
+
+
+def test_g8_06_admitted_approved_evidence_cannot_override_a_deterministic_conflict():
+    """Current canonical semantic approval cannot override a same-runtime G7 conflict."""
+    runtime, materialization, target, base_dependency, evidence = _current_semantic_runtime()
+    operation = gates_fixture.reserve_protected(
+        runtime, "g8-evidence-conflict", materialization.candidate_id,
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    dependencies = gates_fixture.ControlStateAuthoritativeDependencySet((base_dependency,))
+    fence = ActionTargetFence(
+        evidence.subject.repository_id, materialization.candidate_branch, None,
+        runtime.platform.snapshot().generation,
+    )
+    runtime.platform.seed_ref(
+        evidence.subject.repository_id, materialization.candidate_branch, GitSha("d" * 40),
+    )
+    result = gates_fixture.start_protected(
+        runtime, operation,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization, target=target, dependencies=dependencies,
+    )
+    assert result.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
+    assert result.failure_code is G4FailureCode.ACTION_PRECONDITION_CONFLICT
     stored = _operation(runtime, operation.intent.operation_id)
     assert stored.state is OperationState.CONFLICT
     assert stored.start_binding_id is None
@@ -356,45 +571,47 @@ def test_g8_05_target_movement_before_start_conflicts_without_effect():
     ) is None
 
 
-def test_g8_06_admitted_approved_evidence_cannot_override_a_deterministic_conflict():
-    """G5 persists APPROVED evidence; G7's independent target fence still wins."""
-    _, evidence = _persist_admitted_evidence_through_g5_boundary()
-    assert evidence.payload.aggregate is SemanticVerdict.APPROVED
-    runtime, materialization, operation, fence = _publication_setup("g8-evidence-conflict")
-    runtime.platform.seed_ref(
-        gates_fixture.REPO, materialization.candidate_branch, GitSha("d" * 40),
-    )
-    result = gates_fixture.start_protected(
-        runtime, operation,
-        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-        fence, materialization,
-    )
-    assert result.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
-    assert _operation(runtime, operation.intent.operation_id).state is OperationState.CONFLICT
-    assert runtime.platform.marker(
-        operation.intent.operation_id,
-        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
-    ) is None
-
-
 def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
-    """A canonical APPROVED review cannot start an unproven merge or complete work."""
-    _, evidence = _persist_admitted_evidence_through_g5_boundary()
-    assert evidence.payload.aggregate is SemanticVerdict.APPROVED
-    runtime, materialization, operation, _ = _publication_setup("g8-evidence-merge")
-    with pytest.raises(ValueError):
+    """Current semantic evidence is not protected-start, merge, or G4 completion authority."""
+    runtime, materialization, target, base_dependency, evidence = _current_semantic_runtime()
+    operation = gates_fixture.reserve_protected(
+        runtime, "g8-evidence-required-merge", materialization.candidate_id,
+        integration_binding=gates_fixture.IntegrationBound(
+            gates_fixture.GitRef(target.merge.allowed_integration_refs[0].value)
+        ),
+        required_evidence_ids=(evidence.evidence_id,),
+    )
+    dependencies = gates_fixture.ControlStateAuthoritativeDependencySet((base_dependency,))
+    fence = ActionTargetFence(
+        evidence.subject.repository_id, target.merge.allowed_integration_refs[0], materialization.base,
+        runtime.platform.snapshot().generation,
+    )
+    with pytest.raises(ValueError, match="protected action preconditions"):
         gates_fixture.start_protected(
             runtime, operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
-            ActionTargetFence(
-                gates_fixture.REPO, gates_fixture.REF, materialization.base,
-                runtime.platform.snapshot().generation,
-            ), materialization,
+            fence, materialization, target=target,
+            base_ref=target.merge.allowed_integration_refs[0],
+            dependencies=dependencies,
         )
-    assert _operation(runtime, operation.intent.operation_id).state is OperationState.CONFLICT
+    stored = _operation(runtime, operation.intent.operation_id)
+    assert stored.state is OperationState.CONFLICT
+    assert stored.start_binding_id is None
     assert runtime.platform.marker(
         operation.intent.operation_id,
         ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
     ) is None
+    assert runtime.platform.read_ref(
+        evidence.subject.repository_id, target.merge.allowed_integration_refs[0],
+    ) is None
+    semantic = runtime._resolve_semantic_consumption(
+        evidence.subject.task_id, (evidence.evidence_id,), runtime.backend.occurrence,
+    )
+    assert semantic is not None and semantic.contract_status is ConditionStatus.SATISFIED
+    assert semantic.evidence_currentness[0].status.name == "CURRENT"
+    assert semantic.obligation_results[0].status is ConditionStatus.SATISFIED
+    assert semantic.obligation_results[0].progression_support_evidence_ids == (
+        evidence.evidence_id,
+    )
     context = gates_fixture.completion_context(
         runtime, "g8-evidence-required-merge",
         contract=ConditionStatus.SATISFIED,
@@ -402,8 +619,14 @@ def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
         applicability=ConditionStatus.SATISFIED,
         required=(operation.intent.operation_id,),
     )
-    assert _evaluate(runtime, context).code is GateResultCode.COMMITTED
-    assert runtime.backend.read_task_working_set(gates_fixture.TASK).task.state is not TaskState.COMPLETED
+    runtime.register_completion_evaluation_context(context)
+    request = runtime.boundary.evaluate_task(TaskEvaluationCommand(
+        evidence.subject.task_id, context.context_id, (), (), None,
+    ))
+    assert request.transaction.mutations[0].task.state is not TaskState.COMPLETED
+    lease = runtime.acquire_control_lease(runtime.control_capability, dependencies)
+    assert ControlStateGate(runtime).commit(request, lease).code is GateResultCode.COMMITTED
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.COMPLETED
 
 
 def test_g8_08_exact_replay_never_duplicates_effect_or_lends_marker_to_other_operation():
@@ -413,22 +636,30 @@ def test_g8_08_exact_replay_never_duplicates_effect_or_lends_marker_to_other_ope
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
+    exact = _exact_publication_marker(runtime, started, materialization, fence)
+    assert runtime.platform.publish_and_mark(
+        gates_fixture.REPO, materialization.candidate_branch, materialization.commit,
+        exact, _fence_token=started.continuation.target_fence_token,
+    )
     assert TargetPublicationGate(runtime).perform(
         started.continuation,
-    ).code is GateResultCode.EFFECT_SUCCEEDED
-    assert runtime.reconcile_recovered_effect(
-        gates_fixture.TASK, operation.intent.operation_id,
-        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
-    ).code is GateResultCode.EFFECT_SUCCEEDED
-    assert TargetPublicationGate(runtime).perform(
-        started.continuation,
-    ).code is GateResultCode.LEASE_CONSUMED
+    ).code is GateResultCode.ALREADY_APPLIED
     marker = runtime.platform.marker(
         operation.intent.operation_id,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
     )
     assert marker is not None
     other = gates_fixture.reserve_protected(runtime, "g8-replay-other", materialization.candidate_id)
+    other_start = gates_fixture.start_protected(
+        runtime, other, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            gates_fixture.REPO, materialization.candidate_branch, None,
+            runtime.platform.snapshot().generation,
+        ), materialization,
+    )
+    assert other_start.code is GateResultCode.ACTION_PRECONDITION_CONFLICT
+    assert _operation(runtime, other.intent.operation_id).state is OperationState.CONFLICT
+    assert _operation(runtime, other.intent.operation_id).start_binding_id is None
     assert runtime.platform.marker(
         other.intent.operation_id,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
@@ -436,7 +667,7 @@ def test_g8_08_exact_replay_never_duplicates_effect_or_lends_marker_to_other_ope
     assert len(runtime.platform._markers) == 1
 
 
-def test_g8_09_recovery_requires_durable_marker_and_never_replays():
+def test_g8_09a_prepared_without_marker_releases_and_fails_without_replay():
     runtime, materialization, operation, fence = _publication_setup("g8-recovery")
     started = gates_fixture.start_protected(
         runtime, operation,
@@ -525,10 +756,15 @@ def test_g8_10a_authoritative_cancellation_first_blocks_protected_start():
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
+    assert result.code is GateResultCode.REJECTED
     assert result.failure_code is G4FailureCode.CANCELLATION_BLOCKS_OPERATION_START
     stored = _operation(runtime, operation.intent.operation_id)
     assert stored.state is OperationState.RESERVED
     assert stored.start_binding_id is None
+    assert runtime.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "RELEASED"
     assert runtime.platform.marker(
         operation.intent.operation_id,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
@@ -580,15 +816,25 @@ def test_g8_11_public_evaluation_boundary_can_represent_all_frozen_completion_in
         contract=ConditionStatus.SATISFIED,
         additional=ConditionStatus.SATISFIED,
         applicability=ConditionStatus.SATISFIED,
-        required=(),
+        required=(operation.intent.operation_id,),
     )
-    runtime.register_completion_evaluation_context(context)
-    assert ControlStateGate(runtime).commit(
-        runtime.boundary.evaluate_task(TaskEvaluationCommand(
-            gates_fixture.TASK, context.context_id, (), (), None,
-        )), gates_fixture.independent_lease(runtime),
-    ).code is GateResultCode.COMMITTED
+    assert context.contract_acceptance_status is ConditionStatus.SATISFIED
+    assert context.additional_trusted_completion_conditions_status is ConditionStatus.SATISFIED
+    assert context.current_applicability_and_authority_status is ConditionStatus.SATISFIED
+    assert context.required_protected_operation_ids == (operation.intent.operation_id,)
+    assert _evaluate(runtime, context).code is GateResultCode.COMMITTED
+    assert _operation(runtime, operation.intent.operation_id).state is OperationState.SUCCEEDED
     assert runtime.backend.read_task_working_set(gates_fixture.TASK).task.state is TaskState.COMPLETED
+    completed = runtime.backend.read_task_working_set(gates_fixture.TASK).task
+    assert completed.cancellation_status is CancellationStatus.NONE
+    completion_command = TaskEvaluationCommand(
+        gates_fixture.TASK, context.context_id, (), (), None,
+    )
+    assert completion_command.blocking_condition_ids == ()
+    assert completion_command.awaiting_input_requirement_ids == ()
+    assert completion_command.next_integration_operation_id is None
+    assert context.required_protected_operation_ids == (operation.intent.operation_id,)
+    assert completed.next_integration_operation_id is None
 
     for name, contract, additional, applicability in (
         ("contract", ConditionStatus.UNSATISFIED, ConditionStatus.SATISFIED, ConditionStatus.SATISFIED),
@@ -601,16 +847,11 @@ def test_g8_11_public_evaluation_boundary_can_represent_all_frozen_completion_in
             negative, "g8-completion-" + name,
             contract=contract, additional=additional, applicability=applicability,
         )
-        negative.register_completion_evaluation_context(negative_context)
         blockers = (
             (gates_fixture.BlockingConditionId("g8-not-applicable"),)
             if applicability is ConditionStatus.UNSATISFIED else ()
         )
-        assert ControlStateGate(negative).commit(
-            negative.boundary.evaluate_task(TaskEvaluationCommand(
-                gates_fixture.TASK, negative_context.context_id, blockers, (), None,
-            )), gates_fixture.independent_lease(negative),
-        ).code is GateResultCode.COMMITTED
+        assert _evaluate(negative, negative_context, blockers=blockers).code is GateResultCode.COMMITTED
         assert negative.backend.read_task_working_set(gates_fixture.TASK).task.state is not TaskState.COMPLETED
 
 
@@ -697,6 +938,36 @@ def test_g8_11_authoritative_cancellation_cannot_complete():
     assert task.state is not TaskState.COMPLETED
 
 
+def test_g8_11_semantic_veto_preserves_g4_additional_completion_fact(monkeypatch):
+    runtime = gates_fixture.runtime()
+    gates_fixture.initialize_task(runtime)
+    context = gates_fixture.completion_context(
+        runtime, "g8-additional-fact-preservation",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.UNSATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+    )
+    runtime.register_completion_evaluation_context(context)
+    observed = []
+    original = gates_module._compose_completion_aggregate
+
+    def record_g4_additional_fact(**kwargs):
+        observed.append(kwargs["additional_conditions_status"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        gates_module, "_compose_completion_aggregate", record_g4_additional_fact,
+    )
+    command = TaskEvaluationCommand(
+        gates_fixture.TASK, context.context_id, (), (), None,
+    )
+    request = runtime.boundary.evaluate_task(command)
+    assert observed == [ConditionStatus.UNSATISFIED]
+    assert request.transaction.mutations[0].task.state is not TaskState.COMPLETED
+    assert _evaluate(runtime, context).code is GateResultCode.COMMITTED
+    assert runtime.backend.read_task_working_set(gates_fixture.TASK).task.state is not TaskState.COMPLETED
+
+
 def test_g8_13_external_merge_like_state_without_marker_never_recovers_succeeded():
     """An untrusted fast-forward cannot substitute for this merge's marker."""
     runtime, materialization, _, _ = _publication_setup("g8-merge-publication")
@@ -754,126 +1025,318 @@ def test_g8_13_external_merge_like_state_without_marker_never_recovers_succeeded
         merge.intent.operation_id, ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
     ) is None
     assert started.continuation.target_fence_token.active is False
+    assert not any(
+        item.intent.operation_id == merge.intent.operation_id
+        and item.state is OperationState.SUCCEEDED
+        for item in restarted.backend.read_task_working_set(gates_fixture.TASK).operations
+    )
+    completion = gates_fixture.completion_context(
+        restarted, "g8-external-merge-completion",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(merge.intent.operation_id,),
+    )
+    assert _evaluate(restarted, completion).code is GateResultCode.COMMITTED
+    assert restarted.backend.read_task_working_set(gates_fixture.TASK).task.state is not TaskState.COMPLETED
+
+
+def test_g8_13_contradictory_marked_merge_state_recovers_indeterminate():
+    """A real marker contradicted by current target truth remains INDETERMINATE."""
+    runtime, materialization, _, _ = _publication_setup("g8-merge-contradiction")
+    publish = next(iter(runtime.backend.read_task_working_set(gates_fixture.TASK).operations))
+    publish_started = gates_fixture.start_protected(
+        runtime, publish, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            gates_fixture.REPO, materialization.candidate_branch, None,
+            runtime.platform.snapshot().generation,
+        ), materialization,
+    )
+    assert TargetPublicationGate(runtime).perform(
+        publish_started.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    create_pr = gates_fixture.reserve_protected(
+        runtime, "g8-merge-contradiction-pr", materialization.candidate_id,
+    )
+    pr_started = gates_fixture.start_protected(
+        runtime, create_pr, ProtectedEffectSubject.PULL_REQUEST_CREATION,
+        ActionTargetFence(
+            gates_fixture.REPO, materialization.candidate_branch,
+            materialization.commit, runtime.platform.snapshot().generation,
+            gates_fixture.REF, materialization.base,
+        ), materialization, base_ref=gates_fixture.REF,
+        provenance_operation_id=publish.intent.operation_id,
+    )
+    assert TargetPublicationGate(runtime).perform(
+        pr_started.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    existing = runtime.backend.read_task_working_set(gates_fixture.TASK).operations
+    assert all(
+        item.intent.operation_id != OperationId("g8-contradiction-merge-final")
+        for item in existing
+    )
+    assert all(
+        item.intent.idempotency_key.value != "key-g8-contradiction-merge-final"
+        for item in existing
+    )
+    merge = gates_fixture.reserve_protected(
+        runtime, "g8-contradiction-merge-final", materialization.candidate_id,
+    )
+    merge_started = gates_fixture.start_protected(
+        runtime, merge, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        ActionTargetFence(
+            gates_fixture.REPO, gates_fixture.REF, materialization.base,
+            runtime.platform.snapshot().generation,
+        ), materialization, provenance_operation_id=create_pr.intent.operation_id,
+    )
+    assert MergeGate(runtime).perform(
+        merge_started.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED
+    exact_marker = runtime.platform.marker(
+        merge.intent.operation_id, ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+    )
+    assert exact_marker is not None
+
+    # Contradict the marked postcondition with an external target mutation.
+    runtime.platform.seed_ref(gates_fixture.REPO, gates_fixture.REF, materialization.base)
+    restarted = runtime.restart()
+    recovered = restarted.reconcile_recovered_effect(
+        gates_fixture.TASK, merge.intent.operation_id,
+        ProtectedEffectSubject.FAST_FORWARD_MERGE,
+    )
+    assert recovered.code is GateResultCode.INDETERMINATE
+    assert _operation(restarted, merge.intent.operation_id).state is OperationState.INDETERMINATE
+    assert restarted.platform.marker(
+        merge.intent.operation_id, ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
+    ) == exact_marker
+    completion = gates_fixture.completion_context(
+        restarted, "g8-merge-contradiction-completion",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+        required=(merge.intent.operation_id,),
+    )
+    assert _evaluate(restarted, completion).code is GateResultCode.COMMITTED
+    assert restarted.backend.read_task_working_set(gates_fixture.TASK).task.state is not TaskState.COMPLETED
 
 
 def test_g8_12a_objective_prose_is_outside_the_trusted_contract_boundary():
-    """The real G3 parser is closed: prose cannot alter authority or completion."""
-    target = authorization_fixture.admitted_target()
-    for prose in (
-        "Ship only a documentation change.",
-        "Rewrite production and merge it immediately.",
-    ):
-        proposal = authorization_fixture.proposal_json(target.target_registration_id)
-        proposal["objective"] = prose
-        result = load_candidate_authorization_proposal(
-            json.dumps(proposal, separators=(",", ":")).encode(),
-        )
-        assert result.code is AuthorizationProposalFailureCode.UNKNOWN_FIELD
-    valid = authorization_fixture.load_proposal(target.target_registration_id)
-    contract, policy, approval, issuer, root = authorization_fixture.direct_contexts(
-        valid, target,
+    """Distinct raw Issue Contracts admit normally; prose creates no G3/G4 authority."""
+    runtime = gates_fixture.runtime()
+    operations = (TaskCapability.IMPLEMENTATION, TaskCapability.SEMANTIC_REVIEW)
+    raw_a = _raw_contract(
+        contract_id=ContractId("g8-prose-a"), task_id=TaskId("g8-prose-task-a"),
+        operations=operations, objective="Ship only documentation.",
     )
-    admitted = admit_direct_authorization(
-        valid, target, contract, policy, approval, issuer, root,
+    raw_b = _raw_contract(
+        contract_id=ContractId("g8-prose-b"), task_id=TaskId("g8-prose-task-b"),
+        operations=operations, objective="Rewrite production and merge immediately.",
     )
-    assert admitted.decision is Decision.ALLOW
-    assert "objective" not in valid.__dataclass_fields__
-    # Completion accepts only its independently root-managed structured context.
+    first = _admit_raw_contract(runtime, raw_a, "g8-prose-a")
+    second = _admit_raw_contract(runtime, raw_b, "g8-prose-b")
+    assert first.raw_bytes == raw_a and second.raw_bytes == raw_b
+    assert first.contract_raw_sha256 != second.contract_raw_sha256
+    assert first.contract_id != second.contract_id
+    assert (
+        first.requested_operations, first.allowed_mutation_scope,
+        first.prohibited_mutation_scope, first.base_ref, first.base_sha,
+        first.risk_floor, first.acceptance_plan.requirements,
+    ) == (
+        second.requested_operations, second.allowed_mutation_scope,
+        second.prohibited_mutation_scope, second.base_ref, second.base_sha,
+        second.risk_floor, second.acceptance_plan.requirements,
+    )
+    assert "objective" not in first.__dataclass_fields__
+    assert "objective" not in second.__dataclass_fields__
+    assert all(
+        evaluator.mechanism.value == "deterministic"
+        for contract in (first, second)
+        for requirement in contract.acceptance_plan.requirements
+        for evaluator in requirement.evaluators
+    )
+    assert runtime.backend.read_task_working_set(first.task_id) is None
+    assert runtime.backend.read_task_working_set(second.task_id) is None
     assert "objective" not in TaskEvaluationCommand.__dataclass_fields__
 
 
 def test_g8_12b_requested_capability_ceiling_does_not_create_completion_work():
-    """The nearest G3 structured ceiling is capability admission, never a to-do list."""
-    target = authorization_fixture.admitted_target(
-        capabilities=["implementation", "merge"], merge_ref="refs/heads/main",
+    """The real admitted contract ceiling is not authorization or a completion to-do list."""
+    runtime = gates_fixture.runtime()
+    narrow_ops = (TaskCapability.IMPLEMENTATION, TaskCapability.SEMANTIC_REVIEW)
+    broad_ops = (*narrow_ops, TaskCapability.TARGET_PUBLISH)
+    narrow = _admit_raw_contract(runtime, _raw_contract(
+        contract_id=ContractId("g8-ops-narrow"), task_id=TaskId("g8-ops-task-narrow"),
+        operations=narrow_ops,
+    ), "g8-ops-narrow")
+    broad = _admit_raw_contract(runtime, _raw_contract(
+        contract_id=ContractId("g8-ops-broad"), task_id=TaskId("g8-ops-task-broad"),
+        operations=broad_ops,
+    ), "g8-ops-broad")
+    narrow_ceiling = derive_contract_authority_ceiling(narrow)
+    broad_ceiling = derive_contract_authority_ceiling(broad)
+    assert TaskCapability.TARGET_PUBLISH not in narrow_ceiling.requested_capabilities
+    assert TaskCapability.TARGET_PUBLISH in broad_ceiling.requested_capabilities
+    target = runtime.backend.read_resolved_target_registration(gates_fixture.TARGET).registration
+    assert TaskCapability.TARGET_PUBLISH not in target.allowed_task_capabilities
+
+    proposal_value = authorization_fixture.proposal_json(gates_fixture.TARGET)
+    proposal_value.update(
+        task_id=broad.task_id.value,
+        contract_id=broad.contract_id.value,
+        contract_sha256=broad.contract_raw_sha256.value,
+        capabilities=["implementation", "target_publish"],
     )
-    narrow = authorization_fixture.load_proposal(target.target_registration_id)
-    broad_json = authorization_fixture.proposal_json(target.target_registration_id)
-    broad_json["capabilities"] = ["implementation", "merge"]
-    broad_json["operational_constraints"] = {
-        "integration_refs": ["refs/heads/main"],
-        "controlled_runtime_profile_ids": [], "repair_max_attempts": 0,
-    }
-    broad = load_candidate_authorization_proposal(
-        json.dumps(broad_json, separators=(",", ":")).encode(),
+    proposal = load_candidate_authorization_proposal(
+        json.dumps(proposal_value, separators=(",", ":")).encode(),
     )
-    assert type(broad) is type(narrow)
-    narrow_context = authorization_fixture.direct_contexts(narrow, target)
-    broad_context = authorization_fixture.direct_contexts(broad, target)
-    narrow_admission = admit_direct_authorization(
-        narrow, target, *narrow_context,
+    proposal_contract, policy, approval, issuer, root = authorization_fixture.direct_contexts(
+        proposal, target,
     )
-    broad_admission = admit_direct_authorization(
-        broad, target, *broad_context,
+    assert proposal_contract.contract_id == broad.contract_id
+    decision = admit_direct_authorization(
+        proposal, target, broad_ceiling, policy, approval, issuer, root,
     )
-    assert narrow_admission.decision is broad_admission.decision is Decision.ALLOW
-    assert TaskCapability.MERGE not in narrow_admission.admitted_authorization.authorized_capabilities
-    assert TaskCapability.MERGE in broad_admission.admitted_authorization.authorized_capabilities
-    # Completion requirements remain explicit root-managed data, not inferred
-    # from the broader G3 ceiling or from any order among requested capabilities.
-    narrow_runtime = gates_fixture.runtime()
-    broad_runtime = gates_fixture.runtime()
-    gates_fixture.initialize_task(narrow_runtime)
-    gates_fixture.initialize_task(broad_runtime)
-    narrow_completion = gates_fixture.completion_context(
-        narrow_runtime, "g8-narrow-ceiling-completion",
-        contract=ConditionStatus.SATISFIED,
-        additional=ConditionStatus.SATISFIED,
-        applicability=ConditionStatus.SATISFIED,
+    assert decision.decision is Decision.DENY
+    assert decision.reason_code is AuthorizationAdmissionReasonCode.CAPABILITY_NOT_PERMITTED
+    assert decision.admitted_authorization is None
+    assert runtime.backend.read_task_working_set(broad.task_id) is None
+    assert all(
+        item.intent.task_id != broad.task_id
+        for item in runtime.backend._state.operations.values()
     )
-    broad_completion = gates_fixture.completion_context(
-        broad_runtime, "g8-broad-ceiling-completion",
-        contract=ConditionStatus.SATISFIED,
-        additional=ConditionStatus.SATISFIED,
-        applicability=ConditionStatus.SATISFIED,
+    assert "required_protected_operation_ids" not in broad.__dataclass_fields__
+
+
+def test_g8_12_requested_operations_reorder_does_not_create_sequencing_semantics():
+    runtime = gates_fixture.runtime()
+    first_order = (TaskCapability.IMPLEMENTATION, TaskCapability.SEMANTIC_REVIEW)
+    second_order = tuple(reversed(first_order))
+    first = _admit_raw_contract(runtime, _raw_contract(
+        contract_id=ContractId("g8-reorder-a"), task_id=TaskId("g8-reorder-task-a"),
+        operations=first_order,
+    ), "g8-reorder-a")
+    second = _admit_raw_contract(runtime, _raw_contract(
+        contract_id=ContractId("g8-reorder-b"), task_id=TaskId("g8-reorder-task-b"),
+        operations=second_order,
+    ), "g8-reorder-b")
+    assert first.requested_operations == first_order
+    assert second.requested_operations == second_order
+    assert first.requested_operations != second.requested_operations
+    assert frozenset(first.requested_operations) == frozenset(second.requested_operations)
+    assert frozenset(derive_contract_authority_ceiling(first).requested_capabilities) == frozenset(
+        derive_contract_authority_ceiling(second).requested_capabilities
     )
-    assert narrow_completion.required_protected_operation_ids == ()
-    assert broad_completion.required_protected_operation_ids == ()
-    assert _evaluate(narrow_runtime, narrow_completion).code is GateResultCode.COMMITTED
-    assert _evaluate(broad_runtime, broad_completion).code is GateResultCode.COMMITTED
-    assert narrow_runtime.backend.read_task_working_set(gates_fixture.TASK).task.state is TaskState.COMPLETED
-    assert broad_runtime.backend.read_task_working_set(gates_fixture.TASK).task.state is TaskState.COMPLETED
+    assert "operation_order" not in first.__dataclass_fields__
+    assert "operation_order" not in second.__dataclass_fields__
+    assert runtime.backend.read_task_working_set(first.task_id) is None
+    assert runtime.backend.read_task_working_set(second.task_id) is None
 
 
 def test_g8_14_admitted_evidence_for_old_candidate_is_stale_for_replacement():
-    runtime = gates_fixture.runtime()
-    gates_fixture.initialize_task(runtime)
-    original = gates_fixture.materialize(runtime)
-    gates_fixture.adopt_materialization(runtime, original)
-    replacement = build_candidate_materialization(
-        repository_id=original.repository_id, task_id=original.task_id,
-        candidate_id=CandidateId("g8-replacement-candidate"),
-        contract_id=original.contract_id,
-        contract_raw_sha256=original.contract_raw_sha256,
-        authorization_id=original.authorization_id,
-        target_registration_id=original.target_registration_id,
-        policy_epoch_identity=original.policy_epoch_identity,
-        base=original.base, base_tree_id=original.base_tree,
-        commit=original.commit, result_tree_id=original.result_tree,
-        parent_commits=original.parent_commits, base_tree=(),
-        candidate_tree=(gates_fixture.GitTreeEntry(
-            gates_fixture.CanonicalGitPath("src/new.py"),
-            gates_fixture.GitObjectKind.BLOB, "100644", GitSha("c" * 40),
-        ),), materialization_profile_id=original.materialization_profile_id,
+    runtime, original, target, base_dependency, evidence = _current_semantic_runtime()
+    candidate_id = CandidateId("g8-replacement-candidate")
+    replacement_commit = GitSha("4" * 40)
+    replacement_tree_id = GitSha("5" * 40)
+    replacement_blob_id = GitSha("6" * 40)
+    runtime._object_store = gates_fixture.FixtureGitObjectStore(
+        evidence.subject.repository_id,
+        (
+            gates_fixture.FixtureGitCommit(original.base, (), original.base_tree),
+            gates_fixture.FixtureGitCommit(
+                replacement_commit, (original.base,), replacement_tree_id,
+            ),
+        ),
+        (
+            gates_fixture.FixtureGitTree(original.base_tree, ()),
+            gates_fixture.FixtureGitTree(replacement_tree_id, (
+                gates_fixture.FixtureGitTreeEntry(
+                    "replacement.py", gates_fixture.GitObjectKind.BLOB,
+                    "100644", replacement_blob_id,
+                ),
+            )),
+        ),
+    )
+    runtime = runtime.restart()
+    create = runtime.boundary.record_candidate_truth(
+        task_id=evidence.subject.task_id, candidate_id=candidate_id,
+        candidate_commit_id=replacement_commit,
+        parent_candidate_ids=(original.candidate_id,),
     )
     assert ControlStateGate(runtime).commit(
-        runtime.boundary.create_candidate_and_adopt(
-            task_id=gates_fixture.TASK, materialization=replacement,
-            admission_event_id=gates_fixture.ADMISSION,
-            decision_event_id=gates_fixture.DecisionEventId("g8-candidate-replacement"),
-            parent_candidate_ids=(original.candidate_id,),
-        ), gates_fixture.independent_lease(runtime),
+        create, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
-    assert runtime.backend.read_task_working_set(gates_fixture.TASK).task.current_candidate_id == replacement.candidate_id
-    admitted = evidence_fixture.admit_semantic_review(
-        evidence_fixture.fixture()
-    ).proposed_evidence_record
-    # The original evidence subject uses the fixture's original CandidateId;
-    # apply the actual replacement candidate selected by the G4 lifecycle.
-    current = replace(admitted.subject, candidate_id=replacement.candidate_id)
-    result = evaluate_evidence_applicability(admitted, current)
-    assert (result.decision, result.reason) == (
-        EvidenceApplicabilityDecision.STALE,
-        EvidenceApplicabilityReason.CANDIDATE_CHANGED,
+    candidate = runtime.backend.read_candidate(candidate_id)
+    assert candidate is not None
+    replacement = runtime.backend.read_candidate_materialization(
+        candidate.materialization_id,
     )
-    assert result.decision is not EvidenceApplicabilityDecision.APPLICABLE
+    assert replacement is not None
+    assert replacement.materialization_id != original.materialization_id
+    assert candidate.candidate_id != original.candidate_id
+    adopt = runtime.boundary.adopt_recorded_candidate(
+        task_id=evidence.subject.task_id, candidate_id=candidate_id,
+        decision_event_id=gates_fixture.DecisionEventId("g8-candidate-replacement"),
+    )
+    assert ControlStateGate(runtime).commit(
+        adopt, gates_fixture.independent_lease(runtime),
+    ).code is GateResultCode.COMMITTED
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.current_candidate_id == candidate_id
+
+    current = runtime._resolve_semantic_consumption(
+        evidence.subject.task_id, (evidence.evidence_id,), runtime.backend.occurrence,
+    )
+    assert current is not None
+    assert current.evidence_currentness[0].status.name == "STALE"
+    assert current.evidence_currentness[0].applicability_reason is EvidenceApplicabilityReason.CANDIDATE_CHANGED
+    assert current.obligation_results[0].progression_support_evidence_ids == ()
+
+    # Existing G6 write validation refuses to attach a C1 EvidenceId to a C2
+    # operation. If a caller asks the public start boundary for that absent
+    # operation anyway, it cannot produce a prepared start or effect.
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id) is not None
+    before_occurrence = runtime.backend.occurrence
+    bad_request = runtime.boundary.reserve_operation(
+        evidence.subject.task_id,
+        gates_fixture.OperationReservationCommand(
+            operation_id=OperationId("g8-stale-candidate-forward"),
+            idempotency_key=OperationIdempotencyKey("g8-stale-candidate-forward-key"),
+            action_id=OperationActionId("g8-stale-candidate-forward"),
+            subject_id=OperationSubjectId("g8-stale-candidate-forward"),
+            required_evidence_ids=(evidence.evidence_id,),
+            integration_binding=gates_fixture.IntegrationBound(
+                gates_fixture.GitRef(target.merge.allowed_integration_refs[0].value)
+            ),
+            is_repair_attempt=False,
+        ),
+    )
+    rejected = ControlStateGate(runtime).commit(
+        bad_request, gates_fixture.independent_lease(runtime),
+    )
+    assert rejected.code is GateResultCode.REJECTED
+    assert runtime.backend.occurrence == before_occurrence
+    assert all(
+        item.intent.operation_id != OperationId("g8-stale-candidate-forward")
+        for item in runtime.backend.read_task_working_set(evidence.subject.task_id).operations
+    )
+    assert all(
+        item.intent.operation_id != OperationId("g8-stale-candidate-forward")
+        for item in runtime.backend.read_task_working_set(evidence.subject.task_id).operations
+    )
+    assert runtime.platform.marker(
+        OperationId("g8-stale-candidate-forward"),
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+    context = gates_fixture.completion_context(
+        runtime, "g8-stale-candidate-completion",
+        contract=ConditionStatus.SATISFIED,
+        additional=ConditionStatus.SATISFIED,
+        applicability=ConditionStatus.SATISFIED,
+    )
+    runtime.register_completion_evaluation_context(context)
+    with pytest.raises(gates_fixture._TaskSemanticDenied) as denied:
+        runtime.boundary.evaluate_task(TaskEvaluationCommand(
+            evidence.subject.task_id, context.context_id, (), (), None,
+        ))
+    assert denied.value.code is gates_fixture.TaskSemanticDenialCode.SEMANTIC_CONTRACT_UNSATISFIED
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.COMPLETED
