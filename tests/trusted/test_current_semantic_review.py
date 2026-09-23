@@ -361,14 +361,14 @@ def _reconstruction_backend(monkeypatch, evidence_record, inputs):
     return store
 
 
-def _canonical_backend_with_candidate(contract, candidate, materialization):
+def _canonical_backend_with_candidate(contract, candidate, materialization, *, resolved_target=None):
     from tests.trusted.test_backend import admitted_authorization, apply as g6_apply, task as g6_task
     from autodev_control.trusted.backend import (
         CreateAuthorization, CreateCandidateWithMaterialization, CreateContract,
         CreateTaskAndInitialOperationMembership, ReplaceTask,
     )
 
-    target = _canonical_inputs(contract).resolved_target
+    target = _canonical_inputs(contract).resolved_target if resolved_target is None else resolved_target
     store = InMemoryCanonicalStateBackend((target,))
     authorization = _clone(
         admitted_authorization(), authorization_id=AuthorizationId(RAW),

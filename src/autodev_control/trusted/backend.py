@@ -153,6 +153,81 @@ class EvidenceHistoryMembershipRecord:
         _exact_tuple(self.evidence_ids, EvidenceId, "evidence_ids")
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class CanonicalSemanticHistorySnapshot:
+    """Facts-only complete history for one G5-derived current subject."""
+    subject_id: SemanticReviewEffectiveSubjectId
+    history: EvidenceHistoryMembershipRecord | None
+    records: tuple[EvidenceRecord, ...]
+    supersessions: tuple[EvidenceSupersessionRecord, ...]
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("semantic history snapshots come from the canonical backend")
+
+    def __post_init__(self) -> None:
+        if type(self.subject_id) is not SemanticReviewEffectiveSubjectId:
+            raise TypeError("semantic snapshot subject id has wrong exact type")
+        if self.history is not None and type(self.history) is not EvidenceHistoryMembershipRecord:
+            raise TypeError("semantic snapshot history has wrong exact type")
+        if (type(self.records) is not tuple
+                or any(type(item) is not EvidenceRecord for item in self.records)
+                or len({item.evidence_id for item in self.records}) != len(self.records)):
+            raise TypeError("semantic snapshot records must be an exact tuple")
+        if (type(self.supersessions) is not tuple
+                or any(type(item) is not EvidenceSupersessionRecord for item in self.supersessions)):
+            raise TypeError("semantic snapshot supersessions must be an exact tuple")
+        if self.history is None:
+            if self.records or self.supersessions:
+                raise ValueError("absent history cannot carry related canonical records")
+        elif (self.history.effective_subject.subject_id != self.subject_id
+              or tuple(item.evidence_id for item in self.records)
+              != self.history.evidence_ids
+              or any(item.subject_id != self.subject_id for item in self.supersessions)):
+            raise ValueError("semantic history snapshot is not complete and coherent")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CanonicalSemanticEvidenceLookup:
+    evidence_id: EvidenceId
+    record: EvidenceRecord | None
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("semantic evidence lookups come from the canonical backend")
+
+    def __post_init__(self) -> None:
+        if type(self.evidence_id) is not EvidenceId:
+            raise TypeError("evidence lookup id has wrong exact type")
+        if self.record is not None and type(self.record) is not EvidenceRecord:
+            raise TypeError("evidence lookup record has wrong exact type")
+        if self.record is not None and self.record.evidence_id != self.evidence_id:
+            raise ValueError("evidence lookup identity mismatch")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CanonicalSemanticConsumptionSnapshot:
+    """Same-occurrence canonical facts; it performs no G5 semantic decision."""
+    canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding
+    task_id: TaskId
+    histories: tuple[CanonicalSemanticHistorySnapshot, ...]
+    requested_evidence: tuple[CanonicalSemanticEvidenceLookup, ...]
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("semantic consumption snapshots come from the canonical backend")
+
+    def __post_init__(self) -> None:
+        if (type(self.canonical_state_occurrence_binding) is not CanonicalStateOccurrenceBinding
+                or type(self.task_id) is not TaskId):
+            raise TypeError("semantic snapshot occurrence/task has wrong exact type")
+        if (type(self.histories) is not tuple
+                or any(type(item) is not CanonicalSemanticHistorySnapshot for item in self.histories)
+                or len({item.subject_id for item in self.histories}) != len(self.histories)):
+            raise TypeError("semantic snapshot histories must be exact and duplicate-free")
+        if (type(self.requested_evidence) is not tuple
+                or any(type(item) is not CanonicalSemanticEvidenceLookup for item in self.requested_evidence)
+                or len({item.evidence_id for item in self.requested_evidence}) != len(self.requested_evidence)):
+            raise TypeError("semantic snapshot lookups must be exact and duplicate-free")
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalTaskWorkingSet:
     canonical_state_occurrence_binding: CanonicalStateOccurrenceBinding
@@ -1187,6 +1262,76 @@ class InMemoryCanonicalStateBackend:
                 bindings,
                 tuple(self._state.operations[item.operation_id] for item in bindings),
             )
+
+    def read_semantic_consumption_snapshot(
+        self, task_id: TaskId, expected_occurrence: CanonicalStateOccurrenceBinding,
+        complete_current_subject_ids: tuple[SemanticReviewEffectiveSubjectId, ...],
+        requested_evidence_ids: tuple[EvidenceId, ...] = (),
+    ) -> CanonicalSemanticConsumptionSnapshot | None:
+        """Atomically read complete G5 facts for a #32-derived subject set.
+
+        The caller must supply the complete ordered subject projection produced
+        by one #32 resolution.  This boundary only checks occurrence and returns
+        immutable canonical facts; it makes no applicability or composition choice.
+        """
+        if (type(task_id) is not TaskId
+                or type(expected_occurrence) is not CanonicalStateOccurrenceBinding
+                or type(complete_current_subject_ids) is not tuple
+                or any(type(item) is not SemanticReviewEffectiveSubjectId
+                       for item in complete_current_subject_ids)
+                or len(set(complete_current_subject_ids)) != len(complete_current_subject_ids)
+                or type(requested_evidence_ids) is not tuple
+                or any(type(item) is not EvidenceId for item in requested_evidence_ids)
+                or len(set(requested_evidence_ids)) != len(requested_evidence_ids)):
+            raise TypeError("exact complete semantic snapshot request required")
+        with self._lock:
+            occurrence = CanonicalStateOccurrenceBinding(BackendGeneration(self._generation))
+            if occurrence != expected_occurrence or task_id not in self._state.tasks:
+                return None
+            histories: list[CanonicalSemanticHistorySnapshot] = []
+            for subject_id in complete_current_subject_ids:
+                history = self._state.histories.get(subject_id)
+                if history is not None and history.effective_subject.task_id != task_id:
+                    return None
+                if history is None:
+                    records: tuple[EvidenceRecord, ...] = ()
+                else:
+                    try:
+                        records = tuple(self._state.evidence[item] for item in history.evidence_ids)
+                    except KeyError:
+                        return None
+                    if any(not _evidence_matches_subject(item, history.effective_subject)
+                           for item in records):
+                        return None
+                supersessions = tuple(sorted((
+                    item for item in self._state.supersessions.values()
+                    if item.subject_id == subject_id
+                ), key=lambda item: (item.earlier_evidence_id.value,
+                                     item.later_evidence_id.value)))
+                entry = object.__new__(CanonicalSemanticHistorySnapshot)
+                for name, value in (
+                    ("subject_id", subject_id), ("history", history),
+                    ("records", records), ("supersessions", supersessions),
+                ):
+                    object.__setattr__(entry, name, value)
+                entry.__post_init__()
+                histories.append(entry)
+            lookups = []
+            for evidence_id in requested_evidence_ids:
+                lookup = object.__new__(CanonicalSemanticEvidenceLookup)
+                object.__setattr__(lookup, "evidence_id", evidence_id)
+                object.__setattr__(lookup, "record", self._state.evidence.get(evidence_id))
+                lookup.__post_init__()
+                lookups.append(lookup)
+            result = object.__new__(CanonicalSemanticConsumptionSnapshot)
+            for name, value in (
+                ("canonical_state_occurrence_binding", occurrence),
+                ("task_id", task_id), ("histories", tuple(histories)),
+                ("requested_evidence", tuple(lookups)),
+            ):
+                object.__setattr__(result, name, value)
+            result.__post_init__()
+            return result
 
 
 def _candidate_matches_task(candidate: CandidateRecord, task: TaskRecord) -> bool:
