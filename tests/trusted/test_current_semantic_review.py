@@ -2111,6 +2111,142 @@ def test_target_and_pr_dependencies_form_an_uncapped_exact_65_member_per_obligat
     assert result.authoritative_dependencies == expected
 
 
+def test_final_binding_cell_formula_counts_65_per_obligation_dependencies_and_65_global_f(monkeypatch):
+    target_dependencies = tuple(_dependency(f"{item:03}") for item in range(64))
+    pr_dependency = _dependency("z")
+    result, _ = _resolve_with_context_products(
+        monkeypatch, target="REQUIRED", pr="REQUIRED",
+        target_product=_target_success(target_dependencies), pr_product=_pr_success((pr_dependency,)),
+    )
+    outcome = result.obligation_outcomes[0]
+    resolution = outcome.trusted_evaluator_resolution
+    assert result.status is CurrentSemanticReviewResolutionStatus.RESOLVED
+    assert outcome.status is SemanticEvaluatorObligationResolutionStatus.RESOLVED
+    assert len(outcome.authoritative_dependencies) == 65
+    assert len(result.authoritative_dependencies) == 65
+    assert resolution.target_context_requirement is SemanticReviewContextRequirement.REQUIRED
+    assert resolution.pr_context_requirement is SemanticReviewContextRequirement.REQUIRED
+
+    per_obligation_cells = (
+        1 + len(outcome.resolved_obligation.current_review_materials)
+        + len(resolution.review_slots) + len(resolution.required_trusted_context_ids)
+        + len(outcome.authoritative_dependencies)
+    )
+    frozen_total = len(result.authoritative_dependencies) + per_obligation_cells
+    stale_boolean_total = (
+        len(result.authoritative_dependencies) + 1
+        + len(outcome.resolved_obligation.current_review_materials)
+        + len(resolution.review_slots) + len(resolution.required_trusted_context_ids) + 2
+    )
+    assert frozen_total == current_semantic_review._final_binding_cell_count(
+        len(outcome.resolved_obligation.current_review_materials),
+        (current_semantic_review._ObligationWork(
+            outcome.obligation, CurrentSemanticReviewResolutionStatus.RESOLVED,
+            outcome.reason, outcome.semantic_config_status, outcome.semantic_config_reason,
+            resolution, outcome.target_context_id, outcome.pr_id, outcome.authoritative_dependencies,
+        ),),
+        len(result.authoritative_dependencies),
+    )
+    assert frozen_total == stale_boolean_total + (65 - 2)
+    assert frozen_total - len(result.authoritative_dependencies) >= 65
+
+
+@pytest.mark.parametrize(("material_count_delta", "expected_status", "expected_reason"), (
+    (0, CurrentSemanticReviewResolutionStatus.RESOLVED, CurrentSemanticReviewResolutionReason.RESOLVED),
+    (1, CurrentSemanticReviewResolutionStatus.DENIED, CurrentSemanticReviewResolutionReason.RESOLUTION_LIMIT_EXCEEDED),
+))
+def test_final_dependency_cardinality_formula_accepts_exact_limit_and_denies_plus_one(
+    monkeypatch, material_count_delta, expected_status, expected_reason,
+):
+    target_dependencies = tuple(_dependency(f"{item:03}") for item in range(64))
+    pr_dependency = _dependency("z")
+    config_bytes = _semantic_config_bytes(target="REQUIRED", pr="REQUIRED")
+    contract, _, _ = _semantic_contract(config_bytes=config_bytes)
+    materialization = _materialization(CandidateId("current"), contract_raw=contract.contract_raw_sha256)
+    inputs = _canonical_inputs(
+        contract, candidate=_candidate(materialization, contract=contract), materialization=materialization,
+    )
+    monkeypatch.setattr(
+        current_semantic_review, "resolve_current_semantic_target_context",
+        lambda *_: _target_success(target_dependencies),
+    )
+    monkeypatch.setattr(
+        current_semantic_review, "resolve_current_semantic_pull_request_context",
+        lambda *_: _pr_success((pr_dependency,)),
+    )
+    applicability_context = _current_applicability_context(contract)
+    reader = _trusted_reader(contract, config_bytes)
+
+    # Resolve once with the ordinary one-material fixture to obtain the exact
+    # frozen non-material cell contribution for this real semantic config.
+    monkeypatch.setattr(current_semantic_review, "derive_current_review_materials", derive_current_review_materials)
+    prototype = resolve_current_semantic_review(
+        inputs, applicability_context=applicability_context, byte_reader=reader,
+        semantic_context_source=None,
+    )
+    prototype_outcome = prototype.obligation_outcomes[0]
+    prototype_resolution = prototype_outcome.trusted_evaluator_resolution
+    fixed_cells = (
+        len(prototype.authoritative_dependencies) + 1
+        + len(prototype_resolution.review_slots)
+        + len(prototype_resolution.required_trusted_context_ids)
+        + len(prototype_outcome.authoritative_dependencies)
+    )
+    exact_material_count = current_semantic_review.MAX_SEMANTIC_RESOLUTION_BINDING_CELLS - fixed_cells
+    material = derive_current_review_materials(materialization)[0]
+    large_materials = tuple(
+        _clone(material, material_id=MaterialIdentity(f"{index:064x}"))
+        for index in range(exact_material_count + material_count_delta)
+    )
+    monkeypatch.setattr(current_semantic_review, "derive_current_review_materials", lambda *_: large_materials)
+    # The count check precedes product construction; retain the already-valid
+    # products to keep this adversarial boundary test bounded in work.
+    monkeypatch.setattr(
+        current_semantic_review, "_trusted_assignment",
+        lambda *_: prototype_outcome.assignment,
+    )
+    monkeypatch.setattr(
+        current_semantic_review, "_trusted_effective_subject",
+        lambda *_: prototype_outcome.effective_subject,
+    )
+
+    result = resolve_current_semantic_review(
+        inputs, applicability_context=applicability_context, byte_reader=reader,
+        semantic_context_source=None,
+    )
+    actual_cells = (
+        len(prototype.authoritative_dependencies) + 1 + len(large_materials)
+        + len(prototype_resolution.review_slots)
+        + len(prototype_resolution.required_trusted_context_ids)
+        + len(prototype_outcome.authoritative_dependencies)
+    )
+    stale_boolean_cells = (
+        len(prototype.authoritative_dependencies) + 1 + exact_material_count
+        + len(prototype_resolution.review_slots)
+        + len(prototype_resolution.required_trusted_context_ids) + 2
+    )
+    assert len(prototype_outcome.authoritative_dependencies) == 65
+    assert len(prototype.authoritative_dependencies) == 65
+    assert prototype_resolution.target_context_requirement is SemanticReviewContextRequirement.REQUIRED
+    assert prototype_resolution.pr_context_requirement is SemanticReviewContextRequirement.REQUIRED
+    assert len(large_materials) == exact_material_count + material_count_delta
+    assert actual_cells == current_semantic_review.MAX_SEMANTIC_RESOLUTION_BINDING_CELLS + material_count_delta
+    assert stale_boolean_cells < current_semantic_review.MAX_SEMANTIC_RESOLUTION_BINDING_CELLS
+    assert current_semantic_review._static_binding_cell_count(1, len(large_materials)) <= current_semantic_review.MAX_SEMANTIC_RESOLUTION_BINDING_CELLS
+    assert result.status is expected_status
+    assert result.reason is expected_reason
+    if material_count_delta == 0:
+        assert current_semantic_review._final_binding_cell_count(
+            len(large_materials), (current_semantic_review._ObligationWork(
+                prototype_outcome.obligation, CurrentSemanticReviewResolutionStatus.RESOLVED,
+                prototype_outcome.reason, prototype_outcome.semantic_config_status,
+                prototype_outcome.semantic_config_reason, prototype_resolution,
+                prototype_outcome.target_context_id, prototype_outcome.pr_id,
+                prototype_outcome.authoritative_dependencies,
+            ),), len(prototype.authoritative_dependencies),
+        ) == current_semantic_review.MAX_SEMANTIC_RESOLUTION_BINDING_CELLS
+
+
 def test_exact_duplicate_cross_dimension_dependency_is_deduplicated_without_rewriting(monkeypatch):
     dependency = _dependency()
     result, _ = _resolve_with_context_products(
@@ -2243,9 +2379,16 @@ def test_resolver_enforces_static_and_final_binding_cell_bounds(monkeypatch, mat
     if expected_status is CurrentSemanticReviewResolutionStatus.RESOLVED:
         assert len(result.obligation_outcomes) == 256
         assert current_semantic_review._static_binding_cell_count(256, material_count) <= 262_144
+        expected_final_count = len(result.authoritative_dependencies) + sum(
+            1 + material_count + len(outcome.trusted_evaluator_resolution.review_slots)
+            + len(outcome.trusted_evaluator_resolution.required_trusted_context_ids)
+            + len(outcome.authoritative_dependencies)
+            for outcome in result.obligation_outcomes
+            if outcome.status is SemanticEvaluatorObligationResolutionStatus.RESOLVED
+        )
         assert current_semantic_review._final_binding_cell_count(
             material_count, result.obligation_outcomes, len(result.authoritative_dependencies),
-        ) == 262_144
+        ) == expected_final_count == 262_144
     elif material_count == 1023:
         assert current_semantic_review._static_binding_cell_count(256, material_count) == 262_144
         assert result.obligation_outcomes == ()

@@ -436,8 +436,7 @@ def _final_binding_cell_count(material_count: int, resolved: tuple[_ObligationWo
     return dependency_count + sum(
         1 + material_count + len(item.trusted_evaluator_resolution.review_slots)
         + len(item.trusted_evaluator_resolution.required_trusted_context_ids)
-        + int(item.trusted_evaluator_resolution.target_context_requirement is SemanticReviewContextRequirement.REQUIRED)
-        + int(item.trusted_evaluator_resolution.pr_context_requirement is SemanticReviewContextRequirement.REQUIRED)
+        + len(item.authoritative_dependencies)
         for item in resolved
         if item.status in (
             CurrentSemanticReviewResolutionStatus.RESOLVED,
