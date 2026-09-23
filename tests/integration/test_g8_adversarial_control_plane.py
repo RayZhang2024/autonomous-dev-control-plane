@@ -891,6 +891,7 @@ def test_g8_05_target_movement_before_start_conflicts_without_effect():
     assert result.failure_code is G4FailureCode.ACTION_PRECONDITION_CONFLICT
     stored = _operation(runtime, operation.intent.operation_id)
     assert stored.state is OperationState.CONFLICT
+    assert stored.reason_code is G4FailureCode.ACTION_PRECONDITION_CONFLICT
     assert stored.start_binding_id is None
     assert runtime.platform.prepared_effect_state(
         operation.intent.operation_id,
