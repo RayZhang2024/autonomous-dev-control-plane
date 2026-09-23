@@ -165,6 +165,9 @@ def _current_semantic_runtime():
     assert semantic.obligation_results[0].progression_support_evidence_ids == (
         evidence.evidence_id,
     )
+    assert not hasattr(semantic, "control_capability")
+    assert not hasattr(semantic, "publication_capability")
+    assert not hasattr(semantic, "merge_capability")
     assert semantic.evidence_currentness[0].status.name == "CURRENT"
     return runtime, materialization, target, base_dependency, evidence
 
@@ -574,6 +577,18 @@ def test_g8_06_admitted_approved_evidence_cannot_override_a_deterministic_confli
 def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
     """Current semantic evidence is not protected-start, merge, or G4 completion authority."""
     runtime, materialization, target, base_dependency, evidence = _current_semantic_runtime()
+    before = runtime.backend.read_task_working_set(evidence.subject.task_id)
+    assert before is not None
+    admitted_authorization = runtime.backend.read_authorization(before.task.authorization_id)
+    resolved_target = runtime.backend.read_resolved_target_registration(
+        before.task.target_registration_id,
+    )
+    root_context_id = runtime.binding.root_context_id
+    platform_before = runtime.platform.snapshot()
+    control_capability = runtime.control_capability
+    publication_capability = runtime.publication_capability
+    merge_capability = runtime.merge_capability
+    assert admitted_authorization is not None and resolved_target is not None
     operation = gates_fixture.reserve_protected(
         runtime, "g8-evidence-required-merge", materialization.candidate_id,
         integration_binding=gates_fixture.IntegrationBound(
@@ -603,9 +618,13 @@ def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
     assert runtime.platform.read_ref(
         evidence.subject.repository_id, target.merge.allowed_integration_refs[0],
     ) is None
+    operations_before_currentness = runtime.backend.read_task_working_set(
+        evidence.subject.task_id
+    ).operations
     semantic = runtime._resolve_semantic_consumption(
         evidence.subject.task_id, (evidence.evidence_id,), runtime.backend.occurrence,
     )
+    assert runtime.backend.read_task_working_set(evidence.subject.task_id).operations == operations_before_currentness
     assert semantic is not None and semantic.contract_status is ConditionStatus.SATISFIED
     assert semantic.evidence_currentness[0].status.name == "CURRENT"
     assert semantic.obligation_results[0].status is ConditionStatus.SATISFIED
@@ -627,6 +646,16 @@ def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
     lease = runtime.acquire_control_lease(runtime.control_capability, dependencies)
     assert ControlStateGate(runtime).commit(request, lease).code is GateResultCode.COMMITTED
     assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.COMPLETED
+    assert runtime.backend.read_authorization(before.task.authorization_id) == admitted_authorization
+    assert runtime.backend.read_resolved_target_registration(before.task.target_registration_id) == resolved_target
+    assert runtime.binding.root_context_id == root_context_id
+    assert runtime.control_capability is control_capability
+    assert runtime.publication_capability is publication_capability
+    assert runtime.merge_capability is merge_capability
+    platform_after = runtime.platform.snapshot()
+    assert platform_after.refs == platform_before.refs
+    assert platform_after.pull_requests == platform_before.pull_requests
+    assert platform_after.markers == platform_before.markers
 
 
 def test_g8_08_exact_replay_never_duplicates_effect_or_lends_marker_to_other_operation():
