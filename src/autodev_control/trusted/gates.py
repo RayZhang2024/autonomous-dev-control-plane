@@ -1638,15 +1638,43 @@ class FixtureProtectedGateRuntime:
         )
         if not operation.intent.required_evidence_ids and not forward:
             return None
+
+        # Evidence class is canonical state, not a caller claim.  Read it at
+        # the exact start occurrence before deciding whether #29 owns any of
+        # the required IDs.  The empty history projection is facts-only G6.
+        semantic_evidence_ids: tuple[EvidenceId, ...] = ()
+        required_ids = operation.intent.required_evidence_ids
+        if required_ids:
+            evidence_snapshot = self.backend.read_semantic_consumption_snapshot(
+                operation.intent.task_id, expected_occurrence, (), required_ids,
+            )
+            if (evidence_snapshot is None
+                    or evidence_snapshot.canonical_state_occurrence_binding
+                    != expected_occurrence
+                    or self.backend.occurrence != expected_occurrence
+                    or tuple(item.evidence_id for item in evidence_snapshot.requested_evidence)
+                    != required_ids):
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+            if any(item.record is None for item in evidence_snapshot.requested_evidence):
+                return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_CURRENT
+            semantic_evidence_ids = tuple(
+                item.evidence_id for item in evidence_snapshot.requested_evidence
+                if item.record.evidence_class is EvidenceClass.SEMANTIC_REVIEW
+            )
+            if not semantic_evidence_ids and not forward:
+                if self.backend.occurrence != expected_occurrence:
+                    return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+                return None
+
         semantic = self._resolve_semantic_consumption(
-            operation.intent.task_id, operation.intent.required_evidence_ids,
+            operation.intent.task_id, semantic_evidence_ids,
             expected_occurrence,
         )
         if (semantic is None or semantic.occurrence != expected_occurrence
                 or self.backend.occurrence != expected_occurrence):
             return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
         currentness = {item.evidence_id: item for item in semantic.evidence_currentness}
-        for evidence_id in operation.intent.required_evidence_ids:
+        for evidence_id in semantic_evidence_ids:
             result = currentness.get(evidence_id)
             if result is None:
                 return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
@@ -1660,7 +1688,7 @@ class FixtureProtectedGateRuntime:
                 return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_NOT_VALID_FOR_OPERATION
             if semantic.contract_status is not ConditionStatus.SATISFIED:
                 return ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
-            for evidence_id in operation.intent.required_evidence_ids:
+            for evidence_id in semantic_evidence_ids:
                 result = currentness.get(evidence_id)
                 if result is not None and result.status is SemanticEvidenceCurrentnessStatus.CURRENT:
                     if not any(evidence_id in item.progression_support_evidence_ids

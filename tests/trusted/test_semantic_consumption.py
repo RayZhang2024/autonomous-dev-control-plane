@@ -299,8 +299,8 @@ def test_g6_semantic_snapshot_returns_complete_history_and_exact_missing_lookup(
     )
 
 
-def test_exact_nonsemantic_canonical_record_is_not_semantic_currentness():
-    store, resolution, record, subject = _resolved_backend_with_current_evidence()
+def _append_canonical_nonsemantic_evidence(store, resolution, record):
+    subject = resolution.obligation_outcomes[0].effective_subject
     outcome = resolution.obligation_outcomes[0]
     slot = outcome.trusted_evaluator_resolution.review_slots[0]
     effective = mint(
@@ -361,27 +361,67 @@ def test_exact_nonsemantic_canonical_record_is_not_semantic_currentness():
         effective, history.evidence_history_membership.membership_binding_id,
         nonsemantic,
     )).status.name == "APPLIED"
+    return nonsemantic
+
+
+@pytest.mark.parametrize("unresolved_state", ("not_applicable", "indeterminate"))
+def test_unresolved_semantic_resolution_preserves_structural_evidence_classification(
+    unresolved_state,
+):
+    store, initial_resolution, record, subject = _resolved_backend_with_current_evidence()
+    nonsemantic = _append_canonical_nonsemantic_evidence(
+        store, initial_resolution, record,
+    )
     contract = store.read_contract(subject.contract_id)
     inputs = store.read_current_semantic_review_inputs(subject.task_id)
+    context = _current_applicability_context(contract)
+    reader = _trusted_reader(contract, _semantic_config_bytes())
+    if unresolved_state == "not_applicable":
+        moved_base = mint(
+            type(context.base_observation),
+            **{
+                **{name: getattr(context.base_observation, name)
+                   for name in context.base_observation.__dataclass_fields__},
+                "sha": type(contract.base_sha)("d" * 40),
+            },
+        )
+        context = mint(
+            type(context),
+            **{
+                **{name: getattr(context, name) for name in context.__dataclass_fields__},
+                "base_observation": moved_base,
+            },
+        )
+    else:
+        reader = None
     resolution = resolve_current_semantic_review(
-        inputs, applicability_context=_current_applicability_context(contract),
-        byte_reader=_trusted_reader(contract, _semantic_config_bytes()),
+        inputs, applicability_context=context, byte_reader=reader,
         semantic_context_source=None,
+    )
+    assert resolution.status.name == (
+        "NOT_APPLICABLE" if unresolved_state == "not_applicable" else "INDETERMINATE"
     )
     current_subject_ids = tuple(
         item.effective_subject.subject_id for item in resolution.obligation_outcomes
-        if item.effective_subject is not None
+        if resolution.status.name == "RESOLVED" and item.effective_subject is not None
     )
+    missing_id = EvidenceId("absent-under-unresolved-review")
     snapshot = store.read_semantic_consumption_snapshot(
         subject.task_id, inputs.canonical_state_occurrence_binding, current_subject_ids,
-        (nonsemantic.evidence_id,),
+        (nonsemantic.evidence_id, missing_id),
     )
     assert snapshot is not None
     result = consume_current_semantic_evidence(
-        resolution, snapshot, (nonsemantic.evidence_id,),
+        resolution, snapshot, (nonsemantic.evidence_id, missing_id),
         current_contract=contract,
     )
-    assert result.evidence_currentness[0].status is SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC
+    assert tuple(item.status for item in result.evidence_currentness) == (
+        SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC,
+        SemanticEvidenceCurrentnessStatus.NOT_FOUND,
+    )
+    assert tuple(item.reason.name for item in result.evidence_currentness) == (
+        "NOT_SEMANTIC", "NOT_FOUND",
+    )
 
 
 def test_two_evaluator_obligations_remain_independent_for_contract_aggregate_and_support():
@@ -647,10 +687,9 @@ def test_conflicting_applicable_evidence_is_indeterminate_without_progression_su
 
 
 def test_current_contract_schema_epoch_mismatch_is_stale_with_exact_g1_diagnostic():
-    _, contract, materialization = _resolved_product()
-    candidate = _candidate(materialization, contract=contract)
-    store = _canonical_backend_with_candidate(contract, candidate, materialization)
-    inputs = store.read_current_semantic_review_inputs(candidate.task_id)
+    store, _, record, subject = _resolved_backend_with_current_evidence()
+    contract = store.read_contract(subject.contract_id)
+    inputs = store.read_current_semantic_review_inputs(subject.task_id)
     assert inputs is not None
     context = _current_applicability_context(contract)
     old_epoch = replace(
@@ -682,12 +721,12 @@ def test_current_contract_schema_epoch_mismatch_is_stale_with_exact_g1_diagnosti
     assert resolution.status.name == "NOT_APPLICABLE"
     assert resolution.applicability_code is not None
     snapshot = store.read_semantic_consumption_snapshot(
-        candidate.task_id, inputs.canonical_state_occurrence_binding, (),
-        (EvidenceId("historical-evidence"),),
+        subject.task_id, inputs.canonical_state_occurrence_binding, (),
+        (record.evidence_id,),
     )
     assert snapshot is not None
     result = consume_current_semantic_evidence(
-        resolution, snapshot, (EvidenceId("historical-evidence"),),
+        resolution, snapshot, (record.evidence_id,),
         current_contract=contract,
     )
     assert result.contract_status is ConditionStatus.INDETERMINATE

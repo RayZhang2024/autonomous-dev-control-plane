@@ -1169,25 +1169,46 @@ def consume_current_semantic_evidence(
     if tuple(item.evidence_id for item in snapshot.requested_evidence) != requested_evidence_ids:
         raise ValueError("G6 snapshot does not bind the exact requested EvidenceIds")
 
-    def empty_result(status: ConditionStatus) -> CurrentSemanticConsumptionResult:
-        curr = tuple(SemanticEvidenceCurrentnessResult(
+    lookup = {item.evidence_id: item.record for item in snapshot.requested_evidence}
+
+    def structural_result(evidence_id: EvidenceId) -> SemanticEvidenceCurrentnessResult:
+        record = lookup[evidence_id]
+        if record is None:
+            return SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_FOUND,
+                SemanticEvidenceCurrentnessReason.NOT_FOUND,
+            )
+        if record.evidence_class is not EvidenceClass.SEMANTIC_REVIEW:
+            return SemanticEvidenceCurrentnessResult(
+                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC,
+                SemanticEvidenceCurrentnessReason.NOT_SEMANTIC,
+            )
+        return SemanticEvidenceCurrentnessResult(
             evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
             SemanticEvidenceCurrentnessReason.CURRENT_REVIEW_UNAVAILABLE,
-        ) for evidence_id in requested_evidence_ids)
-        return CurrentSemanticConsumptionResult(
-            occurrence, status, (), (), curr
         )
+
+    def empty_result(status: ConditionStatus) -> CurrentSemanticConsumptionResult:
+        if current_resolution.status is CurrentSemanticReviewResolutionStatus.NOT_APPLICABLE:
+            curr = tuple(
+                SemanticEvidenceCurrentnessResult(
+                    evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
+                    SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
+                    applicability_code=current_resolution.applicability_code,
+                ) if lookup[evidence_id] is not None
+                and lookup[evidence_id].evidence_class is EvidenceClass.SEMANTIC_REVIEW
+                else structural_result(evidence_id)
+                for evidence_id in requested_evidence_ids
+            )
+        else:
+            curr = tuple(structural_result(evidence_id)
+                         for evidence_id in requested_evidence_ids)
+        return CurrentSemanticConsumptionResult(occurrence, status, (), (), curr)
 
     if current_resolution.status is not CurrentSemanticReviewResolutionStatus.RESOLVED:
         status = ConditionStatus.INDETERMINATE
         if current_resolution.status is CurrentSemanticReviewResolutionStatus.NOT_APPLICABLE:
-            return CurrentSemanticConsumptionResult(
-                occurrence, status, (), (), tuple(SemanticEvidenceCurrentnessResult(
-                    evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
-                    SemanticEvidenceCurrentnessReason.SUBJECT_STALE,
-                    applicability_code=current_resolution.applicability_code,
-                ) for evidence_id in requested_evidence_ids),
-            )
+            return empty_result(status)
         return empty_result(status)
 
     by_subject = {item.subject_id: item for item in snapshot.histories}
@@ -1281,21 +1302,12 @@ def consume_current_semantic_evidence(
     else:
         contract_status = ConditionStatus.SATISFIED
 
-    lookup = {item.evidence_id: item.record for item in snapshot.requested_evidence}
     outcome_by_id = {item.obligation_id: item for item in obligations}
     currentness: list[SemanticEvidenceCurrentnessResult] = []
     for evidence_id in requested_evidence_ids:
         record = lookup[evidence_id]
-        if record is None:
-            currentness.append(SemanticEvidenceCurrentnessResult(
-                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_FOUND,
-                SemanticEvidenceCurrentnessReason.NOT_FOUND,
-            )); continue
-        if record.evidence_class is not EvidenceClass.SEMANTIC_REVIEW:
-            currentness.append(SemanticEvidenceCurrentnessResult(
-                evidence_id, SemanticEvidenceCurrentnessStatus.NOT_SEMANTIC,
-                SemanticEvidenceCurrentnessReason.NOT_SEMANTIC,
-            )); continue
+        if record is None or record.evidence_class is not EvidenceClass.SEMANTIC_REVIEW:
+            currentness.append(structural_result(evidence_id)); continue
         binding = record.subject.semantic_review_binding
         if binding is None:
             currentness.append(SemanticEvidenceCurrentnessResult(
@@ -1379,12 +1391,6 @@ def consume_current_semantic_evidence(
             currentness.append(SemanticEvidenceCurrentnessResult(
                 evidence_id, SemanticEvidenceCurrentnessStatus.INDETERMINATE,
                 SemanticEvidenceCurrentnessReason.CANONICAL_SNAPSHOT_INCOMPLETE,
-            )); continue
-        if (composition.reason is SemanticCompositionReason.COMPOSED
-                and evidence_id not in composition.contributing_evidence_ids):
-            currentness.append(SemanticEvidenceCurrentnessResult(
-                evidence_id, SemanticEvidenceCurrentnessStatus.STALE,
-                SemanticEvidenceCurrentnessReason.SUPERSEDED,
             )); continue
         if (composition.reason in (
                 SemanticCompositionReason.COMPOSED,

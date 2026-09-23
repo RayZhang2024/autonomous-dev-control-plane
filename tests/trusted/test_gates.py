@@ -3147,6 +3147,211 @@ def test_issue29_empty_readiness_evidence_cannot_bypass_unsatisfied_contract_sem
     assert backend.occurrence == occurrence
 
 
+def _issue29_nonsemantic_protected_start_fixture():
+    from tests.trusted.test_current_semantic_review import resolve_current_semantic_review
+    from tests.trusted.test_semantic_consumption import _append_canonical_nonsemantic_evidence
+
+    value, materialization, target, dependency, semantic_record = (
+        _issue29_semantic_publication_runtime(stale_schema=False)
+    )
+    task_id = semantic_record.subject.task_id
+    inputs = value.backend.read_current_semantic_review_inputs(task_id)
+    applicability, reader, source, _ = value._semantic_contexts[task_id]
+    resolution = resolve_current_semantic_review(
+        inputs, applicability_context=applicability, byte_reader=reader,
+        semantic_context_source=source,
+    )
+    nonsemantic = _append_canonical_nonsemantic_evidence(
+        value.backend, resolution, semantic_record,
+    )
+    return value, materialization, target, dependency, semantic_record, nonsemantic
+
+
+def test_issue29_pure_nonsemantic_nonforward_start_needs_no_semantic_context():
+    (value, materialization, target, _, _, nonsemantic) = (
+        _issue29_nonsemantic_protected_start_fixture()
+    )
+    value._semantic_contexts.clear()
+    operation = reserve_protected(
+        value, "pure-nonsemantic-no-context", materialization.candidate_id,
+        required_evidence_ids=(nonsemantic.evidence_id,),
+    )
+    result = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            nonsemantic.subject.repository_id, materialization.candidate_branch,
+            None, value.platform.snapshot().generation,
+        ), materialization, target=target,
+    )
+    assert result.code is GateResultCode.START_COMMITTED
+    stored = next(item for item in value.backend.read_task_working_set(
+        nonsemantic.subject.task_id,
+    ).operations if item.intent.operation_id == operation.intent.operation_id)
+    assert stored.state is OperationState.PERFORMING
+    assert stored.start_binding_id is not None
+
+
+def test_issue29_pure_nonsemantic_nonforward_start_needs_no_semantic_dependencies():
+    (value, materialization, target, _, _, nonsemantic) = (
+        _issue29_nonsemantic_protected_start_fixture()
+    )
+    operation = reserve_protected(
+        value, "pure-nonsemantic-no-dependencies", materialization.candidate_id,
+        required_evidence_ids=(nonsemantic.evidence_id,),
+    )
+    result = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        ActionTargetFence(
+            nonsemantic.subject.repository_id, materialization.candidate_branch,
+            None, value.platform.snapshot().generation,
+        ), materialization, target=target,
+        dependencies=ControlStateAuthoritativeDependencySet(()),
+    )
+    assert result.code is GateResultCode.START_COMMITTED
+
+
+def test_issue29_missing_required_evidence_fails_closed_before_nonsemantic_classification():
+    (value, _, _, _, semantic_record, _) = (
+        _issue29_nonsemantic_protected_start_fixture()
+    )
+    value._semantic_contexts.clear()
+    missing_id = EvidenceId("missing-required-protected-evidence")
+    command = OperationReservationCommand(
+        operation_id=OperationId("missing-required-evidence"),
+        idempotency_key=OperationIdempotencyKey("key-missing-required-evidence"),
+        action_id=OperationActionId("missing-required-evidence"),
+        subject_id=OperationSubjectId("missing-required-evidence"),
+        required_evidence_ids=(missing_id,),
+        integration_binding=NotIntegrationBound(), is_repair_attempt=False,
+    )
+    before = value.backend.read_task_working_set(semantic_record.subject.task_id)
+    request = value.boundary.reserve_operation(semantic_record.subject.task_id, command)
+    result = ControlStateGate(value).commit(request, independent_lease(value))
+    assert result.code is GateResultCode.REJECTED
+    assert value.backend.read_task_working_set(semantic_record.subject.task_id) == before
+    assert all(item.intent.operation_id != command.operation_id for item in
+               value.backend.read_task_working_set(semantic_record.subject.task_id).operations)
+
+
+def test_issue29_mixed_protected_evidence_applies_semantics_only_to_semantic_ids(
+    monkeypatch,
+):
+    (value, materialization, target, dependency, semantic_record, nonsemantic) = (
+        _issue29_nonsemantic_protected_start_fixture()
+    )
+    operation = reserve_protected(
+        value, "mixed-semantic-and-deterministic", materialization.candidate_id,
+        required_evidence_ids=(semantic_record.evidence_id, nonsemantic.evidence_id),
+    )
+    calls = []
+    original = gates_module.FixtureProtectedGateRuntime._resolve_semantic_consumption
+
+    def record_projection(self, task_id, evidence_ids, expected_occurrence=None):
+        if self is value:
+            calls.append(evidence_ids)
+        return original(self, task_id, evidence_ids, expected_occurrence)
+
+    monkeypatch.setattr(
+        gates_module.FixtureProtectedGateRuntime, "_resolve_semantic_consumption",
+        record_projection,
+    )
+    fence = ActionTargetFence(
+        semantic_record.subject.repository_id, materialization.candidate_branch,
+        None, value.platform.snapshot().generation,
+    )
+    denied = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization, target=target,
+        dependencies=ControlStateAuthoritativeDependencySet(()),
+    )
+    assert denied.code is GateResultCode.REJECTED
+    assert denied.semantic_denial_code is (
+        ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+    )
+    assert calls == [(semantic_record.evidence_id,)]
+    stored = next(item for item in value.backend.read_task_working_set(
+        semantic_record.subject.task_id,
+    ).operations if item.intent.operation_id == operation.intent.operation_id)
+    assert stored.state is OperationState.RESERVED
+    assert stored.start_binding_id is None
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+
+    accepted_operation = reserve_protected(
+        value, "mixed-semantic-and-deterministic-with-dependencies",
+        materialization.candidate_id,
+        required_evidence_ids=(semantic_record.evidence_id, nonsemantic.evidence_id),
+    )
+    accepted = start_protected(
+        value, accepted_operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization, target=target,
+        dependencies=ControlStateAuthoritativeDependencySet((dependency,)),
+    )
+    assert accepted.code is GateResultCode.START_COMMITTED
+    assert calls == [(semantic_record.evidence_id,), (semantic_record.evidence_id,)]
+    semantic = original(
+        value, semantic_record.subject.task_id, (semantic_record.evidence_id,),
+        value.backend.occurrence,
+    )
+    assert semantic is not None
+    assert tuple(item.evidence_id for item in semantic.evidence_currentness) == (
+        semantic_record.evidence_id,
+    )
+    assert all(nonsemantic.evidence_id not in item.progression_support_evidence_ids
+               for item in semantic.obligation_results)
+
+
+@pytest.mark.parametrize("required_kind", ("empty", "nonsemantic"))
+def test_issue29_forward_start_remains_contract_wide_with_only_nonsemantic_or_empty_evidence(
+    required_kind,
+):
+    (value, materialization, target, dependency, semantic_record, nonsemantic) = (
+        _issue29_nonsemantic_protected_start_fixture()
+    )
+    required_ids = () if required_kind == "empty" else (nonsemantic.evidence_id,)
+    command = OperationReservationCommand(
+        operation_id=OperationId(f"forward-with-{required_kind}-evidence"),
+        idempotency_key=OperationIdempotencyKey(f"forward-with-{required_kind}-key"),
+        action_id=OperationActionId(f"forward-with-{required_kind}-action"),
+        subject_id=OperationSubjectId(f"forward-with-{required_kind}-subject"),
+        required_evidence_ids=required_ids,
+        integration_binding=IntegrationBound(GitRef(REF.value)),
+        is_repair_attempt=False,
+    )
+    reservation = value.boundary.reserve_operation(semantic_record.subject.task_id, command)
+    assert ControlStateGate(value).commit(
+        reservation, independent_lease(value),
+    ).code is GateResultCode.COMMITTED
+    operation = next(item for item in value.backend.read_task_working_set(
+        semantic_record.subject.task_id,
+    ).operations if item.intent.operation_id == command.operation_id)
+    working = value.backend.read_task_working_set(semantic_record.subject.task_id)
+    ready_task = replace(
+        working.task, state=TaskState.INTEGRATION_READY,
+        next_integration_operation_id=command.operation_id,
+        revision=working.task.revision + 1,
+    )
+    ready = value.backend.apply(CanonicalTransaction(
+        working.canonical_state_occurrence_binding,
+        (TaskRevisionEquals(working.task.task_id, working.task.revision),),
+        (ReplaceTask(working.task.revision, ready_task),),
+    ))
+    assert ready.status is CanonicalWriteStatus.APPLIED
+
+    assert value._protected_start_semantic_denial(
+        operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        value.backend.occurrence,
+        ControlStateAuthoritativeDependencySet(()),
+    ) is ProtectedStartSemanticDenialCode.REQUIRED_EVIDENCE_CONTEXT_INDETERMINATE
+    assert value._protected_start_semantic_denial(
+        operation, ProtectedEffectSubject.FAST_FORWARD_MERGE,
+        value.backend.occurrence,
+        ControlStateAuthoritativeDependencySet((dependency,)),
+    ) is None
+
+
 def test_issue29_nonready_nonnext_integration_operation_does_not_receive_forward_semantic_veto():
     value, backend, candidate = _issue29_semantic_gate_runtime()
     command = OperationReservationCommand(
