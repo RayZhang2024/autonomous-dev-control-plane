@@ -12,6 +12,7 @@ import json
 import pytest
 
 import autodev_control.trusted.gates as gates_module
+import autodev_control.trusted.runtime_roles as runtime_roles_module
 from autodev_control.trusted.authorization import (
     OrdinaryRootProtectionState,
     admit_direct_authorization,
@@ -116,7 +117,7 @@ def _evaluate(runtime, context, *, blockers=()):
     # Refresh the real #29 neutral resolution after all setup mutations so its
     # G1 dependency and canonical occurrence are exact for this evaluation.
     dependencies = gates_fixture.register_zero_semantic_environment(runtime)
-    return ControlStateGate(runtime).commit(
+    return ControlStateGate(runtime.control_state_client).commit(
         runtime.boundary.evaluate_task(TaskEvaluationCommand(
             gates_fixture.TASK, context.context_id, blockers, (), None,
         )), runtime.acquire_control_lease(runtime.control_capability, dependencies),
@@ -447,7 +448,7 @@ def _current_semantic_runtime():
     admission = runtime.boundary.admit_semantic_evidence(SemanticEvidenceCommand(
         ImmutableConfigId("g8-live-g5-admission-context"), raw_response,
     ))
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         admission, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     evidence = backend.read_evidence(evidence_id)
@@ -561,7 +562,7 @@ def _admit_raw_contract(runtime, raw, label):
     )
     runtime.register_contract_context(raw, context)
     request = runtime.boundary.admit_contract(raw)
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         request, runtime.acquire_control_lease(runtime.control_capability, dependencies),
     ).code is GateResultCode.COMMITTED
     parsed = load_candidate_issue_contract(raw)
@@ -711,7 +712,7 @@ def test_g8_01_stale_base_denies_persisted_forward_merge_start():
         ), materialization, target=target, dependencies=dependencies,
     )
     assert publish_start.code is GateResultCode.START_COMMITTED
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         publish_start.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     create_pr = gates_fixture.reserve_protected(
@@ -728,7 +729,7 @@ def test_g8_01_stale_base_denies_persisted_forward_merge_start():
         dependencies=dependencies,
     )
     assert pr_start.code is GateResultCode.START_COMMITTED
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         pr_start.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
 
@@ -750,7 +751,7 @@ def test_g8_01_stale_base_denies_persisted_forward_merge_start():
         forward.intent.operation_id,
     ))
     assert ready_request.transaction.mutations[0].task.state is TaskState.INTEGRATION_READY
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         ready_request, runtime.acquire_control_lease(runtime.control_capability, dependencies),
     ).code is GateResultCode.COMMITTED
 
@@ -1042,7 +1043,7 @@ def test_g8_07_admitted_approval_is_not_merge_or_completion_authority():
     ))
     assert request.transaction.mutations[0].task.state is not TaskState.COMPLETED
     lease = runtime.acquire_control_lease(runtime.control_capability, dependencies)
-    assert ControlStateGate(runtime).commit(request, lease).code is GateResultCode.COMMITTED
+    assert ControlStateGate(runtime.control_state_client).commit(request, lease).code is GateResultCode.COMMITTED
     assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.state is not TaskState.COMPLETED
     assert runtime.backend.read_authorization(before.task.authorization_id) == admitted_authorization
     assert runtime.backend.read_resolved_target_registration(before.task.target_registration_id) == resolved_target
@@ -1077,7 +1078,7 @@ def test_g8_08_exact_replay_never_duplicates_effect_or_lends_marker_to_other_ope
     ) == exact
     assert len(runtime.platform._markers) == 1
     target_before_replay = runtime.platform.snapshot()
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         started.continuation,
     ).code is GateResultCode.ALREADY_APPLIED
     assert runtime.platform.snapshot() == target_before_replay
@@ -1145,7 +1146,7 @@ def test_g8_09b_consumed_exact_marker_reconciles_succeeded_without_replay():
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     expected_marker = _exact_publication_marker(runtime, started, materialization, fence)
@@ -1181,7 +1182,7 @@ def test_g8_09c_contradictory_marker_postcondition_is_indeterminate():
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     runtime.platform.seed_ref(
@@ -1201,7 +1202,7 @@ def test_g8_10a_authoritative_cancellation_first_blocks_protected_start():
         gates_fixture.TASK, CancellationStatus.AUTHORITATIVE,
         CancellationRequestId("g8-cancel"),
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         cancellation, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     task = runtime.backend.read_task_working_set(gates_fixture.TASK).task
@@ -1243,7 +1244,7 @@ def test_g8_10b_started_operation_survives_authoritative_cancellation_until_reco
         gates_fixture.TASK, CancellationStatus.AUTHORITATIVE,
         CancellationRequestId("g8-cancel-after-start"),
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         cancellation, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     task = runtime.backend.read_task_working_set(gates_fixture.TASK).task
@@ -1270,7 +1271,7 @@ def test_g8_11_public_evaluation_boundary_can_represent_all_frozen_completion_in
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     assert runtime.reconcile_recovered_effect(
@@ -1360,7 +1361,7 @@ def test_g8_11_unresolved_indeterminate_operation_cannot_complete():
         runtime, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
         fence, materialization,
     )
-    assert TargetPublicationGate(runtime).perform(started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
     runtime.platform.seed_ref(
         gates_fixture.REPO, materialization.candidate_branch, GitSha("d" * 40),
     )
@@ -1388,7 +1389,7 @@ def test_g8_11_authoritative_cancellation_cannot_complete():
         gates_fixture.TASK, CancellationStatus.AUTHORITATIVE,
         CancellationRequestId("g8-completion-cancel"),
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         cancellation, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     context = gates_fixture.completion_context(
@@ -1415,14 +1416,14 @@ def test_g8_11_semantic_veto_preserves_g4_additional_completion_fact(monkeypatch
     )
     runtime.register_completion_evaluation_context(context)
     observed = []
-    original = gates_module._compose_completion_aggregate
+    original = runtime_roles_module._compose_completion_aggregate
 
     def record_g4_additional_fact(**kwargs):
         observed.append(kwargs["additional_conditions_status"])
         return original(**kwargs)
 
     monkeypatch.setattr(
-        gates_module, "_compose_completion_aggregate", record_g4_additional_fact,
+        runtime_roles_module, "_compose_completion_aggregate", record_g4_additional_fact,
     )
     command = TaskEvaluationCommand(
         gates_fixture.TASK, context.context_id, (), (), None,
@@ -1445,7 +1446,7 @@ def test_g8_13_external_merge_like_state_without_marker_never_recovers_succeeded
             runtime.platform.snapshot().generation,
         ), materialization,
     )
-    assert TargetPublicationGate(runtime).perform(publish_started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(publish_started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
     create_pr = gates_fixture.reserve_protected(
         runtime, "g8-merge-pr", materialization.candidate_id,
     )
@@ -1458,7 +1459,7 @@ def test_g8_13_external_merge_like_state_without_marker_never_recovers_succeeded
         ), materialization, base_ref=gates_fixture.REF,
         provenance_operation_id=publish.intent.operation_id,
     )
-    assert TargetPublicationGate(runtime).perform(pr_started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(pr_started.continuation).code is GateResultCode.EFFECT_SUCCEEDED
     merge = gates_fixture.reserve_protected(runtime, "g8-external-merge", materialization.candidate_id)
     started = gates_fixture.start_protected(
         runtime, merge, ProtectedEffectSubject.FAST_FORWARD_MERGE,
@@ -1518,7 +1519,7 @@ def test_g8_13_contradictory_marked_merge_state_recovers_indeterminate():
             runtime.platform.snapshot().generation,
         ), materialization,
     )
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         publish_started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     create_pr = gates_fixture.reserve_protected(
@@ -1533,7 +1534,7 @@ def test_g8_13_contradictory_marked_merge_state_recovers_indeterminate():
         ), materialization, base_ref=gates_fixture.REF,
         provenance_operation_id=publish.intent.operation_id,
     )
-    assert TargetPublicationGate(runtime).perform(
+    assert TargetPublicationGate(runtime.publication_gate_client).perform(
         pr_started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     existing = runtime.backend.read_task_working_set(gates_fixture.TASK).operations
@@ -1555,7 +1556,7 @@ def test_g8_13_contradictory_marked_merge_state_recovers_indeterminate():
             runtime.platform.snapshot().generation,
         ), materialization, provenance_operation_id=create_pr.intent.operation_id,
     )
-    assert MergeGate(runtime).perform(
+    assert MergeGate(runtime.merge_gate_client).perform(
         merge_started.continuation,
     ).code is GateResultCode.EFFECT_SUCCEEDED
     exact_marker = runtime.platform.marker(
@@ -1678,7 +1679,7 @@ def test_g8_12a_objective_prose_is_outside_the_trusted_contract_boundary():
         proposal, target, authorization_context, policy, root,
         approval=approval, issuer=issuer,
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         auth_request, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     admitted_auth = auth_request.transaction.mutations[0].authorization
@@ -1810,7 +1811,7 @@ def test_g8_14_admitted_evidence_for_old_candidate_is_stale_for_replacement():
         candidate_commit_id=replacement_commit,
         parent_candidate_ids=(original.candidate_id,),
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         create, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     candidate = runtime.backend.read_candidate(candidate_id)
@@ -1825,7 +1826,7 @@ def test_g8_14_admitted_evidence_for_old_candidate_is_stale_for_replacement():
         task_id=evidence.subject.task_id, candidate_id=candidate_id,
         decision_event_id=gates_fixture.DecisionEventId("g8-candidate-replacement"),
     )
-    assert ControlStateGate(runtime).commit(
+    assert ControlStateGate(runtime.control_state_client).commit(
         adopt, gates_fixture.independent_lease(runtime),
     ).code is GateResultCode.COMMITTED
     assert runtime.backend.read_task_working_set(evidence.subject.task_id).task.current_candidate_id == candidate_id
@@ -1857,7 +1858,7 @@ def test_g8_14_admitted_evidence_for_old_candidate_is_stale_for_replacement():
             is_repair_attempt=False,
         ),
     )
-    rejected = ControlStateGate(runtime).commit(
+    rejected = ControlStateGate(runtime.control_state_client).commit(
         bad_request, gates_fixture.independent_lease(runtime),
     )
     assert rejected.code is GateResultCode.REJECTED

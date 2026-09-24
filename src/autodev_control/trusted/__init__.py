@@ -142,12 +142,12 @@ from .audit import (
     GateAuditEvent, GateAuditEventPreimage, GateAuditOutcome, GateAuditRecord,
     build_gate_audit_event,
 )
-from .fixture_platform import (
-    ActiveFixtureRuntimeRegistry, FixtureFenceConflict, FixtureGitPlatform,
+from .protected_effect import (
+    CreatedCandidatePrEffectSubject, FastForwardMergeEffectSubject,
     ProtectedEffectMarker, ProtectedEffectMarkerPreimage,
-    build_protected_effect_marker,
+    PublishedCandidateRefEffectSubject, build_protected_effect_marker,
 )
-from .gates import (
+from .runtime_roles import (
     ActionTargetFence,
     ControlStateAuthoritativeDependency,
     ControlStateAuthoritativeDependencySet,
@@ -158,7 +158,6 @@ from .gates import (
     CreatedCandidatePrEffectSubject,
     DeterministicTrustedController,
     FastForwardMergeEffectSubject,
-    FixtureProtectedGateRuntime,
     FixtureRuntimeGeneration,
     GateResult,
     GateResultCode,
@@ -208,6 +207,17 @@ from .materialization import (
     inventory_is_authorized,
     mutation_inventory_scope,
 )
+
+
+def __getattr__(name: str):
+    """Load broad fixture adapters only when a caller explicitly requests them."""
+    if name in {"ActiveFixtureRuntimeRegistry", "FixtureFenceConflict", "FixtureGitPlatform"}:
+        from . import fixture_platform
+        return getattr(fixture_platform, name)
+    if name == "FixtureProtectedGateRuntime":
+        from .gates import FixtureProtectedGateRuntime
+        return FixtureProtectedGateRuntime
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "CandidateTrustedManifest",

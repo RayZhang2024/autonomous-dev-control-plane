@@ -680,18 +680,103 @@ def _supersession_key(value: EvidenceSupersessionRecord) -> tuple:
     return value.earlier_evidence_id, value.later_evidence_id
 
 
+class _CanonicalStateStore:
+    """Shared canonical data, separated from the mutating backend endpoint."""
+
+    __slots__ = ("lock", "generation", "state", "resolved_targets")
+
+    def __init__(self, resolved_targets: tuple[ResolvedTargetRegistration, ...]) -> None:
+        self.lock = RLock()
+        self.generation = 1
+        self.state = _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}))
+        self.resolved_targets = MappingProxyType({
+            item.target_registration_id: item for item in resolved_targets
+        })
+
+
+class CanonicalStateReadClient:
+    """Narrow live read projection with no canonical mutation operation."""
+
+    __slots__ = ("_store", "_sealed")
+
+    def __init__(self, store: _CanonicalStateStore) -> None:
+        if type(store) is not _CanonicalStateStore:
+            raise TypeError("exact canonical state store required")
+        object.__setattr__(self, "_store", store)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("canonical read projection is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def _lock(self):
+        return self._store.lock
+
+    @property
+    def _generation(self):
+        return self._store.generation
+
+    @property
+    def _state(self):
+        return self._store.state
+
+    @property
+    def _resolved_targets(self):
+        return self._store.resolved_targets
+
+    @property
+    def occurrence(self) -> CanonicalStateOccurrenceBinding:
+        return InMemoryCanonicalStateBackend.occurrence.fget(self)
+
+    def read_task_working_set(self, task_id: TaskId) -> CanonicalTaskWorkingSet | None:
+        return InMemoryCanonicalStateBackend.read_task_working_set(self, task_id)
+
+    def read_current_semantic_review_inputs(self, task_id: TaskId):
+        return InMemoryCanonicalStateBackend.read_current_semantic_review_inputs(self, task_id)
+
+    def read_evidence(self, evidence_id: EvidenceId) -> EvidenceRecord | None:
+        return InMemoryCanonicalStateBackend.read_evidence(self, evidence_id)
+
+    def read_authorization(self, authorization_id: AuthorizationId) -> AdmittedAuthorization | None:
+        return InMemoryCanonicalStateBackend.read_authorization(self, authorization_id)
+
+    def read_contract(self, contract_id: ContractId) -> AdmittedIssueContract | None:
+        return InMemoryCanonicalStateBackend.read_contract(self, contract_id)
+
+    def read_candidate(self, candidate_id: CandidateId) -> CandidateRecord | None:
+        return InMemoryCanonicalStateBackend.read_candidate(self, candidate_id)
+
+    def read_candidate_materialization(self, materialization_id: CandidateMaterializationId):
+        return InMemoryCanonicalStateBackend.read_candidate_materialization(self, materialization_id)
+
+    def read_resolved_target_registration(self, target_registration_id: TargetRegistrationId):
+        return InMemoryCanonicalStateBackend.read_resolved_target_registration(self, target_registration_id)
+
+    def read_review_eligibility_snapshot(self, subject_id: SemanticReviewEffectiveSubjectId):
+        return InMemoryCanonicalStateBackend.read_review_eligibility_snapshot(self, subject_id)
+
+    def read_semantic_consumption_snapshot(
+        self, task_id: TaskId, expected_occurrence: CanonicalStateOccurrenceBinding,
+        complete_current_subject_ids: tuple[SemanticReviewEffectiveSubjectId, ...],
+        requested_evidence_ids: tuple[EvidenceId, ...] = (),
+    ):
+        return InMemoryCanonicalStateBackend.read_semantic_consumption_snapshot(
+            self, task_id, expected_occurrence, complete_current_subject_ids,
+            requested_evidence_ids,
+        )
+
+
 class InMemoryCanonicalStateBackend:
     """One-lock, no-retry, whole-graph validated reference backend."""
 
-    __slots__ = ("_lock", "_generation", "_state", "_resolved_targets", "_sealed")
+    __slots__ = ("_store", "_sealed")
 
     def __init__(self, resolved_targets: tuple[ResolvedTargetRegistration, ...] = ()) -> None:
         if type(resolved_targets) is not tuple or any(type(item) is not ResolvedTargetRegistration for item in resolved_targets):
             raise TypeError("resolved_targets must be an exact trusted tuple")
-        object.__setattr__(self, "_lock", RLock())
-        object.__setattr__(self, "_generation", 1)
-        object.__setattr__(self, "_state", _freeze_state(_State({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})))
-        object.__setattr__(self, "_resolved_targets", MappingProxyType({item.target_registration_id: item for item in resolved_targets}))
+        object.__setattr__(self, "_store", _CanonicalStateStore(resolved_targets))
         if len(self._resolved_targets) != len(resolved_targets) or any(
             item.registration.target_registration_id != item.target_registration_id
             or item.registration.policy_epoch_identity != item.policy_epoch_identity
@@ -704,6 +789,25 @@ class InMemoryCanonicalStateBackend:
         if getattr(self, "_sealed", False):
             raise AttributeError("canonical backend internals are not caller-replaceable")
         object.__setattr__(self, name, value)
+
+    @property
+    def _lock(self):
+        return self._store.lock
+
+    @property
+    def _generation(self):
+        return self._store.generation
+
+    @property
+    def _state(self):
+        return self._store.state
+
+    @property
+    def _resolved_targets(self):
+        return self._store.resolved_targets
+
+    def read_client(self) -> CanonicalStateReadClient:
+        return CanonicalStateReadClient(self._store)
 
     @property
     def occurrence(self) -> CanonicalStateOccurrenceBinding:
@@ -760,8 +864,8 @@ class InMemoryCanonicalStateBackend:
                 return CanonicalWriteResult(CanonicalWriteStatus.ALREADY_PRESENT, occurrence)
             if not self._valid_graph(candidate):
                 return CanonicalWriteResult(CanonicalWriteStatus.INVALID_TRANSACTION, occurrence)
-            object.__setattr__(self, "_state", _freeze_state(candidate))
-            object.__setattr__(self, "_generation", self._generation + 1)
+            self._store.state = _freeze_state(candidate)
+            self._store.generation += 1
             return CanonicalWriteResult(
                 CanonicalWriteStatus.APPLIED,
                 CanonicalStateOccurrenceBinding(BackendGeneration(self._generation)),
