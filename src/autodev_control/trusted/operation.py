@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 
 from .errors import G4Failure, G4FailureCode
 from .identity import (
@@ -403,6 +404,25 @@ class CanonicalProtectedStartBinding:
             raise TypeError("canonical start identity must be exact")
         if type(self.start_held_target_fence_binding) is not StartHeldTargetFenceBinding:
             raise TypeError("canonical companion requires exact full F binding")
+        if self.operation_start_binding_id != derive_operation_start_binding_id_v2(
+            self.start_held_target_fence_binding,
+        ):
+            raise ValueError("canonical start identity differs from exact F binding")
+
+
+def derive_operation_start_binding_id_v2(
+    start_held_binding: StartHeldTargetFenceBinding,
+) -> OperationStartBindingId:
+    """Derive the one canonical v2 identity from the exact F-held binding."""
+    if type(start_held_binding) is not StartHeldTargetFenceBinding:
+        raise TypeError("exact StartHeldTargetFenceBinding required")
+    # Lazy import avoids making the canonical backend depend on operation
+    # construction at module-import time while sharing its canonical encoding.
+    from .backend import canonical_json_bytes
+
+    return OperationStartBindingId(RawSha256(hashlib.sha256(canonical_json_bytes((
+        "autodev.operation-start-binding/v2", start_held_binding,
+    ))).hexdigest()))
 
 
 @dataclass(frozen=True, slots=True)

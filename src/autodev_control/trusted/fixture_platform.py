@@ -15,8 +15,9 @@ from .identity import (
 from .materialization import AdmittedCandidateMaterialization, CandidateMaterialization, GitTreeEntry, derive_mutation_inventory
 from .operation import (
     AuthoritativeStateBindingId, OperationActionId, OperationId,
-    OperationIdempotencyKey,
-    StartHeldTargetFenceBinding,
+    OperationIdempotencyKey, OperationRecord, OperationState,
+    StartHeldTargetFenceBinding, CanonicalProtectedStartBinding,
+    derive_operation_start_binding_id_v2,
 )
 from .runtime_authority import PreparedTargetFenceBinding
 from .scope import CanonicalBranchRef, GitHubRepositoryId
@@ -227,6 +228,12 @@ class FixtureReadVerifyClient:
     ) -> bool:
         return self._platform.verify_start_held_target_fence(binding)
 
+    def resolve_historical_start_binding(
+        self, binding: StartHeldTargetFenceBinding,
+    ) -> bool:
+        """Verify retained identity only; lifecycle state is queried separately."""
+        return self._platform.resolve_historical_start_binding(binding)
+
     def prepared_start_binding(
         self, operation_id: OperationId, action_class: str,
     ) -> StartHeldTargetFenceBinding | None:
@@ -415,14 +422,6 @@ class FixturePublicationAuthorityClient:
             _fence_token=fence_token, _authority=self._authority,
         )
 
-    def recover_release_start_held(self, binding: StartHeldTargetFenceBinding) -> bool:
-        if type(binding) is not StartHeldTargetFenceBinding or binding.action_class not in self._ACTIONS:
-            return False
-        return self._platform.recover_release_start_held(
-            binding, _authority=self._authority,
-        )
-
-
 class FixtureMergeAuthorityClient:
     """M-only client over the same fixture substrate, with no P methods."""
 
@@ -493,11 +492,44 @@ class FixtureMergeAuthorityClient:
             _authority=self._authority,
         )
 
-    def recover_release_start_held(self, binding: StartHeldTargetFenceBinding) -> bool:
-        if type(binding) is not StartHeldTargetFenceBinding or binding.action_class != "FAST_FORWARD_MERGE":
+class FixtureStartHeldRecoveryAuthority:
+    """External fixture-only capability for governed START_HELD recovery."""
+
+    __slots__ = ("_platform", "_authority")
+
+    def __init__(self, platform: "FixtureGitPlatform", authority: object) -> None:
+        if (type(platform) is not FixtureGitPlatform
+                or authority is not platform._external_recovery_authority):
+            raise TypeError("fixture recovery capability construction is closed")
+        self._platform, self._authority = platform, authority
+
+    def release_proven_absent(
+        self, binding: StartHeldTargetFenceBinding, operation: OperationRecord,
+        prepared_record: object, fence_token: "FixtureFenceToken",
+    ) -> bool:
+        """Release only exact held authority after fixture recovery proves absence."""
+        companion = (
+            None if type(operation) is not OperationRecord
+            else operation.canonical_protected_start_binding
+        )
+        record_id = getattr(prepared_record, "prepared_start_id", None)
+        record_operation = getattr(prepared_record, "operation", None)
+        if (type(binding) is not StartHeldTargetFenceBinding
+                or type(operation) is not OperationRecord
+                or operation.state not in (OperationState.PERFORMING, OperationState.INDETERMINATE)
+                or operation.start_binding_id != derive_operation_start_binding_id_v2(binding)
+                or type(companion) is not CanonicalProtectedStartBinding
+                or companion.start_held_target_fence_binding != binding
+                or companion.operation_start_binding_id != operation.start_binding_id
+                or record_id != binding.prepared_start_id
+                or type(record_operation) is not OperationRecord
+                or record_operation.intent != operation.intent
+                or type(fence_token) is not FixtureFenceToken
+                or not fence_token.active
+                or ("prepared", binding.operation_id, binding.action_class) not in fence_token.facts):
             return False
-        return self._platform.recover_release_start_held(
-            binding, _authority=self._authority,
+        return self._platform._release_start_held_for_fixture_recovery(
+            binding, prepared_record, self._authority,
         )
 
 
@@ -625,7 +657,7 @@ class FixtureGateRoleFenceClient:
 class FixtureGitPlatform:
     """Authoritative fixture state. It performs no network or provider calls."""
 
-    __slots__ = ("_lock", "_registry", "_generation", "_refs", "_prs", "_markers", "_prepared", "_prepared_fence_generations", "_commits", "_authoritative", "_fail_next_effect", "_substrate_identity", "_publication_authority", "_merge_authority")
+    __slots__ = ("_lock", "_registry", "_generation", "_refs", "_prs", "_markers", "_prepared", "_prepared_fence_generations", "_commits", "_authoritative", "_fail_next_effect", "_substrate_identity", "_publication_authority", "_merge_authority", "_external_recovery_authority")
 
     def __init__(self) -> None:
         self._registry: ActiveFixtureRuntimeRegistry | None = None
@@ -643,6 +675,7 @@ class FixtureGitPlatform:
             b"autodev.fixture-substrate/v1\0" + secrets.token_bytes(32)
         ).hexdigest())
         self._publication_authority, self._merge_authority = object(), object()
+        self._external_recovery_authority = object()
 
     def fail_next_effect_for_test(self) -> None:
         with self._lock:
@@ -657,6 +690,10 @@ class FixtureGitPlatform:
 
     def merge_authority_client(self) -> FixtureMergeAuthorityClient:
         return FixtureMergeAuthorityClient(self, self._merge_authority)
+
+    def fixture_start_held_recovery_authority(self) -> FixtureStartHeldRecoveryAuthority:
+        """Constructed only by the external fixture/recovery harness."""
+        return FixtureStartHeldRecoveryAuthority(self, self._external_recovery_authority)
 
     def _consume_effect_failure(self) -> bool:
         if self._fail_next_effect:
@@ -823,7 +860,18 @@ class FixtureGitPlatform:
         with self._lock:
             current = self._prepared.get((binding.operation_id, binding.action_class))
             return (current is not None and current[2] == binding
-                    and current[1] in ("START_HELD", "CONSUMED"))
+                    and current[1] == "START_HELD")
+
+    def resolve_historical_start_binding(
+        self, binding: StartHeldTargetFenceBinding,
+    ) -> bool:
+        """Resolve exact retained binding identity; inspect state separately."""
+        if type(binding) is not StartHeldTargetFenceBinding:
+            return False
+        with self._lock:
+            current = self._prepared.get((binding.operation_id, binding.action_class))
+            return (current is not None and current[2] == binding
+                    and current[1] in ("START_HELD", "CONSUMED", "RELEASED"))
 
     def prepared_start_binding(
         self, operation_id: OperationId, gate_action: str,
@@ -876,18 +924,19 @@ class FixtureGitPlatform:
                 runtime_generation.value, fence_generation,
             )
 
-    def recover_release_start_held(
-        self, binding: StartHeldTargetFenceBinding, *, _authority: object | None = None,
+    def _release_start_held_for_fixture_recovery(
+        self, binding: StartHeldTargetFenceBinding, prepared_record: object,
+        authority: object,
     ) -> bool:
-        """Role-scoped recovery release for proven effect absence."""
-        if type(binding) is not StartHeldTargetFenceBinding:
+        """External recovery mutation inaccessible through ordinary P/M clients."""
+        if (type(binding) is not StartHeldTargetFenceBinding
+                or authority is not self._external_recovery_authority):
             return False
         with self._lock:
-            if not self._authority_matches_action(binding.action_class, _authority):
-                return False
             key = binding.operation_id, binding.action_class
             current = self._prepared.get(key)
-            if (current is None or current[1] != "START_HELD"
+            if (current is None or current[0] is not prepared_record
+                    or current[1] != "START_HELD"
                     or current[2] != binding or key in self._markers):
                 return False
             self._prepared[key] = (current[0], "RELEASED", binding)

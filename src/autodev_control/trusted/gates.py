@@ -51,6 +51,7 @@ from .errors import G4FailureCode
 from .fixture_platform import (
     ActiveFixtureRuntimeRegistry, CreatedCandidatePrEffectSubject,
     FastForwardMergeEffectSubject, FixtureFenceToken, FixtureGateRoleFenceClient,
+    FixtureStartHeldRecoveryAuthority,
     FixtureGitPlatform,
     ProtectedEffectMarker, ProtectedEffectMarkerPreimage,
     PublishedCandidateRefEffectSubject, build_protected_effect_marker,
@@ -75,6 +76,7 @@ from .operation import (
     OperationRecord, OperationState, ReconciliationFinding,
     TrustedReconciliationFinding, _compose_trusted_operation_classification,
     construct_trusted_operation_intent,
+    derive_operation_start_binding_id_v2 as operation_start_binding_id_v2,
     reconcile_operation as decide_reconciliation, transition_operation,
     CanonicalProtectedStartBinding, StartHeldTargetFenceBinding,
 )
@@ -1744,9 +1746,7 @@ class TrustedControllerRuntime:
                 or held.prepared_start_id != prepared_id
                 or held.fixture_substrate_identity != self.f_read_verify.substrate_identity
                 or held.authority_binding_identity != expected_authority
-                or self.f_read_verify.prepared_start_binding(
-                    operation_id, subject.value,
-                ) != held
+                or not self.f_read_verify.resolve_historical_start_binding(held)
                 or type(preimage.dependencies) is not ControlStateAuthoritativeDependencySet
                 or preimage.dependencies != durable.preimage.dependencies
                 or not self._dependencies_fresh_set(preimage.dependencies)):
@@ -2437,7 +2437,7 @@ class FixtureProtectedGateRuntime:
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
                  "registry", "_lock", "_nonce", "_controller_key", "_t_context", "_c_context",
                  "_p_context", "_m_context", "_f_read_verify_client", "_publication_authority_client",
-                 "_merge_authority_client", "_t_to_c_channel_token", "_t_to_p_channel_token",
+                 "_merge_authority_client", "_start_held_recovery_authority", "_t_to_c_channel_token", "_t_to_p_channel_token",
                  "_t_to_m_channel_token", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_semantic_contexts", "_object_store", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_control_gate_runtime", "_trusted_controller_runtime", "_publication_gate_runtime", "_merge_gate_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
@@ -2453,6 +2453,7 @@ class FixtureProtectedGateRuntime:
         self._f_read_verify_client = platform.read_verify_client()
         self._publication_authority_client = platform.publication_authority_client()
         self._merge_authority_client = platform.merge_authority_client()
+        self._start_held_recovery_authority = platform.fixture_start_held_recovery_authority()
         self.registry = registry or ActiveFixtureRuntimeRegistry()
         self.platform.attach_registry(self.registry)
         self._lock, self._nonce = self.registry.lock, object()
@@ -2575,6 +2576,7 @@ class FixtureProtectedGateRuntime:
         return _FixturePublicationGateClient(
             self._publication_gate_runtime, self._trusted_controller_runtime,
             self._t_to_p_channel_token, self._t_context,
+            self._start_held_recovery_authority,
         )
 
     @property
@@ -2582,6 +2584,7 @@ class FixtureProtectedGateRuntime:
         return _FixtureMergeGateClient(
             self._merge_gate_runtime, self._trusted_controller_runtime,
             self._t_to_m_channel_token, self._t_context,
+            self._start_held_recovery_authority,
         )
 
     @property
@@ -3580,7 +3583,10 @@ class FixtureProtectedGateRuntime:
             != self._authority_binding_identity(
                 subject, expected_service, durable.preimage.runtime_binding_id,
             )
-            or not self._f_read_verify_client.verify_start_held_target_fence(held_binding)
+            # Recovery may observe a terminal F state while retaining the exact
+            # immutable start binding.  That historical binding is provenance,
+            # not start permission; current start checks remain strict below.
+            or not self._f_read_verify_client.resolve_historical_start_binding(held_binding)
             or durable.operation.intent != operation.intent
             or durable.subject is not subject
             or durable.preimage.operation_id != operation_id
@@ -3636,7 +3642,9 @@ class FixtureProtectedGateRuntime:
                     ) != "START_HELD"):
                 return GateResult(GateResultCode.INDETERMINATE)
             binding = operation.canonical_protected_start_binding.start_held_target_fence_binding
-            if not self.platform.recover_release_start_held(binding):
+            if not self._start_held_recovery_authority.release_proven_absent(
+                binding, operation, durable, prepared_start.target_fence_token,
+            ):
                 return GateResult(GateResultCode.INDETERMINATE)
             try:
                 request = self.controller._transition_started_failed(
@@ -3879,6 +3887,28 @@ class FixtureProtectedGateRuntime:
                         if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
                         else self._publication_gate_runtime)
                 observation = role._fail_started_effect_proven_absent(continuation)
+                if observation.code is GateResultCode.PRECONDITION_CONFLICT:
+                    current = self.backend.read_task_working_set(operation.intent.task_id)
+                    current_operation = None if current is None else next((
+                        item for item in current.operations
+                        if item.intent.operation_id == operation.intent.operation_id
+                    ), None)
+                    companion = (None if current_operation is None else
+                                 current_operation.canonical_protected_start_binding)
+                    held = (None if type(companion) is not CanonicalProtectedStartBinding else
+                            companion.start_held_target_fence_binding)
+                    durable = self._f_read_verify_client.read_prepared_effect_record(
+                        operation.intent.operation_id, subject.value,
+                    )
+                    if (type(current_operation) is not OperationRecord
+                            or type(held) is not StartHeldTargetFenceBinding
+                            or not self._start_held_recovery_authority.release_proven_absent(
+                                held, current_operation, durable,
+                                prepared.target_fence_token,
+                            )):
+                        self.registry.release(prepared.target_fence_token)
+                        return GateResult(GateResultCode.INDETERMINATE,
+                                          committed.canonical_result)
                 recovery = self._trusted_controller_runtime.reconcile_started_effect_absent(
                     observation,
                 )
@@ -4366,10 +4396,14 @@ class FixtureProtectedGateRuntime:
             if item.intent.operation_id == continuation.operation_id
         ), None)
         canonical = None if operation is None else operation.canonical_protected_start_binding
+        durable = self._f_read_verify_client.read_prepared_effect_record(
+            continuation.operation_id, continuation.subject.value,
+        )
         if (type(canonical) is not CanonicalProtectedStartBinding
                 or operation.start_binding_id != continuation.start_binding_id
-                or not self.platform.recover_release_start_held(
-                    canonical.start_held_target_fence_binding
+                or not self._start_held_recovery_authority.release_proven_absent(
+                    canonical.start_held_target_fence_binding, operation, durable,
+                    continuation.target_fence_token,
                 )):
             return GateResult(GateResultCode.INDETERMINATE)
         independence = (
@@ -4477,9 +4511,16 @@ class FixtureProtectedGateRuntime:
                     if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE
                     else self._publication_gate_runtime
                 )
-                if not role_runtime.recover_release_candidate_action(
-                        durable, held, recovery_token):
+                if prepared_state == "PREPARED":
+                    if not role_runtime.abort_prepared_candidate_action(
+                            durable, recovery_token):
+                        return GateResult(GateResultCode.INDETERMINATE)
+                elif not self._f_read_verify_client.resolve_historical_start_binding(held):
                     return GateResult(GateResultCode.INDETERMINATE)
+                elif prepared_state == "START_HELD":
+                    if not self._start_held_recovery_authority.release_proven_absent(
+                            held, operation, durable, recovery_token):
+                        return GateResult(GateResultCode.INDETERMINATE)
             elif marker is None or prepared_state != "CONSUMED":
                 return GateResult(GateResultCode.INDETERMINATE)
             return self._trusted_controller_runtime.reconcile_recovered_effect(
@@ -4649,6 +4690,33 @@ class _ProtectedGateRoleRuntime:
     def _is_active(self) -> bool:
         return self.fence_client.is_active()
 
+    def _verify_current_start_or_consumed_exact_replay(
+        self, held: StartHeldTargetFenceBinding,
+    ) -> bool:
+        """Accept START_HELD, or only an already-proven exact consumed replay."""
+        if self._f_read_verify_client.verify_start_held_target_fence(held):
+            return True
+        if (
+            type(held) is not StartHeldTargetFenceBinding
+            or self._f_read_verify_client.read_prepared_effect_state(
+                held.operation_id, held.action_class,
+            ) != PreparedProtectedStartState.CONSUMED.value
+            or not self._f_read_verify_client.resolve_historical_start_binding(held)
+        ):
+            return False
+        marker = self._f_read_verify_client.read_marker(
+            held.operation_id, held.action_class,
+        )
+        return (
+            type(marker) is ProtectedEffectMarker
+            and marker.preimage.operation_id == held.operation_id
+            and marker.preimage.gate_action == held.action_class
+            and marker.preimage.prepared_start_id == held.prepared_start_id
+            and marker.preimage.root_context_id == held.root_context_id
+            and marker.preimage.runtime_generation == held.runtime_generation
+            and self._marker_postcondition(marker)
+        )
+
     @staticmethod
     def _target_facts(prepared: PreparedProtectedStart) -> frozenset[tuple]:
         fence = prepared.fence
@@ -4775,7 +4843,7 @@ class _ProtectedGateRoleRuntime:
                 or type(held) is not StartHeldTargetFenceBinding
                 or held.prepared_start_id != prepared_start_id
                 or operation_start_binding_id_v2(held) != expected_start_binding_id
-                or not self._f_read_verify_client.verify_start_held_target_fence(held)):
+                or not self._verify_current_start_or_consumed_exact_replay(held)):
             return None
         value = object.__new__(LiveProtectedEffectContinuation)
         value._owner, value._nonce, value._used = self.runtime_identity, self._nonce, False
@@ -4964,67 +5032,49 @@ class _ProtectedGateRoleRuntime:
             prepared.prepared_target_fence_binding,
         )
 
-    def recover_release_candidate_action(
+    def abort_prepared_candidate_action(
         self, prepared: PreparedProtectedStart,
-        held_binding: StartHeldTargetFenceBinding,
         recovery_fence_token: FixtureFenceToken,
     ) -> bool:
-        """Role-scoped F recovery release; T separately decides canonical outcome."""
+        """Abort only an exact orphaned PREPARED record; START_HELD is never released here."""
         if (type(prepared) is not PreparedProtectedStart
                 or prepared.subject not in self.allowed_subjects
-                or type(held_binding) is not StartHeldTargetFenceBinding
                 or type(recovery_fence_token) is not FixtureFenceToken
                 or not recovery_fence_token.active or not self._is_active()):
             return False
         operation_id, action = prepared.operation.intent.operation_id, prepared.subject.value
         durable = self._f_read_verify_client.read_prepared_effect_record(operation_id, action)
-        marker = self._f_read_verify_client.read_marker(operation_id, action)
-        state = self._f_read_verify_client.read_prepared_effect_state(operation_id, action)
         expected_id = PreparedProtectedStartId(RawSha256(
             hashlib.sha256(canonical_json_bytes(prepared.preimage)).hexdigest()
         ))
+        target_binding = self._f_read_verify_client.prepared_target_fence_binding(
+            operation_id, action,
+        )
         if (type(durable) is not PreparedProtectedStart
                 or durable.prepared_start_id != expected_id
                 or durable.preimage != prepared.preimage
                 or prepared.prepared_start_id != expected_id
-                or marker is not None
-                or held_binding.operation_id != operation_id
-                or held_binding.action_class != action
-                or held_binding.prepared_start_id != expected_id):
-            return False
-        if state == "PREPARED":
-            target_binding = self._f_read_verify_client.prepared_target_fence_binding(
-                operation_id, action,
-            )
-            if (target_binding is None or target_binding.prepared_start_id != expected_id
-                    or not self._f_read_verify_client.verify_prepared_target_fence(target_binding)):
-                return False
-            if self.role is TrustedRuntimeRole.PUBLICATION_GATE:
-                released = self.authority_client.abort_prepared_publication(
-                    operation_id, action, recovery_fence_token,
-                )
-            else:
-                released = self.authority_client.abort_prepared_merge(
-                    operation_id, action, recovery_fence_token,
-                )
-            if not released:
-                return False
-        elif state == "START_HELD":
-            if (not self._f_read_verify_client.verify_start_held_target_fence(held_binding)
-                    or not self.authority_client.recover_release_start_held(held_binding)):
-                return False
-        elif state != "RELEASED":
-            return False
-        if (state in ("START_HELD", "RELEASED")
-                and self._f_read_verify_client.prepared_start_binding(
+                or self._f_read_verify_client.read_prepared_effect_state(
                     operation_id, action,
-                ) != held_binding):
+                ) != "PREPARED"
+                or self._f_read_verify_client.read_marker(operation_id, action) is not None
+                or type(target_binding) is not PreparedTargetFenceBinding
+                or target_binding.prepared_start_id != expected_id
+                or not self._f_read_verify_client.verify_prepared_target_fence(target_binding)):
             return False
-        return (
-            self._f_read_verify_client.read_prepared_effect_state(operation_id, action)
-            == "RELEASED"
-            and self._f_read_verify_client.read_marker(operation_id, action) is None
-        )
+        if self.role is TrustedRuntimeRole.PUBLICATION_GATE:
+            released = self.authority_client.abort_prepared_publication(
+                operation_id, action, recovery_fence_token,
+            )
+        else:
+            released = self.authority_client.abort_prepared_merge(
+                operation_id, action, recovery_fence_token,
+            )
+        return (released
+                and self._f_read_verify_client.read_prepared_effect_state(
+                    operation_id, action,
+                ) == "RELEASED"
+                and self._f_read_verify_client.read_marker(operation_id, action) is None)
 
     def _dependencies_fresh_set(
         self, dependencies: ControlStateAuthoritativeDependencySet,
@@ -5128,17 +5178,7 @@ class _ProtectedGateRoleRuntime:
                 or self._f_read_verify_client.read_marker(
                     continuation.operation_id, continuation.subject.value
                 ) is not None
-                or not self.authority_client.recover_release_start_held(binding)):
-            return GateResult(GateResultCode.INDETERMINATE)
-        if (type(durable) is not PreparedProtectedStart
-                or durable.prepared_start_id != continuation.prepared_start_id
-                or durable.preimage.dependencies != continuation.dependencies
-                or self._f_read_verify_client.read_prepared_effect_state(
-                    continuation.operation_id, continuation.subject.value
-                ) != "RELEASED"
-                or self._f_read_verify_client.read_marker(
-                    continuation.operation_id, continuation.subject.value
-                ) is not None):
+                or not self._f_read_verify_client.verify_start_held_target_fence(binding)):
             return GateResult(GateResultCode.INDETERMINATE)
         if not self._audit_ok(self._audit_event(
             continuation.subject.value, continuation.action_id.value,
@@ -5189,7 +5229,7 @@ class _ProtectedGateRoleRuntime:
                 or held.runtime_generation != self.binding.runtime_generation.value
                 or held.fixture_substrate_identity != self._f_read_verify_client.substrate_identity
                 or held.authority_binding_identity != expected_authority
-                or not self._f_read_verify_client.verify_start_held_target_fence(held)):
+                or not self._verify_current_start_or_consumed_exact_replay(held)):
             return None
         command = self.execute_command
         fields = (
@@ -5286,7 +5326,7 @@ class _ProtectedGateRoleRuntime:
                         or held.runtime_generation != self.binding.runtime_generation.value
                         or held.fixture_substrate_identity != self._f_read_verify_client.substrate_identity
                         or held.authority_binding_identity != authority_binding
-                        or not self._f_read_verify_client.verify_start_held_target_fence(held)
+                        or not self._verify_current_start_or_consumed_exact_replay(held)
                         or durable.preimage.dependencies != continuation.dependencies
                         or not self._dependencies_fresh_set(continuation.dependencies)):
                     return GateResult(GateResultCode.INDETERMINATE)
@@ -5517,22 +5557,111 @@ class MergeGateRuntime(_ProtectedGateRoleRuntime):
         return self._dispatch_execute(continuation, caller_context)
 
 
+def _release_fixture_observed_absence(
+    runtime: _ProtectedGateRoleRuntime,
+    recovery_authority: FixtureStartHeldRecoveryAuthority,
+    observation: GateResult,
+) -> bool:
+    """External fixture orchestration releases only an exact absent held effect."""
+    continuation = observation.continuation
+    if (observation.code is not GateResultCode.PRECONDITION_CONFLICT
+            or type(continuation) is not LiveProtectedEffectContinuation):
+        return False
+    working = runtime.read_state.read_task_working_set(continuation.intent.task_id)
+    operation = None if working is None else next((
+        item for item in working.operations
+        if item.intent.operation_id == continuation.operation_id
+    ), None)
+    companion = None if operation is None else operation.canonical_protected_start_binding
+    held = (None if type(companion) is not CanonicalProtectedStartBinding
+            else companion.start_held_target_fence_binding)
+    durable = runtime._f_read_verify_client.read_prepared_effect_record(
+        continuation.operation_id, continuation.subject.value,
+    )
+    if not (
+        type(operation) is OperationRecord
+        and operation.intent == continuation.intent
+        and operation.state is OperationState.PERFORMING
+        and operation.start_binding_id == continuation.start_binding_id
+        and type(companion) is CanonicalProtectedStartBinding
+        and companion.operation_start_binding_id == continuation.start_binding_id
+        and type(held) is StartHeldTargetFenceBinding
+        and held.prepared_start_id == continuation.prepared_start_id
+        and held.operation_id == continuation.operation_id
+        and held.action_class == continuation.subject.value
+        and type(durable) is PreparedProtectedStart
+        and durable.prepared_start_id == continuation.prepared_start_id
+        and durable.preimage.dependencies == continuation.dependencies
+        and runtime._f_read_verify_client.read_marker(
+            continuation.operation_id, continuation.subject.value,
+        ) is None
+        and runtime._f_read_verify_client.read_prepared_effect_state(
+            continuation.operation_id, continuation.subject.value,
+        ) == PreparedProtectedStartState.START_HELD.value
+        and runtime._f_read_verify_client.verify_start_held_target_fence(held)
+    ):
+        return False
+    fence = durable.fence
+    facts = {
+        ("prepared", continuation.operation_id, continuation.subject.value),
+        ("repository", fence.repository_id),
+        ("ref", fence.repository_id, fence.ref),
+    }
+    if continuation.subject is not ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION:
+        facts.add(("prs", fence.repository_id))
+    if fence.base_ref is not None:
+        facts.add(("ref", fence.repository_id, fence.base_ref))
+    recovery_token = runtime.fence_client.acquire(frozenset(facts))
+    if recovery_token is None:
+        return False
+    try:
+        current = runtime.read_state.read_task_working_set(continuation.intent.task_id)
+        current_operation = None if current is None else next((
+            item for item in current.operations
+            if item.intent.operation_id == continuation.operation_id
+        ), None)
+        current_durable = runtime._f_read_verify_client.read_prepared_effect_record(
+            continuation.operation_id, continuation.subject.value,
+        )
+        return (
+            current_operation == operation
+            and current_durable is durable
+            and runtime._f_read_verify_client.read_marker(
+                continuation.operation_id, continuation.subject.value,
+            ) is None
+            and runtime._f_read_verify_client.read_prepared_effect_state(
+                continuation.operation_id, continuation.subject.value,
+            ) == PreparedProtectedStartState.START_HELD.value
+            and runtime._f_read_verify_client.verify_start_held_target_fence(held)
+            and recovery_authority.release_proven_absent(
+                held, operation, durable, recovery_token,
+            )
+        )
+    finally:
+        runtime.fence_client.release(recovery_token)
+
+
 class _FixturePublicationGateClient:
     """T-side fixture client of an independent P runtime."""
 
-    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context")
+    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context",
+                 "_recovery_authority")
 
     def __init__(
         self, runtime: PublicationGateRuntime,
         controller: TrustedControllerRuntime,
         channel_token: object, t_context: RuntimeSecurityContext,
+        recovery_authority: FixtureStartHeldRecoveryAuthority,
     ) -> None:
         if (type(runtime) is not PublicationGateRuntime
                 or type(controller) is not TrustedControllerRuntime
                 or type(t_context) is not RuntimeSecurityContext):
             raise TypeError("exact publication gate runtime required")
         self._runtime, self._controller = runtime, controller
+        if type(recovery_authority) is not FixtureStartHeldRecoveryAuthority:
+            raise TypeError("fixture recovery authority is required by the external adapter")
         self._channel_token, self._t_context = channel_token, t_context
+        self._recovery_authority = recovery_authority
 
     def prepare_start(self, prepared):
         request = self._runtime._prepared_command_request(
@@ -5601,6 +5730,9 @@ class _FixturePublicationGateClient:
             )
         result = self._runtime.perform_publication(continuation, caller_context)
         if result.code is GateResultCode.PRECONDITION_CONFLICT and result.continuation is not None:
+            if not _release_fixture_observed_absence(
+                    self._runtime, self._recovery_authority, result):
+                return GateResult(GateResultCode.INDETERMINATE)
             return self._controller.reconcile_started_effect_absent(result)
         return result
 
@@ -5608,19 +5740,24 @@ class _FixturePublicationGateClient:
 class _FixtureMergeGateClient:
     """T-side fixture client of an independent M runtime."""
 
-    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context")
+    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context",
+                 "_recovery_authority")
 
     def __init__(
         self, runtime: MergeGateRuntime,
         controller: TrustedControllerRuntime,
         channel_token: object, t_context: RuntimeSecurityContext,
+        recovery_authority: FixtureStartHeldRecoveryAuthority,
     ) -> None:
         if (type(runtime) is not MergeGateRuntime
                 or type(controller) is not TrustedControllerRuntime
                 or type(t_context) is not RuntimeSecurityContext):
             raise TypeError("exact merge gate runtime required")
         self._runtime, self._controller = runtime, controller
+        if type(recovery_authority) is not FixtureStartHeldRecoveryAuthority:
+            raise TypeError("fixture recovery authority is required by the external adapter")
         self._channel_token, self._t_context = channel_token, t_context
+        self._recovery_authority = recovery_authority
 
     def prepare_start(self, prepared):
         request = self._runtime._prepared_command_request(
@@ -5689,6 +5826,9 @@ class _FixtureMergeGateClient:
             )
         result = self._runtime.perform_merge(continuation, caller_context)
         if result.code is GateResultCode.PRECONDITION_CONFLICT and result.continuation is not None:
+            if not _release_fixture_observed_absence(
+                    self._runtime, self._recovery_authority, result):
+                return GateResult(GateResultCode.INDETERMINATE)
             return self._controller.reconcile_started_effect_absent(result)
         return result
 
@@ -5749,16 +5889,6 @@ def operation_start_binding_id(prepared_start_id: PreparedProtectedStartId) -> O
     if type(prepared_start_id) is not PreparedProtectedStartId:
         raise TypeError("exact PreparedProtectedStartId required")
     return OperationStartBindingId(prepared_start_id.raw_sha256)
-
-
-def operation_start_binding_id_v2(
-    start_held_binding: StartHeldTargetFenceBinding,
-) -> OperationStartBindingId:
-    if type(start_held_binding) is not StartHeldTargetFenceBinding:
-        raise TypeError("exact StartHeldTargetFenceBinding required")
-    return OperationStartBindingId(RawSha256(hashlib.sha256(canonical_json_bytes((
-        "autodev.operation-start-binding/v2", start_held_binding,
-    ))).hexdigest()))
 
 
 def publication_context_is_valid(registration: AdmittedTargetRegistration,

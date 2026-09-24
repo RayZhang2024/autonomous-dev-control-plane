@@ -25,7 +25,7 @@ from autodev_control.trusted.backend import (
     canonical_json_bytes,
 )
 from autodev_control.trusted.fixture_platform import (
-    FixtureFenceConflict, FixtureGitPlatform,
+    FixtureFenceConflict, FixtureGitPlatform, FixtureStartHeldRecoveryAuthority,
     ProtectedEffectMarkerPreimage,
     PublishedCandidateRefEffectSubject, build_protected_effect_marker,
 )
@@ -41,7 +41,7 @@ from autodev_control.trusted.runtime_authority import (
 import autodev_control.trusted.gates as gates_module
 from autodev_control.trusted.identity import (
     CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId,
-    LogicalIdentifier, MutationInventoryId, PreparedProtectedStartId,
+    LogicalIdentifier, MutationInventoryId, OperationStartBindingId, PreparedProtectedStartId,
     RawSha256, RootContextId,
 )
 from autodev_control.trusted.operation import (
@@ -2161,6 +2161,29 @@ def test_publication_and_merge_runtimes_have_separate_candidate_role_slots():
     ))
 
 
+def test_start_held_recovery_authority_is_fixture_external_not_a_candidate_role():
+    value = runtime()
+    recovery = value._start_held_recovery_authority
+    assert type(recovery) is FixtureStartHeldRecoveryAuthority
+    assert "_start_held_recovery_authority" in value.__slots__
+    candidate_roles = (
+        value._trusted_controller_runtime, value._control_gate_runtime,
+        value._publication_gate_runtime, value._merge_gate_runtime,
+    )
+    for role in candidate_roles:
+        assert not hasattr(role, "recover_release_start_held")
+        assert not hasattr(role, "_start_held_recovery_authority")
+        assert all(getattr(role, slot, None) is not recovery
+                   for slot in getattr(type(role), "__slots__", ()))
+    assert not hasattr(value._publication_authority_client, "recover_release_start_held")
+    assert not hasattr(value._merge_authority_client, "recover_release_start_held")
+    assert not hasattr(value._publication_gate_runtime.authority_client,
+                       "recover_release_start_held")
+    assert not hasattr(value._merge_gate_runtime.authority_client,
+                       "recover_release_start_held")
+    assert recovery._platform is value.platform
+
+
 def test_f_read_verify_projection_exposes_only_explicit_observation_operations():
     value = runtime()
     client = value._f_read_verify_client
@@ -2735,6 +2758,93 @@ def test_candidate_t_merge_start_uses_authenticated_roles_not_legacy_runtime(mon
     assert value.platform.marker(
         merge.intent.operation_id, ProtectedEffectSubject.FAST_FORWARD_MERGE.value,
     ) is not None
+
+
+def test_canonical_protected_start_binding_enforces_exact_v2_identity():
+    value = runtime()
+    initialize_task(value)
+    materialization = adopt_recorded_candidate(value, materialize(value))
+    operation = reserve_protected(value, "canonical-start-companion-v2",
+                                  materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = value.boundary.start_protected_operation(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        ControlStateAuthoritativeDependencySet(()), all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=registration(),
+    )
+    assert started.code is GateResultCode.EFFECT_SUCCEEDED
+    stored = next(item for item in value.backend.read_task_working_set(TASK).operations
+                  if item.intent.operation_id == operation.intent.operation_id)
+    held = stored.canonical_protected_start_binding.start_held_target_fence_binding
+    expected_id = operation_start_binding_id_v2(held)
+    exact = CanonicalProtectedStartBinding(expected_id, held)
+    assert exact == stored.canonical_protected_start_binding
+    wrong_id = OperationStartBindingId(RawSha256("f" * 64))
+    assert wrong_id != expected_id
+    with pytest.raises(ValueError):
+        CanonicalProtectedStartBinding(wrong_id, held)
+
+
+@pytest.mark.parametrize("terminal_state", ("CONSUMED", "RELEASED"))
+def test_c_rejects_noncurrent_start_held_binding_but_historical_resolution_remains(
+    monkeypatch, terminal_state,
+):
+    value = runtime()
+    initialize_task(value)
+    materialization = adopt_recorded_candidate(value, materialize(value))
+    operation = reserve_protected(value, f"c-noncurrent-held-{terminal_state}",
+                                  materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    control_type = gates_module.ControlStateGateRuntime
+    original = control_type.commit_authenticated_request
+    c_results = []
+
+    def terminalize_before_c(self, request, dependencies, caller_context):
+        key = (operation.intent.operation_id,
+               ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value)
+        with value.platform._lock:
+            current = value.platform._prepared[key]
+            held = current[2]
+            assert type(held) is StartHeldTargetFenceBinding
+            value.platform._prepared[key] = (current[0], terminal_state, held)
+        result = original(self, request, dependencies, caller_context)
+        c_results.append(result.code)
+        return result
+
+    monkeypatch.setattr(control_type, "commit_authenticated_request", terminalize_before_c)
+    result = value.boundary.start_protected_operation(
+        operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION, fence,
+        ControlStateAuthoritativeDependencySet(()), all_scope(), MutationScope(()),
+        materialization=materialization, target_registration=registration(),
+    )
+    assert result.code is GateResultCode.INDETERMINATE
+    assert c_results == [GateResultCode.REJECTED]
+    stored = value.backend.read_task_working_set(TASK)
+    current_operation = next(item for item in stored.operations
+                             if item.intent.operation_id == operation.intent.operation_id)
+    assert current_operation.state is OperationState.RESERVED
+    assert current_operation.canonical_protected_start_binding is None
+    f_binding = value.platform.prepared_start_binding(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    )
+    assert type(f_binding) is StartHeldTargetFenceBinding
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == terminal_state
+    assert not value._f_read_verify_client.verify_start_held_target_fence(f_binding)
+    assert value._f_read_verify_client.resolve_historical_start_binding(f_binding)
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
 
 
 def test_candidate_t_aborts_role_prepared_record_on_semantic_denial():
