@@ -12,6 +12,7 @@ import json
 import pytest
 
 import autodev_control.trusted.gates as gates_module
+import autodev_control.trusted.runtime_roles as runtime_roles_module
 from autodev_control.trusted.authorization import (
     OrdinaryRootProtectionState,
     admit_direct_authorization,
@@ -1415,14 +1416,14 @@ def test_g8_11_semantic_veto_preserves_g4_additional_completion_fact(monkeypatch
     )
     runtime.register_completion_evaluation_context(context)
     observed = []
-    original = gates_module._compose_completion_aggregate
+    original = runtime_roles_module._compose_completion_aggregate
 
     def record_g4_additional_fact(**kwargs):
         observed.append(kwargs["additional_conditions_status"])
         return original(**kwargs)
 
     monkeypatch.setattr(
-        gates_module, "_compose_completion_aggregate", record_g4_additional_fact,
+        runtime_roles_module, "_compose_completion_aggregate", record_g4_additional_fact,
     )
     command = TaskEvaluationCommand(
         gates_fixture.TASK, context.context_id, (), (), None,

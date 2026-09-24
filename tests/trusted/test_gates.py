@@ -1,5 +1,10 @@
+import ast
 import pickle
 import inspect
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import hashlib
 from dataclasses import FrozenInstanceError, replace
@@ -39,6 +44,7 @@ from autodev_control.trusted.runtime_authority import (
     _issue_fixture_caller_context,
 )
 import autodev_control.trusted.gates as gates_module
+import autodev_control.trusted.runtime_roles as runtime_roles_module
 from autodev_control.trusted.identity import (
     CandidateMaterializationId, GitRef, GitSha, ImmutableConfigId,
     LogicalIdentifier, MutationInventoryId, OperationStartBindingId, PreparedProtectedStartId,
@@ -4179,14 +4185,14 @@ def test_issue29_leaves_each_existing_additional_completion_status_unchanged(
     )
     value.register_completion_evaluation_context(context)
     observed = []
-    original = gates_module._compose_completion_aggregate
+    original = runtime_roles_module._compose_completion_aggregate
 
     def capture_additional_status(**kwargs):
         observed.append(kwargs["additional_conditions_status"])
         return original(**kwargs)
 
     monkeypatch.setattr(
-        gates_module, "_compose_completion_aggregate", capture_additional_status,
+        runtime_roles_module, "_compose_completion_aggregate", capture_additional_status,
     )
     command = TaskEvaluationCommand(TASK, context.context_id, (), (), None)
     request = value.boundary.evaluate_task(command)
@@ -4232,7 +4238,7 @@ def test_issue29_occurrence_movement_between_current_review_and_g6_snapshot_fail
     register_zero_semantic_environment(value)
     working = value.backend.read_task_working_set(TASK)
     occurrence = working.canonical_state_occurrence_binding
-    original = gates_module.resolve_current_semantic_review
+    original = runtime_roles_module.resolve_current_semantic_review
 
     def resolve_then_advance(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -4246,7 +4252,7 @@ def test_issue29_occurrence_movement_between_current_review_and_g6_snapshot_fail
         assert advanced.status is CanonicalWriteStatus.APPLIED
         return result
 
-    monkeypatch.setattr(gates_module, "resolve_current_semantic_review", resolve_then_advance)
+    monkeypatch.setattr(runtime_roles_module, "resolve_current_semantic_review", resolve_then_advance)
     assert value._resolve_semantic_consumption(TASK, (), occurrence) is None
     assert value.backend.occurrence != occurrence
 
@@ -5203,3 +5209,46 @@ def test_recovery_fence_blocks_prepared_state_race():
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
     ).code is GateResultCode.EFFECT_FAILED
     assert len(conflicts) == 1
+
+
+def test_candidate_runtime_source_and_import_closure_excludes_fixture_platform():
+    repository = Path(__file__).resolve().parents[2]
+    runtime_source = repository / "src" / "autodev_control" / "trusted" / "runtime_roles.py"
+    tree = ast.parse(runtime_source.read_text(encoding="utf-8"))
+    forbidden_modules = {"fixture_platform", "autodev_control.trusted.fixture_platform"}
+    forbidden_symbols = {
+        "FixtureGitPlatform", "ActiveFixtureRuntimeRegistry",
+        "FixtureStartHeldRecoveryAuthority",
+    }
+    imported_modules = set()
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_modules.add(alias.name)
+                imported_names.add(alias.name.rsplit(".", 1)[-1])
+        elif isinstance(node, ast.ImportFrom):
+            imported_modules.add(node.module or "")
+            imported_names.update(alias.name for alias in node.names)
+    assert not (forbidden_modules & imported_modules)
+    assert not (forbidden_symbols & imported_names)
+    referenced_names = {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
+    assert not (forbidden_symbols & referenced_names)
+
+    code = (
+        "import importlib, sys; "
+        "module = importlib.import_module('autodev_control.trusted.runtime_roles'); "
+        "assert 'autodev_control.trusted.fixture_platform' not in sys.modules; "
+        "assert all(getattr(module, name).__module__ == module.__name__ for name in "
+        "('TrustedControllerRuntime', 'ControlStateGateRuntime', "
+        "'PublicationGateRuntime', 'MergeGateRuntime'))"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", code], cwd=repository, env=environment,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr

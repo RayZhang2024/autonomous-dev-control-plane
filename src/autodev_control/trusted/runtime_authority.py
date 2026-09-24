@@ -11,9 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-from typing import Protocol, runtime_checkable
+from typing import ContextManager, Protocol, runtime_checkable
 
-from .backend import canonical_json_bytes
+from .backend import CanonicalStateReadClient, canonical_json_bytes
 from .identity import (
     CandidateMaterializationId, GateRuntimeBindingId, OperationStartBindingId,
     PreparedProtectedStartId, RawSha256, RootContextId,
@@ -443,6 +443,59 @@ class GateRoleFenceClient(Protocol):
     def acquire(self, facts: frozenset[tuple]) -> object | None: ...
 
     def release(self, token: object) -> None: ...
+
+
+@runtime_checkable
+class RoleFenceHandle(Protocol):
+    """Opaque active handle returned only by a role-scoped fence client."""
+
+    @property
+    def active(self) -> bool: ...
+
+
+@runtime_checkable
+class RuntimeRoleRegistry(Protocol):
+    """Narrow C-local lease/liveness contract; excludes fixture administration."""
+
+    @property
+    def lock(self) -> ContextManager[object]: ...
+
+    def is_role_active(
+        self, root_context_id: RootContextId, runtime_generation: int,
+        role: str, owner: object,
+    ) -> bool: ...
+
+    def acquire(self, owner: object, facts: frozenset[tuple]) -> RoleFenceHandle | None: ...
+
+    def release(self, handle: RoleFenceHandle) -> None: ...
+
+
+@runtime_checkable
+class CanonicalStateWriterClient(Protocol):
+    """Canonical-state write surface required by C, independent of its backend."""
+
+    @property
+    def occurrence(self) -> object: ...
+
+    def apply(self, transaction: object) -> object: ...
+
+
+@runtime_checkable
+class CandidateObjectStore(Protocol):
+    """Read-only trusted object-store operations required for candidate truth."""
+
+    @property
+    def repository_id(self) -> object: ...
+
+    @property
+    def provider_failure(self) -> bool: ...
+
+    @property
+    def observation_instance_id(self) -> RawSha256: ...
+
+    def commit(self, identity: object) -> object | None: ...
+
+    def tree(self, identity: object) -> object | None: ...
 
 
 @runtime_checkable
