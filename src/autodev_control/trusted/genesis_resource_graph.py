@@ -89,6 +89,20 @@ _CONFIG_BINDING_FIELDS = (
     "schema_resource",
     "grammar_id",
 )
+_CONFIG_PURPOSE_FORMATS = {
+    "GENESIS_RESOURCE_GRAPH": GENESIS_RESOURCE_GRAPH_FORMAT,
+    "MODULE_LOADING_POLICY": _MODULE_POLICY_FORMAT,
+    **{
+        f"{purpose}:{role}": format_id
+        for purpose, format_id in (
+            ("ENTRY_POINT_CONFIG", _ENTRY_FORMAT),
+            ("SECURITY_CONTEXT_CONFIG", _SECURITY_FORMAT),
+            ("CAPABILITY_WIRING", _WIRING_FORMAT),
+            ("CREDENTIAL_ROUTING", _CREDENTIAL_FORMAT),
+        )
+        for role in _ROLES
+    },
+}
 _BASE_CHANNEL_FIELDS = (
     "channel_id",
     "source_role",
@@ -562,6 +576,44 @@ def _check_module_policy(value: object) -> GenesisResourceGraphFailure | None:
     return None
 
 
+def _check_config_binding_mirrors(
+    config_values: dict[str, MappingProxyType],
+    bindings: object,
+    members: dict[str, MappingProxyType],
+    entry_values: dict[str, MappingProxyType],
+    contexts: dict[str, MappingProxyType],
+    wirings: dict[str, MappingProxyType],
+    credentials: dict[str, MappingProxyType],
+    module_policy: MappingProxyType,
+) -> GenesisResourceGraphFailure | None:
+    """Require every generic config to be the exact value checked by its consumer."""
+    if not _array(bindings):
+        return _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
+    for binding in bindings:
+        purpose = binding["purpose"]
+        resource_id = binding["resource_id"]
+        actual = config_values.get(resource_id)
+        if actual is None:
+            return _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
+        if purpose == "GENESIS_RESOURCE_GRAPH":
+            expected = config_values.get(resource_id)
+        elif purpose == "MODULE_LOADING_POLICY":
+            expected = module_policy
+        else:
+            prefix, role = purpose.split(":", 1)
+            member = members[role]
+            resource_field, value_map = {
+                "ENTRY_POINT_CONFIG": ("entry_point_config_resource", entry_values),
+                "SECURITY_CONTEXT_CONFIG": ("security_context_config_resource", contexts),
+                "CAPABILITY_WIRING": ("capability_wiring_resource", wirings),
+                "CREDENTIAL_ROUTING": ("credential_routing_resource", credentials),
+            }[prefix]
+            expected = value_map.get(member[resource_field])
+        if expected is None or actual != expected:
+            return _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
+    return None
+
+
 def _check_lock(
     value: object,
     manifest_resources: dict[str, RootManagedResourceRef],
@@ -705,6 +757,7 @@ def _parse_config_bindings(
     seen_configs: set[str] = set()
     seen_resources: set[str] = set()
     parsed_by_resource: dict[str, MappingProxyType] = {}
+    purpose_by_resource: dict[str, str] = {}
     used_schema_ids: set[str] = set()
     declared_pairs: set[tuple[str, str]] = set()
     for binding in value:
@@ -718,23 +771,28 @@ def _parse_config_bindings(
         seen_configs.add(config_id)
         seen_resources.add(resource_id)
         declared_pairs.add((config_id, resource_id))
-        if not _text(binding["purpose"]) or not _text(binding["expected_format"]):
+        purpose = binding["purpose"]
+        expected_format = binding["expected_format"]
+        if (
+            not _text(purpose, identifier=True)
+            or purpose not in _CONFIG_PURPOSE_FORMATS
+            or not _text(expected_format, identifier=True)
+            or expected_format != _CONFIG_PURPOSE_FORMATS[purpose]
+            or purpose in purpose_by_resource.values()
+        ):
             return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
         schema_resource = binding["schema_resource"]
         grammar_id = binding["grammar_id"]
-        if schema_resource is None:
-            if (
-                not _text(grammar_id, identifier=True)
-                or grammar_id != binding["expected_format"]
-            ):
-                return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
-        else:
-            if not _text(schema_resource, identifier=True) or grammar_id is not None:
-                return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_FORMAT_INVALID)
-            schema_ref = resources.get(schema_resource)
-            if schema_ref is None or schema_ref.kind is not RootManagedResourceKind.TRUSTED_SCHEMA:
-                return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_RESOURCE_KIND_MISMATCH)
-            used_schema_ids.add(schema_resource)
+        # R4 accepts only grammar identities for which this module executes a
+        # closed deterministic validator. Schema resources remain independently
+        # closed by the manifest/graph sets and raw digest checks below; a schema
+        # declaration is not treated as validation merely because its bytes exist.
+        if (
+            schema_resource is not None
+            or not _text(grammar_id, identifier=True)
+            or grammar_id != expected_format
+        ):
+            return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
         config_ref = resources.get(resource_id)
         if config_ref is None:
             return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_RESOURCE_MISSING)
@@ -748,26 +806,43 @@ def _parse_config_bindings(
         if type(parsed) is GenesisResourceGraphFailure:
             return {}, set(), parsed
         parsed_by_resource[resource_id] = parsed[1].value
+        purpose_by_resource[resource_id] = purpose
         if (
             type(parsed[1].value) is not MappingProxyType
-            or parsed[1].value.get("format") != binding["expected_format"]
+            or parsed[1].value.get("format") != expected_format
         ):
             return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
-        if config_id == GENESIS_RESOURCE_GRAPH_CONFIG_ID and (
-            binding["purpose"] != "GENESIS_RESOURCE_GRAPH"
-            or binding["expected_format"] != GENESIS_RESOURCE_GRAPH_FORMAT
-            or (
-                schema_resource is None
-                and grammar_id != GENESIS_RESOURCE_GRAPH_FORMAT
-            )
-            or (
-                schema_resource is not None
-                and grammar_id is not None
-            )
-        ):
+        if (config_id == GENESIS_RESOURCE_GRAPH_CONFIG_ID) != (purpose == "GENESIS_RESOURCE_GRAPH"):
+            return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
+        closed_fields = {
+            "GENESIS_RESOURCE_GRAPH": _GRAPH_FIELDS,
+            "MODULE_LOADING_POLICY": (
+                "format", "allowed_candidate_modules", "explicitly_excluded_modules_or_prefixes",
+                "third_party_runtime_policy", "dynamic_import_fallback",
+            ),
+        }
+        for role in _ROLES:
+            closed_fields.update({
+                f"ENTRY_POINT_CONFIG:{role}": ("format", "role", "member_id", "runtime_artifact_resource", "module", "callable"),
+                f"SECURITY_CONTEXT_CONFIG:{role}": (
+                    "format", "role", "member_id", "context_id", "service_principal", "runtime_binding",
+                    "runtime_generation_binding", "root_context_binding", "external_isolation_dependency_id", "channels",
+                ),
+                f"CAPABILITY_WIRING:{role}": (
+                    "format", "role", "member_id", "canonical_state_access", "canonical_state_binding",
+                    "f_read_verify_binding", "target_fence_binding", "publication_authority_binding",
+                    "merge_authority_binding", "external_recovery_binding",
+                ),
+                f"CREDENTIAL_ROUTING:{role}": (
+                    "format", "role", "member_id", "production_github_mutation_credentials",
+                ),
+            })
+        if not _fields(parsed[1].value, closed_fields[purpose]):
             return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
     if declared_pairs != manifest_pairs or seen_resources != {resource for _, resource in manifest_pairs}:
         return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH)
+    if GENESIS_RESOURCE_GRAPH_CONFIG_ID not in seen_configs:
+        return {}, set(), _failure(GenesisResourceGraphFailureCode.GRAPH_CONFIG_MISSING)
     return parsed_by_resource, used_schema_ids, None
 
 
@@ -1042,7 +1117,7 @@ def validate_genesis_resource_graph(
     )
     if config_failure is not None:
         return config_failure
-    if used_schema_ids != set(schema_ids):
+    if not used_schema_ids.issubset(set(schema_ids)):
         return _failure(GenesisResourceGraphFailureCode.GRAPH_SCHEMA_SET_MISMATCH)
 
     module_value = _load_member_resource(
@@ -1103,6 +1178,18 @@ def validate_genesis_resource_graph(
     credential_failure = _check_credentials(credentials, members)
     if credential_failure is not None:
         return credential_failure
+    mirror_failure = _check_config_binding_mirrors(
+        config_values,
+        graph["trusted_config_bindings"],
+        members,
+        entry_values,
+        contexts,
+        wirings,
+        credentials,
+        module_value,
+    )
+    if mirror_failure is not None:
+        return mirror_failure
 
     lock_loaded = _load_lock(
         graph["dependency_lock_resource"], raw_resources, resources

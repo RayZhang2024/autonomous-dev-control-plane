@@ -60,6 +60,8 @@ def _fixture(
     fixture_binding_change: Callable[[dict[str, str]], None] | None = None,
     manifest_change: Callable[[dict[str, object]], None] | None = None,
     include_schema: bool = False,
+    standalone_schema_ids: tuple[str, ...] = (),
+    extra_config: tuple[str, str, dict[str, object]] | None = None,
     extra_resources: tuple[tuple[str, str, bytes], ...] = (),
 ) -> tuple[CandidateTrustedManifest, dict[str, bytes], dict[str, object]]:
     raw: dict[str, bytes] = {
@@ -79,9 +81,10 @@ def _fixture(
         "conformance": "POLICY",
         "graph": "TRUSTED_CONFIG",
     }
-    if include_schema:
-        raw["schema"] = b'{"type":"object"}'
-        resource_kinds["schema"] = "TRUSTED_SCHEMA"
+    schema_ids = standalone_schema_ids or (("schema",) if include_schema else ())
+    for schema_id in schema_ids:
+        raw[schema_id] = _json_bytes({"uninterpreted_trusted_schema_resource": schema_id})
+        resource_kinds[schema_id] = "TRUSTED_SCHEMA"
     for resource_id, kind, data in extra_resources:
         resource_kinds[resource_id] = kind
         raw[resource_id] = data
@@ -240,6 +243,25 @@ def _fixture(
     }
     raw["lock"] = _json_bytes(lock)
 
+    extra_config_binding: dict[str, object] | None = None
+    extra_config_manifest_binding: dict[str, str] | None = None
+    if extra_config is not None:
+        extra_config_id, purpose, config_value = extra_config
+        raw[extra_config_id] = _json_bytes(config_value)
+        resource_kinds[extra_config_id] = "TRUSTED_CONFIG"
+        extra_config_binding = {
+            "config_id": f"generic-{extra_config_id}",
+            "resource_id": extra_config_id,
+            "purpose": purpose,
+            "expected_format": config_value["format"],
+            "schema_resource": None,
+            "grammar_id": config_value["format"],
+        }
+        extra_config_manifest_binding = {
+            "config_id": f"generic-{extra_config_id}",
+            "resource": extra_config_id,
+        }
+
     graph: dict[str, object] = {
         "format": "autodev.genesis-resource-graph/v1",
         "genesis_scope": "fixture-only",
@@ -252,17 +274,19 @@ def _fixture(
         "genesis_conformance_resource": "conformance",
         "members": members,
         "policy_resources": ["conformance"],
-        "trusted_schema_resources": ["schema"] if include_schema else [],
+        "trusted_schema_resources": list(schema_ids),
         "trusted_config_bindings": [{
             "config_id": GENESIS_RESOURCE_GRAPH_CONFIG_ID,
             "resource_id": "graph",
             "purpose": "GENESIS_RESOURCE_GRAPH",
             "expected_format": "autodev.genesis-resource-graph/v1",
-            "schema_resource": "schema" if include_schema else None,
-            "grammar_id": None if include_schema else "autodev.genesis-resource-graph/v1",
+            "schema_resource": None,
+            "grammar_id": "autodev.genesis-resource-graph/v1",
         }],
         "external_tcb_roles": external_roles,
     }
+    if extra_config_binding is not None:
+        graph["trusted_config_bindings"].append(extra_config_binding)
     if graph_change is not None:
         graph_change(graph)
     if resource_change is not None:
@@ -296,8 +320,11 @@ def _fixture(
             }
             for role in ("T", "C", "P", "M")
         ],
-        "trusted_schemas": ["schema"] if include_schema else [],
-        "trusted_configs": [{"config_id": GENESIS_RESOURCE_GRAPH_CONFIG_ID, "resource": "graph"}],
+        "trusted_schemas": list(schema_ids),
+        "trusted_configs": [
+            {"config_id": GENESIS_RESOURCE_GRAPH_CONFIG_ID, "resource": "graph"},
+            *([extra_config_manifest_binding] if extra_config_manifest_binding is not None else []),
+        ],
         "external_tcb_dependencies": [
             {"dependency_id": dep, "assumption_resource": assumption}
             for dep, assumption in assumption_ids.values()
@@ -360,6 +387,90 @@ def test_exact_synthetic_graph_with_all_resource_contents_is_accepted_and_non_be
         result.manifest_id = manifest.manifest_id
     with pytest.raises(TypeError):
         ValidatedGenesisResourceGraph()
+
+
+def test_standalone_issue_and_review_schemas_are_closed_without_config_bindings() -> None:
+    manifest, raw, _ = _fixture(
+        standalone_schema_ids=("issue-contract-schema", "review-verdict-schema")
+    )
+    result = validate_genesis_resource_graph(manifest, raw)
+    assert type(result) is ValidatedGenesisResourceGraph
+    assert {item.value for item in result.consumed_resource_ids} >= {
+        "issue-contract-schema", "review-verdict-schema",
+    }
+
+
+def test_generic_entry_point_config_uses_its_closed_consumer_grammar() -> None:
+    generic_entry = {
+        "format": "autodev.genesis-entry-point/v1",
+        "role": "T",
+        "member_id": "T",
+        "runtime_artifact_resource": "runtime",
+        "module": "autodev_control.role_t",
+        "callable": "run_t",
+    }
+    manifest, raw, _ = _fixture(
+        extra_config=("generic-entry-T", "ENTRY_POINT_CONFIG:T", generic_entry)
+    )
+    assert type(validate_genesis_resource_graph(manifest, raw)) is ValidatedGenesisResourceGraph
+
+
+def test_generic_config_matching_format_but_with_unknown_security_field_is_rejected() -> None:
+    generic_entry = {
+        "format": "autodev.genesis-entry-point/v1",
+        "role": "T",
+        "member_id": "T",
+        "runtime_artifact_resource": "runtime",
+        "module": "autodev_control.role_t",
+        "callable": "run_t",
+        "security_override": "disable-checks",
+    }
+    _failure(
+        _fixture(extra_config=("generic-entry-T", "ENTRY_POINT_CONFIG:T", generic_entry)),
+        GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH,
+    )
+
+
+def test_generic_config_with_valid_grammar_but_disagreeing_consumer_value_is_rejected() -> None:
+    generic_entry = {
+        "format": "autodev.genesis-entry-point/v1",
+        "role": "T",
+        "member_id": "T",
+        "runtime_artifact_resource": "runtime",
+        "module": "autodev_control.role_t",
+        "callable": "alternate_run",
+    }
+    _failure(
+        _fixture(extra_config=("generic-entry-T", "ENTRY_POINT_CONFIG:T", generic_entry)),
+        GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH,
+    )
+
+
+def test_unvalidated_schema_declaration_cannot_stand_in_for_config_grammar() -> None:
+    def declare_schema_for_generic_config(graph: dict[str, object]) -> None:
+        graph["trusted_schema_resources"] = ["schema"]
+        binding = next(
+            item for item in graph["trusted_config_bindings"]
+            if item["resource_id"] == "generic-entry-T"
+        )
+        binding["schema_resource"] = "schema"
+        binding["grammar_id"] = None
+
+    _failure(
+        _fixture(
+            include_schema=True,
+            graph_change=declare_schema_for_generic_config,
+            extra_config=("generic-entry-T", "ENTRY_POINT_CONFIG:T", {
+                "format": "autodev.genesis-entry-point/v1",
+                "role": "T",
+                "member_id": "T",
+                "runtime_artifact_resource": "runtime",
+                "module": "autodev_control.role_t",
+                "callable": "run_t",
+            }),
+        ),
+        GenesisResourceGraphFailureCode.GRAPH_CONFIG_SET_MISMATCH,
+    )
 
 
 def test_missing_reserved_graph_binding_fails_closed() -> None:
@@ -625,6 +736,7 @@ def test_target_fence_binding_is_required_and_role_scoped(role: str) -> None:
 @pytest.mark.parametrize("role,wrong_fence", [
     ("P", "endpoint-m-fence"),
     ("M", "endpoint-p-fence"),
+    ("M", "NONE"),
 ])
 def test_target_fences_cannot_be_crossed_between_p_and_m(role: str, wrong_fence: str) -> None:
     def change(configs: dict[str, dict[str, object]]) -> None:
