@@ -207,7 +207,7 @@ class FixtureProtectedGateRuntime:
     __slots__ = ("binding", "backend", "platform", "audit", "controller", "boundary",
                  "registry", "_lock", "_nonce", "_controller_key", "_t_context", "_c_context",
                  "_p_context", "_m_context", "_f_read_verify_client", "_publication_authority_client",
-                 "_merge_authority_client", "_start_held_recovery_authority", "_t_to_c_channel_token", "_t_to_p_channel_token",
+                 "_merge_authority_client", "_start_held_recovery_authority", "_recovery_coordinator", "_t_to_c_channel_token", "_t_to_p_channel_token",
                  "_t_to_m_channel_token", "_profiles", "_readers", "_fixture_transports", "_contract_contexts", "_authorization_contexts", "_evidence_contexts", "_completion_contexts", "_semantic_contexts", "_object_store", "_control", "_publication", "_merge", "_control_runtime", "_publication_runtime", "_merge_runtime", "_control_gate_runtime", "_trusted_controller_runtime", "_publication_gate_runtime", "_merge_gate_runtime", "_fail_after_start", "_recovery_fence_hook", "_post_start_audit_failure_hook")
 
     def __init__(self, binding: GateRuntimeBinding, backend: InMemoryCanonicalStateBackend,
@@ -224,6 +224,9 @@ class FixtureProtectedGateRuntime:
         self._publication_authority_client = platform.publication_authority_client()
         self._merge_authority_client = platform.merge_authority_client()
         self._start_held_recovery_authority = platform.fixture_start_held_recovery_authority()
+        self._recovery_coordinator = FixtureRecoveryCoordinator(
+            self, self._start_held_recovery_authority,
+        )
         self.registry = registry or ActiveFixtureRuntimeRegistry()
         self.platform.attach_registry(self.registry)
         self._lock, self._nonce = self.registry.lock, object()
@@ -344,17 +347,15 @@ class FixtureProtectedGateRuntime:
     @property
     def publication_gate_client(self) -> PublicationGateClient:
         return _FixturePublicationGateClient(
-            self._publication_gate_runtime, self._trusted_controller_runtime,
-            self._t_to_p_channel_token, self._t_context,
-            self._start_held_recovery_authority,
+            self._publication_gate_runtime, self._t_to_p_channel_token,
+            self._t_context,
         )
 
     @property
     def merge_gate_client(self) -> MergeGateClient:
         return _FixtureMergeGateClient(
-            self._merge_gate_runtime, self._trusted_controller_runtime,
-            self._t_to_m_channel_token, self._t_context,
-            self._start_held_recovery_authority,
+            self._merge_gate_runtime, self._t_to_m_channel_token,
+            self._t_context,
         )
 
     @property
@@ -2476,27 +2477,51 @@ def _release_fixture_observed_absence(
         runtime.fence_client.release(recovery_token)
 
 
+class FixtureRecoveryCoordinator:
+    """External fixture orchestration for absence proof and held-lease release.
+
+    This coordinator is owned by the composition harness. It is deliberately
+    absent from T/P/M role objects and their ordinary invocation clients.
+    """
+
+    __slots__ = ("_runtime", "_recovery_authority")
+
+    def __init__(
+        self, runtime: FixtureProtectedGateRuntime,
+        recovery_authority: FixtureStartHeldRecoveryAuthority,
+    ) -> None:
+        if (type(runtime) is not FixtureProtectedGateRuntime
+                or type(recovery_authority) is not FixtureStartHeldRecoveryAuthority):
+            raise TypeError("exact fixture recovery coordinator inputs required")
+        self._runtime, self._recovery_authority = runtime, recovery_authority
+
+    def release_proven_absence(self, observation: GateResult) -> bool:
+        continuation = getattr(observation, "continuation", None)
+        if type(continuation) is not LiveProtectedEffectContinuation:
+            return False
+        if continuation.subject is ProtectedEffectSubject.FAST_FORWARD_MERGE:
+            role_runtime = self._runtime._merge_gate_runtime
+        else:
+            role_runtime = self._runtime._publication_gate_runtime
+        return _release_fixture_observed_absence(
+            role_runtime, self._recovery_authority, observation,
+        )
+
+
 class _FixturePublicationGateClient:
     """T-side fixture client of an independent P runtime."""
 
-    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context",
-                 "_recovery_authority")
+    __slots__ = ("_runtime", "_channel_token", "_t_context")
 
     def __init__(
         self, runtime: PublicationGateRuntime,
-        controller: TrustedControllerRuntime,
         channel_token: object, t_context: RuntimeSecurityContext,
-        recovery_authority: FixtureStartHeldRecoveryAuthority,
     ) -> None:
         if (type(runtime) is not PublicationGateRuntime
-                or type(controller) is not TrustedControllerRuntime
                 or type(t_context) is not RuntimeSecurityContext):
             raise TypeError("exact publication gate runtime required")
-        self._runtime, self._controller = runtime, controller
-        if type(recovery_authority) is not FixtureStartHeldRecoveryAuthority:
-            raise TypeError("fixture recovery authority is required by the external adapter")
+        self._runtime = runtime
         self._channel_token, self._t_context = channel_token, t_context
-        self._recovery_authority = recovery_authority
 
     def prepare_start(self, prepared):
         request = self._runtime._prepared_command_request(
@@ -2564,35 +2589,23 @@ class _FixturePublicationGateClient:
                 self._channel_token, self._t_context, request.request_digest,
             )
         result = self._runtime.perform_publication(continuation, caller_context)
-        if result.code is GateResultCode.PRECONDITION_CONFLICT and result.continuation is not None:
-            if not _release_fixture_observed_absence(
-                    self._runtime, self._recovery_authority, result):
-                return GateResult(GateResultCode.INDETERMINATE)
-            return self._controller.reconcile_started_effect_absent(result)
         return result
 
 
 class _FixtureMergeGateClient:
     """T-side fixture client of an independent M runtime."""
 
-    __slots__ = ("_runtime", "_controller", "_channel_token", "_t_context",
-                 "_recovery_authority")
+    __slots__ = ("_runtime", "_channel_token", "_t_context")
 
     def __init__(
         self, runtime: MergeGateRuntime,
-        controller: TrustedControllerRuntime,
         channel_token: object, t_context: RuntimeSecurityContext,
-        recovery_authority: FixtureStartHeldRecoveryAuthority,
     ) -> None:
         if (type(runtime) is not MergeGateRuntime
-                or type(controller) is not TrustedControllerRuntime
                 or type(t_context) is not RuntimeSecurityContext):
             raise TypeError("exact merge gate runtime required")
-        self._runtime, self._controller = runtime, controller
-        if type(recovery_authority) is not FixtureStartHeldRecoveryAuthority:
-            raise TypeError("fixture recovery authority is required by the external adapter")
+        self._runtime = runtime
         self._channel_token, self._t_context = channel_token, t_context
-        self._recovery_authority = recovery_authority
 
     def prepare_start(self, prepared):
         request = self._runtime._prepared_command_request(
@@ -2660,9 +2673,4 @@ class _FixtureMergeGateClient:
                 self._channel_token, self._t_context, request.request_digest,
             )
         result = self._runtime.perform_merge(continuation, caller_context)
-        if result.code is GateResultCode.PRECONDITION_CONFLICT and result.continuation is not None:
-            if not _release_fixture_observed_absence(
-                    self._runtime, self._recovery_authority, result):
-                return GateResult(GateResultCode.INDETERMINATE)
-            return self._controller.reconcile_started_effect_absent(result)
         return result

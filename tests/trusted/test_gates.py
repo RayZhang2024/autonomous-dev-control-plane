@@ -2172,6 +2172,10 @@ def test_start_held_recovery_authority_is_fixture_external_not_a_candidate_role(
     recovery = value._start_held_recovery_authority
     assert type(recovery) is FixtureStartHeldRecoveryAuthority
     assert "_start_held_recovery_authority" in value.__slots__
+    coordinator = value._recovery_coordinator
+    assert type(coordinator) is FixtureRecoveryCoordinator
+    assert coordinator._recovery_authority is recovery
+    assert "_recovery_authority" in coordinator.__slots__
     candidate_roles = (
         value._trusted_controller_runtime, value._control_gate_runtime,
         value._publication_gate_runtime, value._merge_gate_runtime,
@@ -2187,6 +2191,15 @@ def test_start_held_recovery_authority_is_fixture_external_not_a_candidate_role(
                        "recover_release_start_held")
     assert not hasattr(value._merge_gate_runtime.authority_client,
                        "recover_release_start_held")
+    for client in (value.publication_gate_client, value.merge_gate_client):
+        assert "_recovery_authority" not in client.__slots__
+        assert "_controller" not in client.__slots__
+        assert not hasattr(client, "_recovery_authority")
+        assert not hasattr(client, "_recovery_coordinator")
+        assert all(getattr(client, slot, None) is not recovery
+                   for slot in client.__slots__)
+        assert not hasattr(client._runtime, "_start_held_recovery_authority")
+        assert not hasattr(client._runtime, "_recovery_coordinator")
     assert recovery._platform is value.platform
 
 
@@ -3864,7 +3877,7 @@ def test_target_effect_audit_failure_preserves_marker_and_restart_reconciles_wit
     ).code is GateResultCode.LEASE_INVALID
 
 
-def test_post_start_target_conflict_proves_absence_releases_and_reconciles_failed():
+def test_post_start_target_conflict_requires_external_release_then_t_reconciliation():
     value = runtime()
     initialize_task(value)
     materialization = materialize(value)
@@ -3877,11 +3890,38 @@ def test_post_start_target_conflict_proves_absence_releases_and_reconciles_faile
     value.platform.fail_next_effect_for_test()
     result = TargetPublicationGate(value.publication_gate_client).perform(started.continuation)
     assert result.code is GateResultCode.PRECONDITION_CONFLICT
+    assert result.continuation == started.continuation
     assert value.platform.read_ref(REPO, materialization.candidate_branch) is None
     assert value.platform.prepared_effect_state(
         operation.intent.operation_id,
         ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) == "START_HELD"
+    assert value.platform.marker(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
+    ) is None
+    stored = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert stored.state is OperationState.PERFORMING
+
+    # Only fixture orchestration can release after its independent exact
+    # absence/fence proof; the ordinary T→P client merely returned P's result.
+    assert value._recovery_coordinator.release_proven_absence(result)
+    assert value.platform.prepared_effect_state(
+        operation.intent.operation_id,
+        ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION.value,
     ) == "RELEASED"
+    still_performing = next(
+        item for item in value.backend.read_task_working_set(TASK).operations
+        if item.intent.operation_id == operation.intent.operation_id
+    )
+    assert still_performing.state is OperationState.PERFORMING
+
+    # T decides the terminal consequence and commits it through authenticated C.
+    reconciled = value._trusted_controller_runtime.reconcile_started_effect_absent(result)
+    assert reconciled.code is GateResultCode.PRECONDITION_CONFLICT
     stored = next(
         item for item in value.backend.read_task_working_set(TASK).operations
         if item.intent.operation_id == operation.intent.operation_id
