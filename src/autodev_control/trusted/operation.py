@@ -4,11 +4,16 @@ These values are candidate trusted source only.  They neither persist state nor
 grant permission to perform an external effect.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 
 from .errors import G4Failure, G4FailureCode
-from .identity import GitRef, OperationStartBindingId, RawSha256
+from .identity import (
+    GitRef, OperationStartBindingId, PreparedProtectedStartId, RawSha256,
+    RootContextId,
+)
 from .manifest import PolicyEpochIdentity
 from .scope import AuthorizationId, ContractId, TargetRegistrationId, TaskId
 
@@ -327,6 +332,7 @@ class OperationRecord:
     state: OperationState
     reason_code: G4FailureCode | None = None
     start_binding_id: OperationStartBindingId | None = None
+    canonical_protected_start_binding: CanonicalProtectedStartBinding | None = None
 
     def __post_init__(self) -> None:
         if type(self.intent) is not OperationIntent:
@@ -338,11 +344,65 @@ class OperationRecord:
             raise TypeError("reason_code must be exact G4FailureCode or None")
         if self.start_binding_id is not None and type(self.start_binding_id) is not OperationStartBindingId:
             raise TypeError("start_binding_id must be exact OperationStartBindingId or None")
+        if (self.canonical_protected_start_binding is not None
+                and type(self.canonical_protected_start_binding) is not CanonicalProtectedStartBinding):
+            raise TypeError("canonical protected start binding must be exact or None")
+        if (self.canonical_protected_start_binding is not None
+                and self.canonical_protected_start_binding.operation_start_binding_id
+                != self.start_binding_id):
+            raise ValueError("canonical protected start binding identity differs from operation")
         if self.state in (OperationState.RESERVED, OperationState.CONFLICT):
             if self.start_binding_id is not None:
                 raise ValueError("non-started operation cannot carry a start binding")
         elif self.start_binding_id is None:
             raise ValueError("started operation must preserve its start binding")
+
+
+@dataclass(frozen=True, slots=True)
+class StartHeldTargetFenceBinding:
+    """Immutable exact F authority retained as the canonical start preimage."""
+
+    format: str
+    fixture_substrate_identity: RawSha256
+    authority_binding_identity: RawSha256
+    operation_id: OperationId
+    action_class: str
+    target_fence_identity: RawSha256
+    prepared_start_id: PreparedProtectedStartId
+    start_hold_identity: RawSha256
+    root_context_id: RootContextId
+    runtime_generation: int
+    fence_generation: int
+
+    def __post_init__(self) -> None:
+        if self.format != "autodev.start-held-target-fence-binding/v1":
+            raise ValueError("unsupported start-held binding format")
+        if any(type(v) is not RawSha256 for v in (
+            self.fixture_substrate_identity, self.authority_binding_identity,
+            self.target_fence_identity, self.start_hold_identity,
+        )):
+            raise TypeError("start-held digests must be exact RawSha256")
+        if type(self.operation_id) is not OperationId or type(self.action_class) is not str or not self.action_class:
+            raise TypeError("start-held operation identity is malformed")
+        if type(self.prepared_start_id) is not PreparedProtectedStartId:
+            raise TypeError("start-held prepared id must be exact")
+        if type(self.root_context_id) is not RootContextId:
+            raise TypeError("start-held root must be exact")
+        if (type(self.runtime_generation) is not int or self.runtime_generation < 1
+                or type(self.fence_generation) is not int or self.fence_generation < 1):
+            raise ValueError("start-held generations must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalProtectedStartBinding:
+    operation_start_binding_id: OperationStartBindingId
+    start_held_target_fence_binding: StartHeldTargetFenceBinding
+
+    def __post_init__(self) -> None:
+        if type(self.operation_start_binding_id) is not OperationStartBindingId:
+            raise TypeError("canonical start identity must be exact")
+        if type(self.start_held_target_fence_binding) is not StartHeldTargetFenceBinding:
+            raise TypeError("canonical companion requires exact full F binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,7 +503,7 @@ def transition_operation(
         return OperationRevisionResult(failure=G4Failure(G4FailureCode.INVALID_OPERATION_TRANSITION))
     proposed = OperationRecord(
         operation.intent, operation.revision + 1, target_state, reason_code,
-        operation.start_binding_id,
+        operation.start_binding_id, operation.canonical_protected_start_binding,
     )
     return OperationRevisionResult(OperationRevisionProposal(operation.revision, proposed))
 
