@@ -9,12 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
-import secrets
 from threading import RLock
 
 from .audit import (
-    AuditAppendStatus, FixtureGateAudit, GateAuditAuthoritativeDependency,
+    AuditAppendStatus, GateAuditAuthoritativeDependency,
     GateAuditEventPreimage, GateAuditOutcome, build_gate_audit_event,
+)
+from .fixture_audit import FixtureGateAudit
+from .fixture_capabilities import (
+    ControlStateCapability, MergeCapability, TargetPublicationCapability,
+    mint_fixture_capability as _mint_capability,
 )
 from .backend import (
     AuthorizationExistsAndMatches, CanonicalNamespace, CanonicalTransaction,
@@ -109,9 +113,10 @@ from .runtime_authority import (
     GateRoleFenceClient as GateRoleFenceContract,
     CanonicalStartReadClient as CanonicalStartReadContract,
     GateAuditClient as GateAuditContract,
-    _issue_fixture_caller_context, runtime_context_identity,
+    runtime_context_identity,
     FixtureReadVerifyClient,
 )
+from .fixture_transport import issue_fixture_caller_context as _issue_fixture_caller_context
 from .state_reader import (
     AuthoritativeObservationProfile, AuthoritativeStateSnapshot,
     GitHubPullRequestNumber, GitHubStateReader, RegisteredStateFactDescriptor,
@@ -197,7 +202,7 @@ from .target_registration import AdmittedTargetRegistration
 from .runtime_roles import *
 from .runtime_roles import (
     _DeterministicStartDenied, _TaskSemanticDenied, _canonical_semantic_dependency_union,
-    _mint_capability, _new_controller,
+    _new_controller,
 )
 
 
@@ -287,7 +292,7 @@ class FixtureProtectedGateRuntime:
         if not activated:
             raise RuntimeError("cannot replace active runtime while a gate lease is live")
         self._control_gate_runtime = ControlStateGateRuntime(
-            binding, backend, audit, self.registry, self._control, self._nonce,
+            binding, backend, audit, self.registry, self._nonce,
             self._control_runtime, self._t_context, self._c_context,
             self._t_to_c_channel_token, self._f_read_verify_client,
             self._profiles, self._fixture_transports,
@@ -307,7 +312,7 @@ class FixtureProtectedGateRuntime:
         )
         self.boundary = TrustedControlCommandBoundary(self._trusted_controller_runtime)
         self._publication_gate_runtime = PublicationGateRuntime(
-            binding, self.backend.read_client(), audit, self._publication,
+            binding, self.backend.read_client(), audit,
             self._publication_runtime, self._nonce, self._t_context, self._p_context,
             _FixtureRoleCallerVerifier(self._t_to_p_channel_token, self._t_context),
             self._f_read_verify_client,
@@ -318,7 +323,7 @@ class FixtureProtectedGateRuntime:
             ), self._profiles, self._fixture_transports,
         )
         self._merge_gate_runtime = MergeGateRuntime(
-            binding, self.backend.read_client(), audit, self._merge,
+            binding, self.backend.read_client(), audit,
             self._merge_runtime, self._nonce, self._t_context, self._m_context,
             _FixtureRoleCallerVerifier(self._t_to_m_channel_token, self._t_context),
             self._f_read_verify_client,
@@ -878,7 +883,7 @@ class FixtureProtectedGateRuntime:
                 return GateResult(GateResultCode.LEASE_INVALID)
             if (lease.runtime_binding is not self.binding or lease.root_context_id != self.binding.root_context_id
                     or lease.runtime_generation != self.binding.runtime_generation
-                    or lease.capability is not self._control):
+                    ):
                 return GateResult(GateResultCode.LEASE_INVALID)
             if request.command_kind is TrustedControlCommandKind.START_OPERATION:
                 started = next((
@@ -1061,7 +1066,7 @@ class FixtureProtectedGateRuntime:
         value._owner, value._nonce, value._used = self, self._nonce, False
         value.control_lease, value.action_target_fence = control_lease, fence
         value.prepared_start = prepared
-        value.target_capability, value.runtime_binding = target_capability, self.binding
+        value.target_service_identity, value.runtime_binding = target_capability.service_identity, self.binding
         value.authorized_scope, value.root_forbidden_scope = authorized_scope, root_forbidden_scope
         value.target_fence_token = target_token
         return value
@@ -1107,7 +1112,7 @@ class FixtureProtectedGateRuntime:
                 and fence.ref == materialization.candidate_branch
                 and fence.expected_sha is None and fence.base_ref is None
                 and publication_context_is_valid(
-                    target, capability, materialization, intent.integration_binding
+                    target, capability.service_identity, materialization, intent.integration_binding
                 )
             )
         if subject is ProtectedEffectSubject.PULL_REQUEST_CREATION:
@@ -1474,7 +1479,7 @@ class FixtureProtectedGateRuntime:
             if type(prepared) is not PreparedStartCommitLease or not prepared._consume(self, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             expected_capability = self._merge if subject is ProtectedEffectSubject.FAST_FORWARD_MERGE else self._publication
-            if (prepared.runtime_binding is not self.binding or prepared.target_capability is not expected_capability
+            if (prepared.runtime_binding is not self.binding or prepared.target_service_identity != expected_capability.service_identity
                     or not prepared.target_fence_token.active or not self._is_active()):
                 return GateResult(GateResultCode.LEASE_INVALID)
             if (operation != prepared.prepared_start.operation
@@ -1645,7 +1650,7 @@ class FixtureProtectedGateRuntime:
             continuation.provenance_operation_id = prepared.prepared_start.preimage.provenance_operation_id
             if not self._audit_ok(self._audit_event(
                 "PROTECTED_START", subject.value, GateAuditOutcome.APPLIED,
-                service=prepared.target_capability.service_identity,
+                service=prepared.target_service_identity,
                 dependencies=prepared.control_lease.dependencies,
                 operation_id=proposed.intent.operation_id,
                 start_id=proposed.start_binding_id,
@@ -2014,7 +2019,7 @@ class FixtureProtectedGateRuntime:
                             or type(target_registration) is not AdmittedTargetRegistration
                             or fence.ref != materialization.candidate_branch
                             or fence.expected_sha is not None
-                            or not publication_context_is_valid(target_registration, capability, materialization,
+                            or not publication_context_is_valid(target_registration, capability.service_identity, materialization,
                                                                 continuation.integration_binding)):
                         return GateResult(GateResultCode.REJECTED)
                     effect_subject = PublishedCandidateRefEffectSubject(
@@ -2309,7 +2314,12 @@ class FixtureProtectedGateRuntime:
             GateRuntimeBinding(self.binding.root_context_id,
                                self.binding.runtime_generation,
                                self.binding.control_state_principal, self.binding.publication_principal,
-                               self.binding.merge_principal),
+                               self.binding.merge_principal,
+                               RawSha256(hashlib.sha256(canonical_json_bytes((
+                                   "autodev.fixture-restart-runtime-identity/v1",
+                                   self.binding.runtime_binding_id,
+                                   self.binding.runtime_generation.value + 1,
+                               ))).hexdigest())),
             self.backend, self.platform, self.audit, self.registry,
             object_store=self._object_store,
             _restart_from=previous,

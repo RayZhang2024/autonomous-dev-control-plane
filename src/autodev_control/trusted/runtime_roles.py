@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
-import secrets
 from threading import RLock
 
 from .audit import (
@@ -111,7 +110,7 @@ from .runtime_authority import (
     CanonicalStartReadClient as CanonicalStartReadContract,
     GateAuditClient as GateAuditContract, FixtureReadVerifyClient,
     RuntimeRoleRegistry, RoleFenceHandle, CandidateObjectStore,
-    CanonicalStateWriterClient, _issue_fixture_caller_context,
+    CanonicalStateWriterClient,
     runtime_context_identity,
 )
 from .target_registration import AdmittedTargetRegistration
@@ -320,7 +319,7 @@ class GateRuntimeBinding:
     control_state_principal: ServicePrincipalId
     publication_principal: ServicePrincipalId
     merge_principal: ServicePrincipalId
-    runtime_instance_nonce: RawSha256 = field(default_factory=lambda: RawSha256(secrets.token_hex(32)))
+    runtime_instance_nonce: RawSha256
     runtime_binding_id: GateRuntimeBindingId = field(init=False)
 
     def __post_init__(self) -> None:
@@ -340,27 +339,6 @@ class GateRuntimeBinding:
         object.__setattr__(self, "runtime_binding_id", GateRuntimeBindingId(RawSha256(digest)))
 
 TrustedGateRuntimeBinding = GateRuntimeBinding
-
-class _Capability:
-    __slots__ = ("_nonce", "service_identity")
-
-    def __init__(self, *_: object, **__: object) -> None:
-        raise TypeError("capabilities are minted only by the fixture gate runtime")
-
-class ControlStateCapability(_Capability):
-    pass
-
-class TargetPublicationCapability(_Capability):
-    pass
-
-class MergeCapability(_Capability):
-    pass
-
-def _mint_capability(kind: type[_Capability], nonce: object, service_identity: ServicePrincipalId) -> _Capability:
-    value = object.__new__(kind)
-    value._nonce = nonce
-    value.service_identity = service_identity
-    return value
 
 ControlStateAuthoritativeDependency = AuthoritativeStateDependency
 
@@ -392,13 +370,13 @@ class _OneUse:
         raise TypeError("ephemeral gate authority cannot be serialized")
 
 class ControlStateCommitLease(_OneUse):
-    __slots__ = ("root_context_id", "runtime_generation", "runtime_binding", "dependencies", "capability", "fence_token")
+    __slots__ = ("root_context_id", "runtime_generation", "runtime_binding", "dependencies", "fence_token")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("control-state leases are minted only by the active gate")
 
 class PreparedStartCommitLease(_OneUse):
-    __slots__ = ("control_lease", "action_target_fence", "prepared_start", "target_capability", "runtime_binding", "authorized_scope", "root_forbidden_scope", "target_fence_token")
+    __slots__ = ("control_lease", "action_target_fence", "prepared_start", "target_service_identity", "runtime_binding", "authorized_scope", "root_forbidden_scope", "target_fence_token")
 
     def __init__(self, *_: object, **__: object) -> None:
         raise TypeError("prepared-start leases are minted only by the active gate")
@@ -2070,7 +2048,7 @@ class ControlStateGateRuntime:
     """
 
     __slots__ = (
-        "binding", "backend", "audit", "registry", "capability", "nonce",
+        "binding", "backend", "audit", "registry", "nonce",
         "runtime_identity", "controller_context", "control_context",
         "channel_token", "f_read_verify", "dependency_profiles",
         "dependency_transports",
@@ -2079,7 +2057,7 @@ class ControlStateGateRuntime:
     def __init__(
         self, binding: GateRuntimeBinding,
         backend: CanonicalStateWriterClient, audit: GateAuditContract,
-        registry: RuntimeRoleRegistry, capability: ControlStateCapability,
+        registry: RuntimeRoleRegistry,
         nonce: object, runtime_identity: object,
         controller_context: RuntimeSecurityContext,
         control_context: RuntimeSecurityContext, channel_token: object,
@@ -2090,15 +2068,25 @@ class ControlStateGateRuntime:
                 or not isinstance(backend, CanonicalStateWriterClient)
                 or not isinstance(audit, GateAuditContract)
                 or not isinstance(registry, RuntimeRoleRegistry)
-                or type(capability) is not ControlStateCapability
                 or type(controller_context) is not RuntimeSecurityContext
                 or type(control_context) is not RuntimeSecurityContext
                 or controller_context.role is not TrustedRuntimeRole.CONTROLLER
                 or control_context.role is not TrustedRuntimeRole.CONTROL_STATE_GATE
+                or (controller_context.root_context_id,
+                    controller_context.runtime_generation,
+                    controller_context.runtime_binding_id) != (
+                    binding.root_context_id, binding.runtime_generation.value,
+                    binding.runtime_binding_id)
+                or (control_context.service_identity,
+                    control_context.root_context_id,
+                    control_context.runtime_generation,
+                    control_context.runtime_binding_id) != (
+                    binding.control_state_principal, binding.root_context_id,
+                    binding.runtime_generation.value, binding.runtime_binding_id)
                 or not isinstance(f_read_verify, FixtureReadVerifyClient)):
             raise TypeError("C runtime requires exact C-scoped dependencies")
         self.binding, self.backend, self.audit, self.registry = binding, backend, audit, registry
-        self.capability, self.nonce, self.runtime_identity = capability, nonce, runtime_identity
+        self.nonce, self.runtime_identity = nonce, runtime_identity
         self.controller_context, self.control_context = controller_context, control_context
         self.channel_token, self.f_read_verify = channel_token, f_read_verify
         self.dependency_profiles, self.dependency_transports = dependency_profiles, dependency_transports
@@ -2197,7 +2185,6 @@ class ControlStateGateRuntime:
         lease.runtime_generation = self.binding.runtime_generation
         lease.runtime_binding = self.binding
         lease.dependencies = dependencies
-        lease.capability = self.capability
         lease.fence_token = token
         return lease
 
@@ -2252,8 +2239,7 @@ class ControlStateGateRuntime:
                 return GateResult(GateResultCode.LEASE_INVALID)
             if (lease.runtime_binding is not self.binding
                     or lease.root_context_id != self.binding.root_context_id
-                    or lease.runtime_generation != self.binding.runtime_generation
-                    or lease.capability is not self.capability):
+                    or lease.runtime_generation != self.binding.runtime_generation):
                 return GateResult(GateResultCode.LEASE_INVALID)
             if request.command_kind is TrustedControlCommandKind.START_OPERATION:
                 started = next((
@@ -2402,7 +2388,7 @@ class _ProtectedGateRoleRuntime:
     """Shared implementation data for one narrowly bound P or M candidate role."""
 
     __slots__ = (
-        "binding", "read_state", "audit", "capability", "runtime_identity",
+        "binding", "read_state", "audit", "runtime_identity",
         "_nonce", "_t_context", "_role_context", "caller_verifier",
         "_f_read_verify_client", "authority_client", "fence_client",
         "dependency_profiles", "dependency_transports", "_lock",
@@ -2419,7 +2405,7 @@ class _ProtectedGateRoleRuntime:
 
     def __init__(
         self, binding: GateRuntimeBinding, read_state: CanonicalStartReadContract,
-        audit: GateAuditContract, capability: TargetPublicationCapability | MergeCapability,
+        audit: GateAuditContract,
         runtime_identity: object, nonce: object,
         t_context: RuntimeSecurityContext, role_context: RuntimeSecurityContext,
         caller_verifier: AuthenticatedCallerVerifier,
@@ -2435,24 +2421,32 @@ class _ProtectedGateRoleRuntime:
                 or t_context.role is not TrustedRuntimeRole.CONTROLLER
                 or type(role_context) is not RuntimeSecurityContext
                 or role_context.role is not self.role
+                or (t_context.root_context_id, t_context.runtime_generation,
+                    t_context.runtime_binding_id) != (
+                    binding.root_context_id, binding.runtime_generation.value,
+                    binding.runtime_binding_id)
+                or (role_context.root_context_id, role_context.runtime_generation,
+                    role_context.runtime_binding_id) != (
+                    binding.root_context_id, binding.runtime_generation.value,
+                    binding.runtime_binding_id)
                 or not isinstance(caller_verifier, AuthenticatedCallerVerifier)
                 or not isinstance(f_read_verify_client, FixtureReadVerifyClient)
                 or not isinstance(fence_client, GateRoleFenceContract)):
             raise TypeError("P/M runtime requires exact role-scoped read and identity dependencies")
         if self.role is TrustedRuntimeRole.PUBLICATION_GATE:
             valid = (
-                type(capability) is TargetPublicationCapability
+                role_context.service_identity == binding.publication_principal
                 and isinstance(authority_client, PublicationAuthorityContract)
             )
         else:
             valid = (
-                type(capability) is MergeCapability
+                role_context.service_identity == binding.merge_principal
                 and isinstance(authority_client, MergeAuthorityContract)
             )
         if not valid:
-            raise TypeError("P/M runtime received cross-role capability or authority")
+            raise TypeError("P/M runtime received cross-role context or authority")
         self.binding, self.read_state, self.audit = binding, read_state, audit
-        self.capability, self.runtime_identity, self._nonce = capability, runtime_identity, nonce
+        self.runtime_identity, self._nonce = runtime_identity, nonce
         self._t_context, self._role_context = t_context, role_context
         self.caller_verifier = caller_verifier
         self._f_read_verify_client, self.authority_client = f_read_verify_client, authority_client
@@ -2965,7 +2959,7 @@ class _ProtectedGateRoleRuntime:
         if not self._audit_ok(self._audit_event(
             continuation.subject.value, continuation.action_id.value,
             GateAuditOutcome.PRECONDITION_CONFLICT,
-            service=self.capability.service_identity,
+            service=self._role_context.service_identity,
             dependencies=continuation.dependencies,
             operation_id=continuation.operation_id,
             start_id=continuation.start_binding_id,
@@ -2995,7 +2989,7 @@ class _ProtectedGateRoleRuntime:
             else companion.start_held_target_fence_binding
         )
         expected_authority = self.authority_client.binding_identity(
-            self.capability.service_identity, self.binding.root_context_id,
+            self._role_context.service_identity, self.binding.root_context_id,
             self.binding.runtime_generation.value, self.binding.runtime_binding_id,
         )
         if (operation is None or operation.intent != continuation.intent
@@ -3053,17 +3047,26 @@ class _ProtectedGateRoleRuntime:
                 or request.root_context_id != self.binding.root_context_id
                 or request.runtime_generation != self.binding.runtime_generation.value):
             return GateResult(GateResultCode.REJECTED)
-        return self.perform_effect(continuation, self.capability)
+        return self.perform_effect(continuation, request, caller_context)
 
     def perform_effect(
         self, continuation: LiveProtectedEffectContinuation,
-        capability: TargetPublicationCapability | MergeCapability,
+        request: ProtectedGateRequest,
+        caller_context: AuthenticatedCallerContext | None,
     ) -> GateResult:
         with self._lock:
-            if (capability is not self.capability
-                    or type(continuation) is not LiveProtectedEffectContinuation
+            expected_request = self._build_execute_request(continuation)
+            if (type(continuation) is not LiveProtectedEffectContinuation
                     or continuation.subject not in self.allowed_subjects
-                    or not continuation._consume(self.runtime_identity, self._nonce)):
+                    or type(request) is not ProtectedGateRequest
+                    or request != expected_request
+                    or not self.caller_verifier.verify(request.request_digest, caller_context)
+                    or request.declared_t_identity != runtime_context_identity(self._t_context)
+                    or request.destination_identity != runtime_context_identity(self._role_context)
+                    or request.root_context_id != self.binding.root_context_id
+                    or request.runtime_generation != self.binding.runtime_generation.value):
+                return GateResult(GateResultCode.REJECTED)
+            if not continuation._consume(self.runtime_identity, self._nonce):
                 return GateResult(GateResultCode.LEASE_CONSUMED)
             try:
                 if not continuation.target_fence_token.active or not self._is_active():
@@ -3083,8 +3086,9 @@ class _ProtectedGateRoleRuntime:
                 ), None)
                 companion = None if operation is None else operation.canonical_protected_start_binding
                 held = None if type(companion) is not CanonicalProtectedStartBinding else companion.start_held_target_fence_binding
+                service = self._role_context.service_identity
                 authority_binding = self.authority_client.binding_identity(
-                    capability.service_identity, self.binding.root_context_id,
+                    service, self.binding.root_context_id,
                     self.binding.runtime_generation.value, self.binding.runtime_binding_id,
                 )
                 if (type(durable) is not PreparedProtectedStart
@@ -3150,7 +3154,7 @@ class _ProtectedGateRoleRuntime:
                     if (fence.ref != materialization.candidate_branch
                             or fence.expected_sha is not None
                             or not publication_context_is_valid(
-                                target, capability, materialization,
+                                target, service, materialization,
                                 continuation.integration_binding,
                             )):
                         return GateResult(GateResultCode.REJECTED)
@@ -3166,7 +3170,7 @@ class _ProtectedGateRoleRuntime:
                     published = None if provenance is None else provenance.preimage.effect_subject
                     if (type(base_ref) is not CanonicalBranchRef or fence.base_ref != base_ref
                             or target.target_publication is None
-                            or target.target_publication.service_identity != capability.service_identity
+                            or target.target_publication.service_identity != service
                             or target.merge is None or base_ref not in target.merge.allowed_integration_refs
                             or fence.ref != materialization.candidate_branch
                             or fence.expected_sha != materialization.commit
@@ -3197,7 +3201,7 @@ class _ProtectedGateRoleRuntime:
                     )
                     created = None if provenance is None else provenance.preimage.effect_subject
                     if (target.merge is None
-                            or target.merge.service_identity != capability.service_identity
+                            or target.merge.service_identity != service
                             or fence.ref not in target.merge.allowed_integration_refs
                             or type(created) is not CreatedCandidatePrEffectSubject
                             or created.repository_id != fence.repository_id
@@ -3225,7 +3229,7 @@ class _ProtectedGateRoleRuntime:
                     continuation.action_id, action_digest, materialization.materialization_id,
                     materialization.inventory.inventory_id, continuation.prepared_start_id,
                     self.binding.root_context_id, self.binding.runtime_generation.value,
-                    capability.service_identity, effect_subject, pre_identity, post_identity,
+                    service, effect_subject, pre_identity, post_identity,
                     prerequisite_marker_id,
                 ))
                 if current is not None:
@@ -3234,7 +3238,7 @@ class _ProtectedGateRoleRuntime:
                     if not self._audit_ok(self._audit_event(
                         subject.value, continuation.action_id.value,
                         GateAuditOutcome.ALREADY_APPLIED,
-                        service=capability.service_identity,
+                        service=service,
                         dependencies=continuation.dependencies,
                         operation_id=continuation.operation_id,
                         start_id=continuation.start_binding_id, marker=current,
@@ -3268,7 +3272,7 @@ class _ProtectedGateRoleRuntime:
                 if not self._audit_ok(self._audit_event(
                     subject.value, continuation.action_id.value,
                     GateAuditOutcome.APPLIED,
-                    service=capability.service_identity,
+                    service=service,
                     dependencies=continuation.dependencies,
                     operation_id=continuation.operation_id,
                     start_id=continuation.start_binding_id, marker=marker,
@@ -3391,17 +3395,17 @@ def operation_start_binding_id(prepared_start_id: PreparedProtectedStartId) -> O
     return OperationStartBindingId(prepared_start_id.raw_sha256)
 
 def publication_context_is_valid(registration: AdmittedTargetRegistration,
-                                 capability: TargetPublicationCapability,
+                                 expected_service_identity: ServicePrincipalId,
                                  materialization: CandidateMaterialization | AdmittedCandidateMaterialization,
                                  operation_integration_ref: object = None) -> bool:
     """Validate namespace/principal/ref separation without cross-nominal equality."""
     if (type(registration) is not AdmittedTargetRegistration
-            or type(capability) is not TargetPublicationCapability
+            or type(expected_service_identity) is not ServicePrincipalId
             or type(materialization) not in (CandidateMaterialization, AdmittedCandidateMaterialization)):
         return False
     destination = materialization.candidate_branch
     if (registration.target_publication is None
-            or registration.target_publication.service_identity != capability.service_identity):
+            or registration.target_publication.service_identity != expected_service_identity):
         return False
     if destination in registration.protected_refs:
         return False

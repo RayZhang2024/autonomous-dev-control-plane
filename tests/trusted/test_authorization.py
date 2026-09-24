@@ -14,11 +14,6 @@ from autodev_control.trusted.authorization import (
     DelegationAllowance,
     DirectAuthoritySource,
     OrdinaryRootProtectionState,
-    _authenticated_human_approval_for_test,
-    _authorization_policy_context_for_test,
-    _contract_authority_ceiling_for_test,
-    _direct_issuer_envelope_for_test,
-    _ordinary_root_context_for_test,
     _result,
     admit_delegated_authorization,
     admit_direct_authorization,
@@ -52,11 +47,18 @@ from autodev_control.trusted.scope import (
 from autodev_control.trusted.target_registration import (
     CandidateTargetRegistration,
     TargetRegistrationRootImpact,
+    admit_target_registration,
+    load_candidate_target_registration,
+)
+from tests.support.trusted_values import (
+    _authenticated_human_approval_for_test,
+    _authorization_policy_context_for_test,
+    _contract_authority_ceiling_for_test,
+    _direct_issuer_envelope_for_test,
+    _ordinary_root_context_for_test,
     _authenticated_target_admin_approval_for_test,
     _target_registration_policy_context_for_test,
     _target_registration_root_assessment_for_test,
-    admit_target_registration,
-    load_candidate_target_registration,
 )
 
 
