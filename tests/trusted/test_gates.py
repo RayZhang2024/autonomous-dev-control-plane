@@ -12,9 +12,13 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from autodev_control.trusted.audit import (
-    AuditAppendStatus, FixtureGateAudit, GateAuditAuthoritativeDependency,
+    AuditAppendStatus, GateAuditAuthoritativeDependency,
     GateAuditEventPreimage,
     GateAuditOutcome, build_gate_audit_event,
+)
+from autodev_control.trusted.fixture_audit import FixtureGateAudit
+from autodev_control.trusted.fixture_capabilities import (
+    ControlStateCapability, MergeCapability, TargetPublicationCapability,
 )
 from autodev_control.trusted.authorization import (
     AdmittedAuthorization, AuthorizationOperationalConstraints, DelegationAllowance,
@@ -41,8 +45,8 @@ from autodev_control.trusted.runtime_authority import (
     MergeAuthorityClient, MergeGateClient,
     ProtectedGateCommand, PublicationAuthorityClient, RuntimeSecurityContext,
     PublicationGateClient, TrustedRuntimeRole,
-    _issue_fixture_caller_context,
 )
+from autodev_control.trusted.fixture_transport import issue_fixture_caller_context as _issue_fixture_caller_context
 import autodev_control.trusted.gates as gates_module
 import autodev_control.trusted.runtime_roles as runtime_roles_module
 from autodev_control.trusted.identity import (
@@ -154,6 +158,7 @@ def runtime(target=None, object_store=None):
     binding = GateRuntimeBinding(
         RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
         ServicePrincipalId("control"), ServicePrincipalId("publication"), ServicePrincipalId("merge"),
+        RawSha256("a" * 64),
     )
     resolved = mint(
         ResolvedTargetRegistration, registration=target,
@@ -278,6 +283,7 @@ def audit_event(outcome=GateAuditOutcome.ATTEMPTED):
         RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
         ServicePrincipalId("control"), ServicePrincipalId("publication"),
         ServicePrincipalId("merge"),
+        RawSha256("a" * 64),
     )
     return build_gate_audit_event(GateAuditEventPreimage(
         "autodev.gate-audit-event/v1", "gate", "op", outcome,
@@ -807,7 +813,8 @@ def start_protected(value, operation, subject, fence, materialization, *,
 def test_gate_principals_must_be_pairwise_distinct():
     with pytest.raises(ValueError):
         GateRuntimeBinding(RootContextId(RawSha256("1" * 64)), FixtureRuntimeGeneration(1),
-                           ServicePrincipalId("same"), ServicePrincipalId("same"), ServicePrincipalId("merge"))
+                           ServicePrincipalId("same"), ServicePrincipalId("same"), ServicePrincipalId("merge"),
+                           RawSha256("a" * 64))
 
 
 def test_three_capabilities_are_distinct_and_principal_bound():
@@ -899,6 +906,7 @@ def _issue29_semantic_publication_runtime(
         ServicePrincipalId("control-semantic-start"),
         target.target_publication.service_identity,
         target.merge.service_identity,
+        RawSha256("a" * 64),
     )
     value = FixtureProtectedGateRuntime(
         binding, store, platform, FixtureGateAudit(),
@@ -2047,7 +2055,7 @@ def test_candidate_gate_entrypoints_receive_only_role_specific_client_contracts(
     c_runtime = control._client._control
     assert type(c_runtime).__name__ == "ControlStateGateRuntime"
     assert set(c_runtime.__slots__) == {
-        "binding", "backend", "audit", "registry", "capability", "nonce",
+        "binding", "backend", "audit", "registry", "nonce",
         "runtime_identity", "controller_context", "control_context",
         "channel_token", "f_read_verify", "dependency_profiles",
         "dependency_transports",
@@ -2133,8 +2141,10 @@ def test_publication_and_merge_runtimes_have_separate_candidate_role_slots():
     assert merge_client._runtime is merge
     assert not isinstance(publication_client._runtime, FixtureProtectedGateRuntime)
     assert not isinstance(merge_client._runtime, FixtureProtectedGateRuntime)
-    assert type(publication.capability) is TargetPublicationCapability
-    assert type(merge.capability) is MergeCapability
+    assert not hasattr(publication, "capability")
+    assert not hasattr(merge, "capability")
+    assert publication._role_context.service_identity == value.binding.publication_principal
+    assert merge._role_context.service_identity == value.binding.merge_principal
     assert not hasattr(publication, "_merge_authority_client")
     assert not hasattr(merge, "_publication_authority_client")
     assert not hasattr(publication.read_state, "apply")
@@ -2439,6 +2449,7 @@ def test_authenticated_control_state_request_rejects_stale_t_runtime_epoch():
         value.binding.root_context_id, value.binding.runtime_generation,
         value.binding.control_state_principal,
         value.binding.publication_principal, value.binding.merge_principal,
+        RawSha256("b" * 64),
     )
     stale_context = RuntimeSecurityContext(
         TrustedRuntimeRole.CONTROLLER, ServicePrincipalId("trusted-controller"),
@@ -2647,6 +2658,7 @@ def test_new_generation_retires_old_runtime_for_normal_work():
             RootContextId(RawSha256("9" * 64)), FixtureRuntimeGeneration(2),
             ServicePrincipalId("control"), ServicePrincipalId("publication"),
             ServicePrincipalId("merge"),
+            RawSha256("a" * 64),
         ), old.backend, old.platform, old.audit, old.registry,
     )
     assert independent_lease(old) is None
@@ -4359,6 +4371,7 @@ def _issue29_semantic_gate_runtime(*, config_available=True):
         RootContextId(RawSha256("2" * 64)), FixtureRuntimeGeneration(9),
         ServicePrincipalId("control-semantic"), ServicePrincipalId("publication-semantic"),
         ServicePrincipalId("merge-semantic"),
+        RawSha256("a" * 64),
     )
     value = FixtureProtectedGateRuntime(
         gate_binding, backend, FixtureGitPlatform(), FixtureGateAudit(),
@@ -5009,6 +5022,7 @@ def test_admin_runtime_replacement_requires_strictly_higher_generation():
                 value.binding.control_state_principal,
                 value.binding.publication_principal,
                 value.binding.merge_principal,
+                RawSha256("a" * 64),
             ), value.backend, value.platform, value.audit, value.registry,
         )
     replacement = FixtureProtectedGateRuntime(
@@ -5017,6 +5031,7 @@ def test_admin_runtime_replacement_requires_strictly_higher_generation():
             value.binding.control_state_principal,
             value.binding.publication_principal,
             value.binding.merge_principal,
+            RawSha256("b" * 64),
         ), value.backend, value.platform, value.audit, value.registry,
     )
     assert replacement._is_active()
@@ -5034,6 +5049,7 @@ def test_admin_runtime_replacement_requires_strictly_higher_generation():
                     value.binding.control_state_principal,
                     value.binding.publication_principal,
                     value.binding.merge_principal,
+                    RawSha256("c" * 64),
                 ), value.backend, value.platform, value.audit, value.registry,
             )
 
@@ -5257,6 +5273,11 @@ def test_recovery_fence_blocks_prepared_state_race():
 def test_candidate_runtime_source_and_import_closure_excludes_fixture_platform():
     repository = Path(__file__).resolve().parents[2]
     runtime_source = repository / "src" / "autodev_control" / "trusted" / "runtime_roles.py"
+    package_source = repository / "src" / "autodev_control" / "trusted" / "__init__.py"
+    audit_source = repository / "src" / "autodev_control" / "trusted" / "audit.py"
+    authority_source = repository / "src" / "autodev_control" / "trusted" / "runtime_authority.py"
+    authorization_source = repository / "src" / "autodev_control" / "trusted" / "authorization.py"
+    registration_source = repository / "src" / "autodev_control" / "trusted" / "target_registration.py"
     tree = ast.parse(runtime_source.read_text(encoding="utf-8"))
     forbidden_modules = {"fixture_platform", "autodev_control.trusted.fixture_platform"}
     forbidden_symbols = {
@@ -5275,6 +5296,28 @@ def test_candidate_runtime_source_and_import_closure_excludes_fixture_platform()
             imported_names.update(alias.name for alias in node.names)
     assert not (forbidden_modules & imported_modules)
     assert not (forbidden_symbols & imported_names)
+    candidate_source = runtime_source.read_text(encoding="utf-8")
+    for forbidden in (
+        "_mint_capability", "ControlStateCapability", "TargetPublicationCapability",
+        "MergeCapability", "_issue_fixture_caller_context", "_for_test",
+        "secrets.", "default_factory",
+    ):
+        assert forbidden not in candidate_source
+    audit_text = audit_source.read_text(encoding="utf-8")
+    assert "FixtureGateAudit" not in audit_text
+    assert "fail_next_append_for_test" not in audit_text
+    assert "fail_append_after_for_test" not in audit_text
+    authority_text = authority_source.read_text(encoding="utf-8")
+    assert "_issue_fixture_caller_context" not in authority_text
+    for source in (authorization_source, registration_source):
+        text = source.read_text(encoding="utf-8")
+        assert "_for_test" not in text
+    from tests.support import trusted_values
+    assert callable(trusted_values._ordinary_root_context_for_test)
+    assert callable(trusted_values._authenticated_target_admin_approval_for_test)
+    bootstrap = package_source.read_text(encoding="utf-8")
+    assert "__getattr__" not in bootstrap
+    assert "Fixture" not in bootstrap and "Capability" not in bootstrap
     referenced_names = {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
     }
@@ -5282,8 +5325,15 @@ def test_candidate_runtime_source_and_import_closure_excludes_fixture_platform()
 
     code = (
         "import importlib, sys; "
+        "package = importlib.import_module('autodev_control.trusted'); "
         "module = importlib.import_module('autodev_control.trusted.runtime_roles'); "
-        "assert 'autodev_control.trusted.fixture_platform' not in sys.modules; "
+        "assert not any(name in sys.modules for name in ('autodev_control.trusted.gates', "
+        "'autodev_control.trusted.fixture_platform', "
+        "'autodev_control.trusted.fixture_audit', "
+        "'autodev_control.trusted.fixture_transport', "
+        "'autodev_control.trusted.fixture_capabilities', 'tests.support')); "
+        "assert package.__all__ == (); "
+        "assert not hasattr(package, 'FixtureProtectedGateRuntime'); "
         "assert all(getattr(module, name).__module__ == module.__name__ for name in "
         "('TrustedControllerRuntime', 'ControlStateGateRuntime', "
         "'PublicationGateRuntime', 'MergeGateRuntime'))"
@@ -5295,3 +5345,107 @@ def test_candidate_runtime_source_and_import_closure_excludes_fixture_platform()
         capture_output=True, text=True, check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_issue42_candidate_roles_have_no_capability_authority_and_require_external_binding():
+    value = runtime()
+    c_runtime = value._control_gate_runtime
+    p_runtime = value._publication_gate_runtime
+    m_runtime = value._merge_gate_runtime
+
+    assert "capability" not in inspect.signature(type(c_runtime)).parameters
+    assert "capability" not in inspect.signature(type(p_runtime)).parameters
+    assert "capability" not in inspect.signature(type(m_runtime)).parameters
+    assert "capability" not in inspect.signature(p_runtime.perform_effect).parameters
+    assert not hasattr(c_runtime, "capability")
+    assert not hasattr(p_runtime, "capability")
+    assert not hasattr(m_runtime, "capability")
+    assert set(TrustedRuntimeRole) == {
+        TrustedRuntimeRole.CONTROLLER,
+        TrustedRuntimeRole.CONTROL_STATE_GATE,
+        TrustedRuntimeRole.PUBLICATION_GATE,
+        TrustedRuntimeRole.MERGE_GATE,
+    }
+    with pytest.raises(TypeError):
+        GateRuntimeBinding(
+            value.binding.root_context_id, value.binding.runtime_generation,
+            value.binding.control_state_principal, value.binding.publication_principal,
+            value.binding.merge_principal,
+        )
+
+    assert not hasattr(value.controller, "perform_effect")
+    assert not hasattr(value.controller, "platform")
+    assert not hasattr(p_runtime, "merge_authority_client")
+    assert not hasattr(m_runtime, "publication_authority_client")
+
+
+def test_issue42_candidate_role_contexts_reject_wrong_role_and_wrong_runtime_binding():
+    value = runtime()
+    control = value._control_gate_runtime
+    publication = value._publication_gate_runtime
+    merge = value._merge_gate_runtime
+
+    for wrong_context in (publication._role_context, merge._role_context):
+        with pytest.raises(TypeError):
+            type(control)(
+                control.binding, control.backend, control.audit, control.registry,
+                control.nonce, control.runtime_identity, control.controller_context,
+                wrong_context, control.channel_token,
+                control.f_read_verify, control.dependency_profiles,
+                control.dependency_transports,
+            )
+
+    def rebuild_role(role, context, authority):
+        return type(role)(
+            role.binding, role.read_state, role.audit, role.runtime_identity,
+            role._nonce, role._t_context, context, role.caller_verifier,
+            role._f_read_verify_client, authority, role.fence_client,
+            role.dependency_profiles, role.dependency_transports,
+        )
+
+    with pytest.raises(TypeError):
+        rebuild_role(publication, merge._role_context, publication.authority_client)
+    with pytest.raises(TypeError):
+        rebuild_role(merge, publication._role_context, merge.authority_client)
+    with pytest.raises(TypeError):
+        rebuild_role(publication, publication._role_context, merge.authority_client)
+    with pytest.raises(TypeError):
+        rebuild_role(merge, merge._role_context, publication.authority_client)
+
+    other_binding = replace(
+        value.binding, root_context_id=RootContextId(RawSha256("9" * 64)),
+        runtime_instance_nonce=RawSha256("f" * 64),
+    )
+    with pytest.raises(TypeError):
+        type(publication)(
+            other_binding, publication.read_state, publication.audit,
+            publication.runtime_identity, publication._nonce,
+            publication._t_context, publication._role_context,
+            publication.caller_verifier, publication._f_read_verify_client,
+            publication.authority_client, publication.fence_client,
+            publication.dependency_profiles, publication.dependency_transports,
+        )
+
+
+def test_issue42_effect_rejects_direct_unauthenticated_candidate_role_call():
+    value = runtime()
+    initialize_task(value)
+    materialization = adopt_recorded_candidate(value, materialize(value))
+    operation = reserve_protected(value, "issue42-authenticated-p", materialization.candidate_id)
+    fence = ActionTargetFence(
+        REPO, materialization.candidate_branch, None,
+        value.platform.snapshot().generation,
+    )
+    started = start_protected(
+        value, operation, ProtectedEffectSubject.CANDIDATE_BRANCH_PUBLICATION,
+        fence, materialization,
+    )
+
+    direct = value._publication_gate_runtime.perform_effect(
+        started.continuation, None, None,
+    )
+    assert direct.code is GateResultCode.REJECTED
+    assert value.platform.read_ref(REPO, materialization.candidate_branch) is None
+    assert TargetPublicationGate(value.publication_gate_client).perform(
+        started.continuation,
+    ).code is GateResultCode.EFFECT_SUCCEEDED

@@ -82,6 +82,7 @@ from autodev_control.trusted.state import (
 )
 
 from tests.trusted import test_authorization as authorization_fixture
+from tests.support.trusted_values import _ordinary_root_context_for_test
 from tests.trusted import test_evidence as evidence_fixture
 from tests.trusted import test_gates as gates_fixture
 from tests.trusted.contract_fixtures import (
@@ -228,6 +229,7 @@ def _current_semantic_runtime():
         gates_fixture.ServicePrincipalId("control-semantic-start"),
         target.target_publication.service_identity,
         target.merge.service_identity,
+        RawSha256("a" * 64),
     )
     runtime = gates_fixture.FixtureProtectedGateRuntime(
         binding, backend, platform, gates_fixture.FixtureGateAudit(),
@@ -849,7 +851,7 @@ def _g8_root_admissions():
     contract, policy, approval, issuer, root = authorization_fixture.direct_contexts(
         proposal, target,
     )
-    protected = authorization_fixture._ordinary_root_context_for_test(
+    protected = _ordinary_root_context_for_test(
         policy_epoch_identity=policy.policy_epoch_identity,
         repository_id=target.repository_id,
         state=OrdinaryRootProtectionState.ROOT_PROTECTED_MUTATION_SCOPE,

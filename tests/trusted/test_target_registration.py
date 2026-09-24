@@ -31,12 +31,14 @@ from autodev_control.trusted.target_registration import (
     AdmittedTargetRegistration,
     CandidateTargetRegistration,
     TargetRegistrationRootImpact,
-    _authenticated_target_admin_approval_for_test,
-    _target_registration_policy_context_for_test,
-    _target_registration_root_assessment_for_test,
     _target_result,
     admit_target_registration,
     load_candidate_target_registration,
+)
+from tests.support.trusted_values import (
+    _authenticated_target_admin_approval_for_test,
+    _target_registration_policy_context_for_test,
+    _target_registration_root_assessment_for_test,
 )
 
 
