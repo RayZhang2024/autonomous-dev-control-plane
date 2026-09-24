@@ -2169,11 +2169,14 @@ def test_publication_and_merge_runtimes_have_separate_candidate_role_slots():
 
 def test_start_held_recovery_authority_is_fixture_external_not_a_candidate_role():
     value = runtime()
-    recovery = value._start_held_recovery_authority
-    assert type(recovery) is FixtureStartHeldRecoveryAuthority
-    assert "_start_held_recovery_authority" in value.__slots__
     coordinator = value._recovery_coordinator
     assert type(coordinator) is FixtureRecoveryCoordinator
+    recovery = coordinator._recovery_authority
+    assert type(recovery) is FixtureStartHeldRecoveryAuthority
+    assert coordinator._runtime is value
+    assert "_recovery_coordinator" in value.__slots__
+    assert "_start_held_recovery_authority" not in value.__slots__
+    assert not hasattr(value, "_start_held_recovery_authority")
     assert coordinator._recovery_authority is recovery
     assert "_recovery_authority" in coordinator.__slots__
     candidate_roles = (
