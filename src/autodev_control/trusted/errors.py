@@ -55,6 +55,33 @@ class ResourceFailureCode(Enum):
     PARSE_FAILED = "PARSE_FAILED"
 
 
+class GenesisResourceGraphFailureCode(Enum):
+    """Closed deterministic failure domain for pre-G9 genesis graph admission."""
+
+    GRAPH_CONFIG_MISSING = "GRAPH_CONFIG_MISSING"
+    GRAPH_CONFIG_DUPLICATE = "GRAPH_CONFIG_DUPLICATE"
+    GRAPH_RESOURCE_MISSING = "GRAPH_RESOURCE_MISSING"
+    GRAPH_RESOURCE_KIND_MISMATCH = "GRAPH_RESOURCE_KIND_MISMATCH"
+    GRAPH_RESOURCE_DIGEST_MISMATCH = "GRAPH_RESOURCE_DIGEST_MISMATCH"
+    GRAPH_UNKNOWN_ORPHAN_RESOURCE = "GRAPH_UNKNOWN_ORPHAN_RESOURCE"
+    GRAPH_MEMBER_SET_MISMATCH = "GRAPH_MEMBER_SET_MISMATCH"
+    GRAPH_MEMBER_BINDING_MISMATCH = "GRAPH_MEMBER_BINDING_MISMATCH"
+    GRAPH_SHARED_RESOURCE_MISMATCH = "GRAPH_SHARED_RESOURCE_MISMATCH"
+    GRAPH_ENTRY_POINT_MISMATCH = "GRAPH_ENTRY_POINT_MISMATCH"
+    GRAPH_SECURITY_CONTEXT_MISMATCH = "GRAPH_SECURITY_CONTEXT_MISMATCH"
+    GRAPH_CAPABILITY_WIRING_MISMATCH = "GRAPH_CAPABILITY_WIRING_MISMATCH"
+    GRAPH_CREDENTIAL_ROUTING_MISMATCH = "GRAPH_CREDENTIAL_ROUTING_MISMATCH"
+    GRAPH_MODULE_LOADING_MISMATCH = "GRAPH_MODULE_LOADING_MISMATCH"
+    GRAPH_POLICY_SET_MISMATCH = "GRAPH_POLICY_SET_MISMATCH"
+    GRAPH_SCHEMA_SET_MISMATCH = "GRAPH_SCHEMA_SET_MISMATCH"
+    GRAPH_CONFIG_SET_MISMATCH = "GRAPH_CONFIG_SET_MISMATCH"
+    GRAPH_EXTERNAL_TCB_MISMATCH = "GRAPH_EXTERNAL_TCB_MISMATCH"
+    GRAPH_BUILD_ROLE_MISSING = "GRAPH_BUILD_ROLE_MISSING"
+    GRAPH_LOCK_ROLE_MISSING = "GRAPH_LOCK_ROLE_MISSING"
+    GRAPH_FORMAT_INVALID = "GRAPH_FORMAT_INVALID"
+    GRAPH_PARSE_FAILED = "GRAPH_PARSE_FAILED"
+
+
 class TargetRegistrationFailureCode(Enum):
     INVALID_INPUT_TYPE = "INVALID_INPUT_TYPE"
     BYTE_LIMIT_EXCEEDED = "BYTE_LIMIT_EXCEEDED"
@@ -241,6 +268,18 @@ class ResourceFailure:
     def __post_init__(self) -> None:
         if type(self.code) is not ResourceFailureCode:
             raise TypeError("code must be exactly ResourceFailureCode")
+        if self.parse_failure is not None and type(self.parse_failure) is not ParseFailure:
+            raise TypeError("parse_failure must be exactly ParseFailure or None")
+
+
+@dataclass(frozen=True, slots=True)
+class GenesisResourceGraphFailure:
+    code: GenesisResourceGraphFailureCode
+    parse_failure: ParseFailure | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.code) is not GenesisResourceGraphFailureCode:
+            raise TypeError("code must be exactly GenesisResourceGraphFailureCode")
         if self.parse_failure is not None and type(self.parse_failure) is not ParseFailure:
             raise TypeError("parse_failure must be exactly ParseFailure or None")
 
