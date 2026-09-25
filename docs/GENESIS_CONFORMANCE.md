@@ -4,15 +4,15 @@
 
 **Status:** subordinate, non-executable conformance specification
 
-**Version:** R3 v0.3
+**Version:** R3 v0.4
 
 **Genesis scope:** fixture-only G1–G8 candidate conformance; not activation
 
-**Reviewed executable base:** `ff8cbebb7637792108b9381d5bfb6f1e3b4af596`
+**Reviewed executable base:** `1c859faad04978a341a3527e034b41c0a849da1f`
 
 ```text
 reviewed_executable_base:
-ff8cbebb7637792108b9381d5bfb6f1e3b4af596
+1c859faad04978a341a3527e034b41c0a849da1f
 ```
 
 This is the pre-R3 executable-source baseline. This document does not contain, derive, or require a self-referential final commit identity. Its own resource identity is separate:
