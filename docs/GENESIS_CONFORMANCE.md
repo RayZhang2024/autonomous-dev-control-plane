@@ -4,15 +4,15 @@
 
 **Status:** subordinate, non-executable conformance specification
 
-**Version:** R3 v0.2
+**Version:** R3 v0.3
 
 **Genesis scope:** fixture-only G1–G8 candidate conformance; not activation
 
-**Reviewed executable base:** `c6bae19702da9e9b60cb0d27cdb741f2a2aab378`
+**Reviewed executable base:** `ff8cbebb7637792108b9381d5bfb6f1e3b4af596`
 
 ```text
 reviewed_executable_base:
-c6bae19702da9e9b60cb0d27cdb741f2a2aab378
+ff8cbebb7637792108b9381d5bfb6f1e3b4af596
 ```
 
 This is the pre-R3 executable-source baseline. This document does not contain, derive, or require a self-referential final commit identity. Its own resource identity is separate:
@@ -292,7 +292,7 @@ These deployment facts do not activate genesis, grant any additional authority, 
 
 The frozen candidate executable membership is embedded here in full. This list, not an issue/PR comment, is the durable R3 membership record.
 
-### 18.1 `GENESIS_MINIMAL_CORE` — 17 modules
+### 18.1 `GENESIS_MINIMAL_CORE` — 18 modules
 
 ```text
 src/autodev_control/trusted/errors.py
@@ -301,6 +301,7 @@ src/autodev_control/trusted/parsing.py
 src/autodev_control/trusted/scope.py
 src/autodev_control/trusted/resources.py
 src/autodev_control/trusted/manifest.py
+src/autodev_control/trusted/genesis_resource_graph.py
 src/autodev_control/trusted/decision.py
 src/autodev_control/trusted/contract.py
 src/autodev_control/trusted/target_registration.py
@@ -327,7 +328,7 @@ src/autodev_control/trusted/runtime_authority.py
 src/autodev_control/trusted/runtime_roles.py
 ```
 
-Total: **25 candidate executable Python modules**.
+Total: **26 candidate executable Python modules**.
 
 ### 18.3 Explicit exclusions
 
@@ -362,7 +363,7 @@ The stable `GC-*` identifiers below are local specification traceability IDs onl
 | Rule ID | Rule summary | Phase 0 governing sections | Executable locus (non-authoritative) | Proof/test family (non-authoritative) | Failure behavior |
 | --- | --- | --- | --- | --- | --- |
 | `GC-G1-001` | Bounded parsing, exact identities/digests, closed deterministic decisions; prose is not security classification. | [CORE_POLICY.md](CORE_POLICY.md) §§7–10, 18; [ARCHITECTURE.md](ARCHITECTURE.md) §§18–19, 31; [REVIEW_MODEL.md](REVIEW_MODEL.md) §§4, 13, 21 | `trusted/parsing.py`, `identity.py`, `decision.py`, `contract.py` | G1 parser, identity, decision, contract regressions | Reject or fail closed on malformed, ambiguous, unsupported, or unverifiable input. |
-| `GC-G2-001` | Explicit content-bound resources, policy epoch, closed membership/dependencies; no unexpected dynamic loading. | [CORE_POLICY.md](CORE_POLICY.md) §§21, 23–24, 28; [ARCHITECTURE.md](ARCHITECTURE.md) §§5, 23–24; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§9–16, 89–91, 96–100 | `trusted/resources.py`, `manifest.py`, `runtime_roles.py` | G2 resources/manifest/import-closure regressions | Fail closed on identity, membership, epoch, or closure mismatch. |
+| `GC-G2-001` | Explicit content-bound resources, policy epoch, closed membership/dependencies; no unexpected dynamic loading. | [CORE_POLICY.md](CORE_POLICY.md) §§21, 23–24, 28; [ARCHITECTURE.md](ARCHITECTURE.md) §§5, 23–24; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§9–16, 89–91, 96–100 | `trusted/resources.py`, `manifest.py`, `genesis_resource_graph.py`, `runtime_roles.py` | G2 resources/manifest/import-closure regressions | Fail closed on identity, membership, epoch, or closure mismatch. |
 | `GC-G3-001` | Target and authorization are independent authenticated ceilings; delegation cannot amplify; root containment is fail-closed. | [CORE_POLICY.md](CORE_POLICY.md) §§4–5, 8, 10–11, 14, 16, 18; [ARCHITECTURE.md](ARCHITECTURE.md) §§9–14, 21; [STATE_MACHINE.md](STATE_MACHINE.md) §§19–20, 33 | `trusted/target_registration.py`, `authorization.py`, `scope.py` | G3 target, authorization, delegation, root-scope regressions | Deny/escalate at the required boundary when authority, provenance, or root context is invalid or unavailable. |
 | `GC-G4-001` | Canonical task/operation revisions, start linearization, race-safe cancellation, idempotency, recovery, full completion predicate. | [CORE_POLICY.md](CORE_POLICY.md) §§12, 18–19, 25; [STATE_MACHINE.md](STATE_MACHINE.md) §§3–20, 22–32; [ARCHITECTURE.md](ARCHITECTURE.md) §§17, 39–42 | `trusted/state.py`, `operation.py`, `backend.py`, `state_reader.py` | G4 lifecycle/start/recovery/completion regressions | Reject stale revisions and unsafe transitions; reconcile uncertain effects before retry. |
 | `GC-G5-001` | Evidence Admission binds provenance and subject; deterministic semantic composition cannot mint authority or override deterministic failure. | [CORE_POLICY.md](CORE_POLICY.md) §§5.4, 7, 9–10, 15, 18; [ARCHITECTURE.md](ARCHITECTURE.md) §20; [REVIEW_MODEL.md](REVIEW_MODEL.md) §§3–4, 21–31; [STATE_MACHINE.md](STATE_MACHINE.md) §§18, 20, 26, 32 | `trusted/evidence.py`, `review.py` | G5 admission, supersession, composition regressions | Unadmitted, stale, conflicting, or inapplicable evidence cannot support a permissive result. |
@@ -383,7 +384,7 @@ The stable `GC-*` identifiers below are local specification traceability IDs onl
 | `GC-NON-AUTHORITY-001` | Prose, evidence, lifecycle projections, audit, dependencies, tests, merge/main, and R3 itself do not create authority or activation. | [CORE_POLICY.md](CORE_POLICY.md) §§4–10, 13, 18, 20, 23, 25; [ARCHITECTURE.md](ARCHITECTURE.md) §§18–21, 31, 48–50; [STATE_MACHINE.md](STATE_MACHINE.md) §§5, 18, 20, 34; [REVIEW_MODEL.md](REVIEW_MODEL.md) §§3–4, 20–21, 26; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§20, 89–100 | No authority locus | G1–G8 non-authority and activation-boundary regressions | Treat the item only as information/evidence, never as authorization or activation. |
 | `GC-FAIL-CLOSED-001` | Missing, malformed, stale, conflicting, unsupported, or unverifiable required facts fail closed at their consuming boundary. | [CORE_POLICY.md](CORE_POLICY.md) §§8, 10–11, 13–14, 18–19; [ARCHITECTURE.md](ARCHITECTURE.md) §§17, 31, 49; [STATE_MACHINE.md](STATE_MACHINE.md) §§16, 21, 28, 30; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§10–14, 28–30, 96–100 | Trusted validators, readers, gates, and backend boundaries | G1–G8 negative/adversarial regression families | Deny, reject, or escalate as defined by the boundary; never fall back to untrusted/historical assertions. |
 | `GC-R1-001` | The reviewed fixture-only T/C/P/M deployment overlay is subordinate and does not activate or redefine authority. | [CORE_POLICY.md](CORE_POLICY.md) §§12–13, 21–23; [ARCHITECTURE.md](ARCHITECTURE.md) §§3–8, 44–50; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§6, 21–22, 96–100 | `trusted/runtime_roles.py`; fixture substrate outside candidate G | R1 role-separation and fixture-boundary regressions | Reject role/authority expansion; external substrate remains outside candidate G. |
-| `GC-R2-001` | Candidate executable membership is exactly the two listed sets (17 + 8); explicit exclusions remain outside membership. | [CORE_POLICY.md](CORE_POLICY.md) §§21, 23–24, 28; [ARCHITECTURE.md](ARCHITECTURE.md) §§5, 23–24, 50; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§9–16, 89–91, 96–100 | `trusted/manifest.py`, `resources.py`, `runtime_roles.py` | G2 manifest/import-closure regressions | Any membership or classification mismatch blocks conformance; external dependency declaration grants no membership. |
+| `GC-R2-001` | Candidate executable membership is exactly the two listed sets (18 + 8); explicit exclusions remain outside membership. | [CORE_POLICY.md](CORE_POLICY.md) §§21, 23–24, 28; [ARCHITECTURE.md](ARCHITECTURE.md) §§5, 23–24, 50; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§9–16, 89–91, 96–100 | `trusted/manifest.py`, `resources.py`, `genesis_resource_graph.py`, `runtime_roles.py` | G2 manifest/import-closure regressions | Any membership or classification mismatch blocks conformance; external dependency declaration grants no membership. |
 | `GC-STOP-001` | An unsupported or contradictory rule requires STOP and explicit reviewed Phase 0/specification amendment; R3 cannot legalize it. | [CORE_POLICY.md](CORE_POLICY.md) §§27–28; [ARCHITECTURE.md](ARCHITECTURE.md) §§51–52; [REVIEW_MODEL.md](REVIEW_MODEL.md) §§2, 36–37; [SELF_MODIFICATION.md](SELF_MODIFICATION.md) §§88–91, 100–101 | No runtime locus | Policy/specification review | Stop implementation or use until explicit reviewed amendment and re-review. |
 
 ## 20. Historical implementation provenance — non-normative
@@ -399,6 +400,7 @@ The stable `GC-*` identifiers below are local specification traceability IDs onl
 - Issue #40: R1 runtime separation.
 - Issue #42: R2 membership cleanup.
 - Issue #39: R2 resource/membership provenance.
+- Issue #47: R4 genesis resource-graph repair.
 
 Only the frozen Phase 0 documents cited in the traceability matrix supply normative derivation. Issue/PR comments and implementation history are provenance only.
 
