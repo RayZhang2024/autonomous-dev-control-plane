@@ -965,7 +965,12 @@ def _parse_external_roles(
 
 def _validate_raw_input(
     manifest: object, resource_bytes: object
-) -> tuple[CandidateTrustedManifest, dict[str, bytes], dict[str, RootManagedResourceRef]] | GenesisResourceGraphFailure:
+) -> tuple[
+    CandidateTrustedManifest,
+    dict[str, bytes],
+    dict[str, RootManagedResourceRef],
+    dict[str, RootManagedResourceRef],
+] | GenesisResourceGraphFailure:
     if type(manifest) is not CandidateTrustedManifest:
         return _failure(GenesisResourceGraphFailureCode.GRAPH_FORMAT_INVALID)
     if manifest.kind is not ManifestKind.GENESIS or manifest.predecessor_manifest is not None:
@@ -986,7 +991,19 @@ def _validate_raw_input(
         if total_bytes > _MAX_TOTAL_RESOURCE_BYTES:
             return _failure(GenesisResourceGraphFailureCode.GRAPH_PARSE_FAILED)
         raw_resources[key] = value
-    return manifest, raw_resources, resources
+    manifest_resource_ids = set(resources)
+    supplied_resource_ids = set(raw_resources)
+    if supplied_resource_ids != manifest_resource_ids:
+        # Unknown supplied IDs were rejected above; only missing manifest
+        # resources can remain at this point.
+        return _failure(GenesisResourceGraphFailureCode.GRAPH_RESOURCE_MISSING)
+    verified_refs: dict[str, RootManagedResourceRef] = {}
+    for resource_id in sorted(manifest_resource_ids):
+        verified = _verify_raw(resource_id, raw_resources, resources)
+        if type(verified) is GenesisResourceGraphFailure:
+            return verified
+        verified_refs[resource_id] = verified[0]
+    return manifest, raw_resources, resources, verified_refs
 
 
 def validate_genesis_resource_graph(
@@ -1003,7 +1020,7 @@ def validate_genesis_resource_graph(
     checked = _validate_raw_input(candidate_manifest, resource_bytes)
     if type(checked) is GenesisResourceGraphFailure:
         return checked
-    manifest, raw_resources, resources = checked
+    manifest, raw_resources, resources, preverified_refs = checked
 
     graph_bindings = [
         item for item in manifest.trusted_configs
@@ -1233,11 +1250,12 @@ def validate_genesis_resource_graph(
 
     # Schema resource declarations are exact resources; verify their bytes
     # without interpreting schema languages or introducing a schema engine.
-    verified_refs: dict[str, RootManagedResourceRef] = {
+    verified_refs: dict[str, RootManagedResourceRef] = dict(preverified_refs)
+    verified_refs.update({
         graph_ref.resource_id.value: graph_ref,
         lock_ref.resource_id.value: lock_ref,
         conformance_ref.resource_id.value: conformance_ref,
-    }
+    })
     verified_refs.update({item.resource_id.value: item for item in verified_external})
     config_resource_ids = set(config_values)
     config_resource_ids.add(graph["module_loading_policy_resource"])
@@ -1254,6 +1272,9 @@ def validate_genesis_resource_graph(
         if type(verified) is GenesisResourceGraphFailure:
             return verified
         verified_refs[schema_id] = verified[0]
+
+    if set(verified_refs) != consumed or consumed != manifest_resource_ids:
+        return _failure(GenesisResourceGraphFailureCode.GRAPH_UNKNOWN_ORPHAN_RESOURCE)
 
     consumed_ids = tuple(RootManagedResourceId(value) for value in sorted(consumed))
     verified_ordered = tuple(verified_refs[key] for key in sorted(verified_refs))

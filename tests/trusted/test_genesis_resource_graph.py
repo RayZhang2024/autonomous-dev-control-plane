@@ -389,6 +389,77 @@ def test_exact_synthetic_graph_with_all_resource_contents_is_accepted_and_non_be
         ValidatedGenesisResourceGraph()
 
 
+def _fixture_with_ordinary_policy() -> tuple[CandidateTrustedManifest, dict[str, bytes], dict[str, object]]:
+    return _fixture(
+        extra_resources=(("ordinary-policy", "POLICY", b"ordinary policy bytes"),),
+        graph_change=lambda graph: graph["policy_resources"].append("ordinary-policy"),
+        manifest_change=lambda manifest: manifest["policy_resources"].append("ordinary-policy"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "fixture_factory"),
+    [
+        ("implementation", _fixture),
+        ("build", _fixture),
+        ("runtime", _fixture),
+        ("core", _fixture),
+        ("ordinary-policy", _fixture_with_ordinary_policy),
+    ],
+    ids=("trusted-code", "build-definition", "runtime-artifact", "core-policy", "ordinary-policy"),
+)
+def test_every_manifest_resource_raw_byte_mutation_fails_digest_before_graph_parse(
+    resource_id: str,
+    fixture_factory: Callable[[], tuple[CandidateTrustedManifest, dict[str, bytes], dict[str, object]]],
+) -> None:
+    manifest, raw, _ = fixture_factory()
+    raw[resource_id] += b" altered"
+    _failure((manifest, raw, {}), GenesisResourceGraphFailureCode.GRAPH_RESOURCE_DIGEST_MISMATCH)
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "fixture_factory"),
+    [
+        ("implementation", _fixture),
+        ("build", _fixture),
+        ("runtime", _fixture),
+        ("core", _fixture),
+        ("ordinary-policy", _fixture_with_ordinary_policy),
+    ],
+    ids=("trusted-code", "build-definition", "runtime-artifact", "core-policy", "ordinary-policy"),
+)
+def test_missing_raw_bytes_for_manifest_resources_fail_closed(
+    resource_id: str,
+    fixture_factory: Callable[[], tuple[CandidateTrustedManifest, dict[str, bytes], dict[str, object]]],
+) -> None:
+    manifest, raw, _ = fixture_factory()
+    raw.pop(resource_id)
+    _failure((manifest, raw, {}), GenesisResourceGraphFailureCode.GRAPH_RESOURCE_MISSING)
+
+
+def test_malformed_structured_raw_with_stale_manifest_digest_fails_before_parse() -> None:
+    manifest, raw, _ = _fixture()
+    raw["graph"] = b"{"
+    _failure((manifest, raw, {}), GenesisResourceGraphFailureCode.GRAPH_RESOURCE_DIGEST_MISMATCH)
+
+
+def test_manifest_rebound_to_malformed_structured_raw_reaches_parse_failure() -> None:
+    manifest, raw, _ = _fixture()
+    rebound = _rebind_raw_resource(manifest, raw, "graph", b"{")
+    _failure((rebound, raw, {}), GenesisResourceGraphFailureCode.GRAPH_PARSE_FAILED)
+
+
+@pytest.mark.parametrize("resource_id", ("implementation", "build", "runtime"))
+def test_raw_digest_binding_and_dependency_lock_binding_are_independent(resource_id: str) -> None:
+    manifest, raw, _ = _fixture()
+    raw[resource_id] += b" raw mutation"
+    _failure((manifest, raw, {}), GenesisResourceGraphFailureCode.GRAPH_RESOURCE_DIGEST_MISMATCH)
+
+    manifest, raw, _ = _fixture()
+    rebound = _rebind_raw_resource(manifest, raw, resource_id, raw[resource_id] + b" coherent new raw")
+    _failure((rebound, raw, {}), GenesisResourceGraphFailureCode.GRAPH_FORMAT_INVALID)
+
+
 def test_standalone_issue_and_review_schemas_are_closed_without_config_bindings() -> None:
     manifest, raw, _ = _fixture(
         standalone_schema_ids=("issue-contract-schema", "review-verdict-schema")
@@ -798,6 +869,11 @@ def test_result_is_exactly_bound_to_verified_resource_references() -> None:
     result = validate_genesis_resource_graph(manifest, raw)
     assert type(result) is ValidatedGenesisResourceGraph
     verified_ids = {item.resource_id.value for item in result.verified_resource_refs}
+    manifest_ids = {item.resource_id.value for item in manifest.root_managed_resources}
+    consumed_ids = {item.value for item in result.consumed_resource_ids}
+    assert verified_ids == consumed_ids == manifest_ids
+    assert tuple(item.resource_id.value for item in result.verified_resource_refs) == tuple(sorted(manifest_ids))
+    assert tuple(item.value for item in result.consumed_resource_ids) == tuple(sorted(manifest_ids))
     assert {
         "graph", "module-policy", "lock", "conformance", "entry-T", "security-C",
         "wiring-P", "credential-M", "assumption-fixture",
