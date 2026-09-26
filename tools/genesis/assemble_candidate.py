@@ -64,6 +64,164 @@ _POLICY_PATHS = (
 _R3_GIT_BLOB = "30d4efcaa2adb38acbc0df5635c3bcba4710fa18"
 _R3_RAW_SHA256 = "36498b5d51227a553d452ee21d3fbc61aed7483dc9304939befddb2651acfd35"
 _R3_BYTE_LENGTH = 41155
+_EXECUTION_ISOLATION_DOMAIN = b"autodev.g9-execution-isolation-dependency/v1\0"
+_STAGED_PYTHON_PATH = r"C:\AutodevG9\shared\python313\python.exe"
+_STAGED_PYTHON_SHA256 = "081786173866d86cda1b06aa671848217fa0d635edb6dcd2218644466f4229cd"
+_ROLE_PRINCIPALS = (
+    {"role": "T", "account": r"Ray\autodev-g9-t", "sid": "S-1-5-21-711519901-190585334-3846127459-1016",
+     "token_type": "PRIMARY", "administrator": False},
+    {"role": "C", "account": r"Ray\autodev-g9-c", "sid": "S-1-5-21-711519901-190585334-3846127459-1017",
+     "token_type": "PRIMARY", "administrator": False},
+    {"role": "P", "account": r"Ray\autodev-g9-p", "sid": "S-1-5-21-711519901-190585334-3846127459-1018",
+     "token_type": "PRIMARY", "administrator": False},
+    {"role": "M", "account": r"Ray\autodev-g9-m", "sid": "S-1-5-21-711519901-190585334-3846127459-1019",
+     "token_type": "PRIMARY", "administrator": False},
+)
+_EXECUTION_ISOLATION_PROFILE_FIELDS = (
+    "format", "host_profile", "role_principals", "python_runtime", "staging_profile",
+    "channel_profile", "external_adapter_material", "role_interpreter_modules",
+    "production_github_mutation_credentials",
+)
+_PROFILE_RECORD_FIELDS = {
+    "host_profile": ("profile_id", "platform", "architecture", "domain"),
+    "python_runtime": ("identity", "version", "path", "sha256"),
+    "staging_profile": (
+        "profile_id", "root", "shared_role_access", "shared_operator_administrator_system_access",
+        "private_role_access", "root_store_role_access", "external_fence_release",
+    ),
+    "channel_profile": (
+        "profile_id", "format", "directions", "destination_credentials",
+        "controller_destination_credentials", "cross_role_messages",
+    ),
+}
+
+
+def _profile_record(value: object, fields: tuple[str, ...]) -> bool:
+    return type(value) is dict and set(value) == set(fields)
+
+
+def _make_execution_isolation_profile(
+    external_tcb_material: list[dict[str, str]],
+) -> dict[str, object]:
+    """Return the closed, non-candidate profile evidenced by the realized Windows run."""
+    by_path = {item["path"]: item["sha256"] for item in external_tcb_material}
+    if set(by_path) != {
+        "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
+        "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
+    }:
+        raise ValueError("execution-isolation adapter material is not the exact four-file set")
+    return {
+        "format": "autodev.g9-execution-isolation-profile/v1",
+        "host_profile": {
+            "profile_id": "autodev.g9.windows-dedicated-principals/v1",
+            "platform": "Windows",
+            "architecture": "AMD64",
+            "domain": "Ray",
+        },
+        "role_principals": [dict(item) for item in _ROLE_PRINCIPALS],
+        "python_runtime": {
+            "identity": "CPython",
+            "version": "3.13.14",
+            "path": _STAGED_PYTHON_PATH,
+            "sha256": _STAGED_PYTHON_SHA256,
+        },
+        "staging_profile": {
+            "profile_id": "autodev.g9.protected-staging-acl/v1",
+            "root": r"C:\AutodevG9",
+            "shared_role_access": "RX",
+            "shared_operator_administrator_system_access": "F",
+            "private_role_access": "owner-only-M;other-role-absent;inheritance-disabled",
+            "root_store_role_access": "DENY",
+            "external_fence_release": "DENY",
+        },
+        "channel_profile": {
+            "profile_id": "autodev.g9.t-to-cpm-role-bound-channels/v1",
+            "format": "autodev.genesis-ipc/v1",
+            "directions": ["T->C", "T->P", "T->M"],
+            "destination_credentials": "ROLE_LOCAL_ONLY",
+            "controller_destination_credentials": "NONE",
+            "cross_role_messages": "REJECT",
+        },
+        "external_adapter_material": [
+            {"path": item["path"], "sha256": item["sha256"]}
+            for item in sorted(external_tcb_material, key=lambda value: value["path"])
+        ],
+        "role_interpreter_modules": [
+            {"module_name": "ipc", "execution": "IMPORTED",
+             "path": "tools/genesis/ipc.py", "sha256": by_path["tools/genesis/ipc.py"]},
+            {"module_name": "role_worker", "execution": "SCRIPT",
+             "path": "tools/genesis/role_worker.py", "sha256": by_path["tools/genesis/role_worker.py"]},
+        ],
+        "production_github_mutation_credentials": "NONE",
+    }
+
+
+def _derive_execution_isolation_dependency_id(profile: dict[str, object]) -> str:
+    """Content-address the exact closed profile using canonical JSON and domain separation."""
+    if type(profile) is not dict or set(profile) != set(_EXECUTION_ISOLATION_PROFILE_FIELDS):
+        raise ValueError("execution-isolation profile has an open field set")
+    if profile["format"] != "autodev.g9-execution-isolation-profile/v1":
+        raise ValueError("execution-isolation profile format is unsupported")
+    for field, expected_fields in _PROFILE_RECORD_FIELDS.items():
+        if not _profile_record(profile[field], expected_fields):
+            raise ValueError(f"execution-isolation {field} has an open field set")
+        values = profile[field]
+        non_direction_values = (
+            [value for key, value in values.items() if key != "directions"]
+            if field == "channel_profile" else list(values.values())
+        )
+        if any(type(value) is not str or not value for value in non_direction_values):
+            raise ValueError(f"execution-isolation {field} contains an invalid value")
+    principals = profile["role_principals"]
+    if (type(principals) is not list or len(principals) != 4
+            or tuple(item.get("role") for item in principals if type(item) is dict) != _ROLES
+            or any(not _profile_record(item, ("role", "account", "sid", "token_type", "administrator"))
+                   or any(type(item[field]) is not str or not item[field]
+                          for field in ("role", "account", "sid", "token_type"))
+                   or type(item["administrator"]) is not bool for item in principals)):
+        raise ValueError("execution-isolation role-principal set is not closed")
+    if (type(profile["production_github_mutation_credentials"]) is not str
+            or profile["production_github_mutation_credentials"] != "NONE"):
+        raise ValueError("execution-isolation profile admits production GitHub credentials")
+    adapters = profile["external_adapter_material"]
+    if (type(adapters) is not list or len(adapters) != 4
+            or any(not _profile_record(item, ("path", "sha256")) for item in adapters)):
+        raise ValueError("execution-isolation adapter material is not closed")
+    if tuple(item["path"] for item in adapters) != tuple(sorted({
+        "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
+        "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
+    })):
+        raise ValueError("execution-isolation adapter material has unexpected paths or order")
+    for item in adapters:
+        if (type(item["sha256"]) is not str or len(item["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in item["sha256"])):
+            raise ValueError("execution-isolation adapter digest is invalid")
+    modules = profile["role_interpreter_modules"]
+    expected_modules = (("ipc", "IMPORTED", "tools/genesis/ipc.py"),
+                        ("role_worker", "SCRIPT", "tools/genesis/role_worker.py"))
+    if (type(modules) is not list or len(modules) != len(expected_modules)
+            or any(not _profile_record(item, ("module_name", "execution", "path", "sha256"))
+                   for item in modules)):
+        raise ValueError("execution-isolation role-interpreter module set is not closed")
+    for item, expected in zip(modules, expected_modules, strict=True):
+        if (tuple(item[field] for field in ("module_name", "execution", "path")) != expected
+                or item["sha256"] != next(record["sha256"] for record in adapters
+                                           if record["path"] == item["path"])):
+            raise ValueError("execution-isolation module identity is not bound to adapter material")
+    if (type(profile["channel_profile"].get("directions")) is not list
+            or not all(type(direction) is str for direction in profile["channel_profile"]["directions"])):
+        raise ValueError("execution-isolation channel direction set is invalid")
+    return "dep-execution-isolation-" + sha256(
+        _EXECUTION_ISOLATION_DOMAIN + _json(profile)
+    )
+
+
+def _manifest_external_tcb_dependencies(graph: dict[str, object]) -> list[dict[str, str]]:
+    """Mirror the exact graph dependency identities into the outer manifest."""
+    return [
+        {"dependency_id": item["dependency_id"], "assumption_resource": item["assumption_resource"]}
+        for item in graph["external_tcb_roles"]
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +268,9 @@ def _write_entry(role: str, runtime_id: str) -> dict[str, str]:
     }
 
 
-def _make_graph_resources(runtime_id: str) -> tuple[dict[str, bytes], dict[str, str], dict[str, object]]:
+def _make_graph_resources(
+    runtime_id: str, execution_isolation_dependency_id: str,
+) -> tuple[dict[str, bytes], dict[str, str], dict[str, object]]:
     raw: dict[str, bytes] = {}
     kinds: dict[str, str] = {}
     members: list[dict[str, str]] = []
@@ -183,7 +343,7 @@ def _make_graph_resources(runtime_id: str) -> tuple[dict[str, bytes], dict[str, 
             "runtime_binding": f"runtime-binding-{role}",
             "runtime_generation_binding": "runtime-generation-candidate",
             "root_context_binding": "root-context-candidate",
-            "external_isolation_dependency_id": "dep-execution-isolation",
+            "external_isolation_dependency_id": execution_isolation_dependency_id,
             "channels": [channel_values[item] for item in ("C", "P", "M")] if role == "T" else incoming,
         }
         access = {"T": "READ", "C": "READ_WRITE", "P": "READ", "M": "READ"}[role]
@@ -211,7 +371,7 @@ def _make_graph_resources(runtime_id: str) -> tuple[dict[str, bytes], dict[str, 
         }
     external = (
         ("ROOT_ACTIVATION_FENCE", "dep-root-activation-fence", "assumption-root-fence"),
-        ("EXECUTION_ISOLATION", "dep-execution-isolation", "assumption-execution-isolation"),
+        ("EXECUTION_ISOLATION", execution_isolation_dependency_id, "assumption-execution-isolation"),
         ("FIXTURE_EFFECT_SUBSTRATE", "dep-fixture-effect-substrate", "assumption-fixture-effects"),
     )
     external_roles: list[dict[str, object]] = []
@@ -238,7 +398,10 @@ def _make_graph_resources(runtime_id: str) -> tuple[dict[str, bytes], dict[str, 
         "format": "autodev.genesis-module-loading-policy/v1",
         "allowed_candidate_modules": list(sorted(RUNTIME_MEMBERS)),
         "explicitly_excluded_modules_or_prefixes": list(_EXCLUSIONS),
-        "third_party_runtime_policy": {"standard_library_policy": "ALLOW", "third_party_module_allowlist": []},
+        "third_party_runtime_policy": {
+            "standard_library_policy": "ALLOW",
+            "third_party_module_allowlist": ["ipc", "role_worker"],
+        },
         "dynamic_import_fallback": "NONE",
     }
     raw[module_policy_id] = _json(module_policy)
@@ -283,10 +446,16 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
          "sha256": sha256(Path(__file__).with_name(name).read_bytes())}
         for name in ("ipc.py", "role_worker.py", "windows_role_launcher.py", "windows_role_runner.py")
     ]
+    execution_isolation_profile = _make_execution_isolation_profile(external_tcb_material)
+    execution_isolation_dependency_id = _derive_execution_isolation_dependency_id(
+        execution_isolation_profile
+    )
     build_definition = _json({
         "format": "autodev.genesis-build-definition/v1",
         "repository_application_base": APPLICATION_BASE,
         "r2_executable_baseline": R2_EXECUTABLE_BASE,
+        "execution_isolation_dependency_id": execution_isolation_dependency_id,
+        "execution_isolation_profile": execution_isolation_profile,
         "build_tool": {
             "path": "tools/genesis/build_definition.py",
             "sha256": sha256((Path(__file__).with_name("build_definition.py")).read_bytes()),
@@ -313,7 +482,7 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
         "runtime_artifact_sha256": sha256(first.runtime_artifact),
     })
     runtime_id = "runtime"
-    raw, kinds, graph = _make_graph_resources(runtime_id)
+    raw, kinds, graph = _make_graph_resources(runtime_id, execution_isolation_dependency_id)
     conformance = _git_blob(APPLICATION_BASE, "docs/GENESIS_CONFORMANCE.md", git_cwd)
     conformance_blob = subprocess.run(
         ["git", "hash-object", "--stdin"], cwd=git_cwd, input=conformance,
@@ -387,14 +556,7 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
             {"config_id": binding["config_id"], "resource": binding["resource_id"]}
             for binding in graph["trusted_config_bindings"]
         ],
-        "external_tcb_dependencies": [
-            {"dependency_id": dependency, "assumption_resource": assumption}
-            for _, dependency, assumption in (
-                ("ROOT_ACTIVATION_FENCE", "dep-root-activation-fence", "assumption-root-fence"),
-                ("EXECUTION_ISOLATION", "dep-execution-isolation", "assumption-execution-isolation"),
-                ("FIXTURE_EFFECT_SUBSTRATE", "dep-fixture-effect-substrate", "assumption-fixture-effects"),
-            )
-        ],
+        "external_tcb_dependencies": _manifest_external_tcb_dependencies(graph),
     }
     manifest_raw = _json(manifest_data)
     manifest = load_candidate_trusted_manifest(manifest_raw)
@@ -416,6 +578,8 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
         "manifest_sha256": sha256(manifest_raw),
         "r4_validation": "PASS",
         "runtime_dependencies": [],
+        "execution_isolation_dependency_id": execution_isolation_dependency_id,
+        "execution_isolation_profile": execution_isolation_profile,
         "external_tcb_material": external_tcb_material,
     })
     evidence_id = _resource_id("D", evidence)
@@ -437,6 +601,8 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
              "service_principal": f"service-{role}-candidate"} for role in _ROLES
         ],
         "root_trust_anchor_profile_identity": "external-root-trust-anchor-first-genesis/v1",
+        "execution_isolation_dependency_id": execution_isolation_dependency_id,
+        "execution_isolation_profile": execution_isolation_profile,
         "external_tcb_material": external_tcb_material,
         "deterministic_evidence": {"record_id": evidence_id, "sha256": sha256(evidence)},
         "manifest_sha256": sha256(manifest_raw),

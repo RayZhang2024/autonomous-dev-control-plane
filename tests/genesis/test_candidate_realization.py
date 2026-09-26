@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ast
+import copy
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,17 @@ import zipfile
 
 import pytest
 
-from assemble_candidate import assemble_candidate
+from assemble_candidate import (
+    _EXECUTION_ISOLATION_DOMAIN,
+    _EXECUTION_ISOLATION_PROFILE_FIELDS,
+    _derive_execution_isolation_dependency_id,
+    _make_graph_resources,
+    _manifest_external_tcb_dependencies,
+    assemble_candidate,
+)
 from build_definition import (
     APPLICATION_BASE, AUTHORIZED_BASE, R2_EXECUTABLE_BASE, RUNTIME_MEMBERS, SOURCE_MEMBERS,
+    canonical_json_bytes,
 )
 from fixture_root_store import TemporaryRootStore
 from ipc import decode_ack, decode_message, encode_message
@@ -56,6 +65,102 @@ EXPECTED_MODULES = frozenset({
 @pytest.fixture(scope="module")
 def package():
     return assemble_candidate(git_cwd=str(REPOSITORY))
+
+
+def test_execution_isolation_dependency_id_is_exactly_derived_from_closed_profile(package):
+    build = json.loads(package.build_definition)
+    profile = build["execution_isolation_profile"]
+    expected = "dep-execution-isolation-" + hashlib.sha256(
+        _EXECUTION_ISOLATION_DOMAIN + canonical_json_bytes(profile)
+    ).hexdigest()
+    assert set(profile) == set(_EXECUTION_ISOLATION_PROFILE_FIELDS)
+    assert build["execution_isolation_dependency_id"] == expected
+    assert package.dependency_lock
+    assert json.loads(package.deterministic_evidence)["execution_isolation_dependency_id"] == expected
+    with zipfile.ZipFile(__import__("io").BytesIO(package.candidate_package)) as archive:
+        descriptor = json.loads(archive.read("candidate-package.json"))
+    assert descriptor["preimage"]["execution_isolation_dependency_id"] == expected
+    assert descriptor["preimage"]["execution_isolation_profile"] == profile
+
+
+@pytest.mark.parametrize("path", (
+    "tools/genesis/ipc.py",
+    "tools/genesis/role_worker.py",
+    "tools/genesis/windows_role_launcher.py",
+    "tools/genesis/windows_role_runner.py",
+))
+def test_external_isolation_code_digest_changes_dependency_assumption_manifest_and_contexts(package, path):
+    profile = json.loads(package.build_definition)["execution_isolation_profile"]
+    original_id = _derive_execution_isolation_dependency_id(profile)
+    changed = copy.deepcopy(profile)
+    item = next(value for value in changed["external_adapter_material"] if value["path"] == path)
+    item["sha256"] = "f" * 64
+    for module in changed["role_interpreter_modules"]:
+        if module["path"] == path:
+            module["sha256"] = item["sha256"]
+    changed_id = _derive_execution_isolation_dependency_id(changed)
+    assert changed_id != original_id
+
+    raw, _, graph = _make_graph_resources("runtime", changed_id)
+    assumption = json.loads(raw["assumption-execution-isolation"])
+    assert assumption == {
+        "format": "autodev.genesis-external-tcb-assumption/v1",
+        "role": "EXECUTION_ISOLATION",
+        "dependency_id": changed_id,
+    }
+    graph_binding = next(item for item in graph["external_tcb_roles"]
+                         if item["role"] == "EXECUTION_ISOLATION")
+    assert graph_binding["dependency_id"] == changed_id
+    assert {item["dependency_id"] for item in _manifest_external_tcb_dependencies(graph)} >= {changed_id}
+    for role in ("T", "C", "P", "M"):
+        assert json.loads(raw[f"security-{role}"])["external_isolation_dependency_id"] == changed_id
+
+
+@pytest.mark.parametrize("role", ("T", "C", "P", "M"))
+def test_each_reviewed_role_sid_changes_execution_isolation_profile_identity(package, role):
+    profile = json.loads(package.build_definition)["execution_isolation_profile"]
+    original_id = _derive_execution_isolation_dependency_id(profile)
+    changed = copy.deepcopy(profile)
+    principal = next(item for item in changed["role_principals"] if item["role"] == role)
+    principal["sid"] += "-99"
+    assert _derive_execution_isolation_dependency_id(changed) != original_id
+
+
+@pytest.mark.parametrize("field,value", (
+    ("sha256", "0" * 64),
+    ("version", "3.13.15"),
+    ("path", r"C:\AutodevG9\other-python\python.exe"),
+))
+def test_staged_cpython_profile_change_changes_execution_isolation_identity(package, field, value):
+    profile = json.loads(package.build_definition)["execution_isolation_profile"]
+    original_id = _derive_execution_isolation_dependency_id(profile)
+    changed = copy.deepcopy(profile)
+    changed["python_runtime"][field] = value
+    assert _derive_execution_isolation_dependency_id(changed) != original_id
+
+
+def test_module_loading_policy_allowlists_exact_external_role_modules_outside_candidate_runtime(package):
+    build = json.loads(package.build_definition)
+    profile = build["execution_isolation_profile"]
+    policy = json.loads(package.raw_resources["module-policy"])
+    assert policy["third_party_runtime_policy"]["third_party_module_allowlist"] == [
+        "ipc", "role_worker",
+    ]
+    assert not set(policy["third_party_runtime_policy"]["third_party_module_allowlist"]) & set(
+        policy["allowed_candidate_modules"]
+    )
+    assert profile["role_interpreter_modules"] == [
+        {"module_name": "ipc", "execution": "IMPORTED", "path": "tools/genesis/ipc.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/ipc.py")},
+        {"module_name": "role_worker", "execution": "SCRIPT", "path": "tools/genesis/role_worker.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/role_worker.py")},
+    ]
+    with zipfile.ZipFile(__import__("io").BytesIO(package.runtime_artifact)) as archive:
+        names = set(archive.namelist())
+    assert "ipc.py" not in names and "role_worker.py" not in names
+    assert all(item not in RUNTIME_MEMBERS for item in policy["third_party_runtime_policy"]["third_party_module_allowlist"])
 
 
 def test_exact_26_source_runtime_bijection_and_deterministic_repeat_builds(package):
