@@ -232,10 +232,23 @@ def _role_bootstrap(package, graph: dict[str, object], candidate: Path, worker: 
 
 
 def run_realized_roles() -> dict[str, object]:
+    """Run and tear down the non-authoritative role-isolation rehearsal."""
+    return _run_realized_roles(retained_session_id=None)
+
+
+def _launch_retained_deployment_processes(deployment_session_id: str) -> dict[str, object]:
+    """Launch the exact S/T/C/P/M set and transfer native handles to the root controller."""
+    if (type(deployment_session_id) is not str or len(deployment_session_id) != 64
+            or any(char not in "0123456789abcdef" for char in deployment_session_id)):
+        raise ValueError("controller deployment session identity is malformed")
+    return _run_realized_roles(retained_session_id=deployment_session_id)
+
+
+def _run_realized_roles(*, retained_session_id: str | None) -> dict[str, object]:
     from root_admin import ROOT_STORE_PATH
 
     canonical_root_namespace = ROOT_STORE_PATH.parent
-    if ROOT_STORE_PATH.exists() or canonical_root_namespace.exists():
+    if retained_session_id is None and (ROOT_STORE_PATH.exists() or canonical_root_namespace.exists()):
         raise RuntimeError("canonical root namespace/DB must remain absent during this implementation run")
     root_profile, substrate_profile, root_anchor_id, (root_dependency_id,
                                                        substrate_dependency_id) = _host_profiles()
@@ -271,7 +284,8 @@ def run_realized_roles() -> dict[str, object]:
     processes = {}
     reports = {}
     runtime_run_id = secrets.token_hex(32)
-    deployment_session_id = new_deployment_session_id()
+    deployment_session_id = retained_session_id or new_deployment_session_id()
+    retained_transferred = False
     substrate_process = None
     substrate_state: dict[str, object] | None = None
     try:
@@ -440,13 +454,14 @@ def run_realized_roles() -> dict[str, object]:
         if not fence_release_denied:
             raise AssertionError("closed IPC admitted external fence release")
 
-        for process in processes.values():
-            process.send_json_line({"control": "STOP"})
-        exit_codes = {role: process.wait() for role, process in processes.items()}
-        if any(exit_code != 0 for exit_code in exit_codes.values()):
-            raise AssertionError("one or more role workers did not stop cleanly")
-        if substrate_process.stop() != 0:
-            raise AssertionError("external substrate service did not stop cleanly")
+        if retained_session_id is None:
+            for process in processes.values():
+                process.send_json_line({"control": "STOP"})
+            exit_codes = {role: process.wait() for role, process in processes.items()}
+            if any(exit_code != 0 for exit_code in exit_codes.values()):
+                raise AssertionError("one or more role workers did not stop cleanly")
+            if substrate_process.stop() != 0:
+                raise AssertionError("external substrate service did not stop cleanly")
         substrate_state = {
             "sid": substrate_process.sid, "token_type": substrate_process.token_type,
             "administrator": substrate_process.is_administrator,
@@ -456,25 +471,31 @@ def run_realized_roles() -> dict[str, object]:
             "configuration_identity": sha256(canonical_json_bytes(substrate_profile)),
             "working_directory": str(external),
         }
-        with tempfile.TemporaryDirectory(prefix="g9-root-readiness-") as temp_root:
-            fixture_database = Path(temp_root) / "non-authoritative-root.sqlite3"
-            connection = sqlite3.connect(fixture_database)
-            try:
-                from root_admin import _SCHEMA_STATEMENTS
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                _insert_fence(connection, fence_row)
-                connection.commit()
-            finally:
-                connection.close()
+        if retained_session_id is not None:
             observed_root = inspect_uninitialized_root(
-                fixture_database, expected_fence_row=fence_row,
+                ROOT_STORE_PATH, expected_fence_row=fence_row,
                 deployment_session_id=deployment_session_id,
             )
-            observed_root["observation_scope"] = "NON_AUTHORITATIVE_TEMPORARY_FIXTURE_ONLY"
-            observed_root["canonical_root_database"] = "ABSENT_UNTOUCHED"
-            observed_root["fixture_database_sha256"] = sha256(fixture_database.read_bytes())
-        if ROOT_STORE_PATH.exists() or canonical_root_namespace.exists():
+        else:
+            with tempfile.TemporaryDirectory(prefix="g9-root-readiness-") as temp_root:
+                fixture_database = Path(temp_root) / "non-authoritative-root.sqlite3"
+                connection = sqlite3.connect(fixture_database)
+                try:
+                    from root_admin import _SCHEMA_STATEMENTS
+                    for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    _insert_fence(connection, fence_row)
+                    connection.commit()
+                finally:
+                    connection.close()
+                observed_root = inspect_uninitialized_root(
+                    fixture_database, expected_fence_row=fence_row,
+                    deployment_session_id=deployment_session_id,
+                )
+                observed_root["observation_scope"] = "NON_AUTHORITATIVE_TEMPORARY_FIXTURE_ONLY"
+                observed_root["canonical_root_database"] = "ABSENT_UNTOUCHED"
+                observed_root["fixture_database_sha256"] = sha256(fixture_database.read_bytes())
+        if retained_session_id is None and (ROOT_STORE_PATH.exists() or canonical_root_namespace.exists()):
             raise RuntimeError("canonical root namespace/DB changed during the rehearsal")
 
         member_by_role = {item["role"]: item for item in graph["members"]}
@@ -542,11 +563,13 @@ def run_realized_roles() -> dict[str, object]:
             ),
             "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         }
-        readiness = build_deployment_readiness(readiness_preimage)
-        if not verify_deployment_readiness(readiness):
-            raise AssertionError("Deployment Readiness content-address validation failed")
-        (candidate / "deployment-readiness.json").write_bytes(canonical_json_bytes(readiness))
-        return {
+        readiness = None
+        if retained_session_id is None:
+            readiness = build_deployment_readiness(readiness_preimage)
+            if not verify_deployment_readiness(readiness):
+                raise AssertionError("Deployment Readiness content-address validation failed")
+            (candidate / "deployment-readiness.json").write_bytes(canonical_json_bytes(readiness))
+        result = {
             "candidate_package_id": package.candidate_package_id,
             "runtime_sha256": package.runtime_sha256,
             "manifest_id": package.manifest_id,
@@ -554,8 +577,9 @@ def run_realized_roles() -> dict[str, object]:
             "root_anchor_id": root_anchor_id,
             "root_fence_dependency_id": root_dependency_id,
             "fixture_substrate_dependency_id": substrate_dependency_id,
-            "deployment_readiness_id": readiness["record_id"],
-            "deployment_readiness_path": str(candidate / "deployment-readiness.json"),
+            "deployment_readiness_id": readiness["record_id"] if readiness is not None else None,
+            "deployment_readiness_path": (str(candidate / "deployment-readiness.json")
+                                          if readiness is not None else None),
             "python_executable": str(PYTHON),
             "python_sha256": "081786173866d86cda1b06aa671848217fa0d635edb6dcd2218644466f4229cd",
             "roles": {
@@ -573,18 +597,29 @@ def run_realized_roles() -> dict[str, object]:
             "root_database": "ABSENT / UNTOUCHED",
             "production_github_mutation_credentials": "NONE",
         }
+        if retained_session_id is not None:
+            result["_retained_process_instances"] = {"S": substrate_process, **processes}
+            result["_deployment_readiness_preimage"] = readiness_preimage
+            result["_root_fence_profile"] = root_profile
+            result["_fixture_substrate_profile"] = substrate_profile
+            result["_deployment_session_id"] = deployment_session_id
+            result["_candidate_build_definition"] = json.loads(package.build_definition)
+            result["_root_anchor_id"] = root_anchor_id
+            retained_transferred = True
+        return result
     finally:
-        for process in processes.values():
-            try:
-                process.close()
-            except Exception:
-                pass
-        if substrate_process is not None:
-            try:
-                if not substrate_process.stdin.closed:
-                    substrate_process.stop()
-            except Exception:
-                substrate_process.close()
+        if not retained_transferred:
+            for process in processes.values():
+                try:
+                    process.close()
+                except Exception:
+                    pass
+            if substrate_process is not None:
+                try:
+                    if not substrate_process.stdin.closed:
+                        substrate_process.stop()
+                except Exception:
+                    substrate_process.close()
 
 
 if __name__ == "__main__":

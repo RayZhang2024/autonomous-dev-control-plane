@@ -107,6 +107,36 @@ def _write(value: dict[str, object]) -> None:
     sys.stdout.buffer.flush()
 
 
+def _fresh_protected_effect_probe(role: str, substrate: object,
+                                  candidate_package_id: str) -> dict[str, object]:
+    """Repeat only P/M's already-bound read/fenced-prepare denial observations."""
+    if role == "P":
+        fence = substrate.read_publication_fence()
+        response = substrate.prepare_publication("root-release-readiness-probe", b"")
+    elif role == "M":
+        fence = substrate.read_merge_fence()
+        response = substrate.prepare_merge("root-release-readiness-probe", b"")
+    else:
+        raise ValueError("protected-effect probe is limited to P/M")
+    expected_fence = {"fence": "FENCED", "revision": 0,
+                      "candidate_package_id": candidate_package_id}
+    expected_response = {"accepted": False, "reason": "TARGET_FENCED",
+                         "candidate_package_id": candidate_package_id}
+    if fence != expected_fence or response != expected_response:
+        raise PermissionError("protected target is not in the exact frozen denied state")
+    return {"control_probe": "PROTECTED_EFFECT", "role": role,
+            "fence": fence["fence"], "revision": fence["revision"],
+            "protected_effect_accepted": False,
+            "candidate_package_id": candidate_package_id}
+
+
+def _fence_release_probe(role: str) -> dict[str, object]:
+    if role not in _ENTRY:
+        raise ValueError("fence-release probe role is unsupported")
+    return {"control_probe": "FENCE_RELEASE", "role": role,
+            "accepted": False, "reason": "NO_RELEASE_CAPABILITY"}
+
+
 def _probe_access(role: str, shared_runtime: Path, private: dict[str, Path],
                   root_probe: Path) -> dict[str, object]:
     own = private[role] / f"probe-{os.getpid()}-{role}.tmp"
@@ -278,15 +308,39 @@ def main() -> int:
             if not line or len(line) > 64 * 1024:
                 close_canonical_state_owner(bootstrap["runtime_run_id"])
                 return 0
+            if line == b'{"control":"FENCE_RELEASE_PROBE"}\n':
+                _write(_fence_release_probe(role))
+                continue
             if role == "T":
                 if line == b'{"control":"STOP"}\n':
                     close_canonical_state_owner(bootstrap["runtime_run_id"])
                     return 0
+                if line == b'{"control":"PROTECTED_EFFECT_PROBE"}\n':
+                    _write({"accepted": False, "reason": "PROBE_NOT_APPLICABLE", "role": "T"})
+                    continue
+                if line == b'{"control":"ROOT_ACCESS_PROBE"}\n':
+                    access = _probe_access(role, shared_directory / "runtime.zip",
+                                           private_directories, Path(bootstrap["root_store_probe"]))
+                    _write({"role": role, "access": access})
+                    continue
                 _write({"accepted": False, "reason": "NO_DESTINATION_CHANNEL_CREDENTIALS"})
                 continue
             if line == b'{"control":"STOP"}\n':
                 close_canonical_state_owner(bootstrap["runtime_run_id"])
                 return 0
+            if line == b'{"control":"PROTECTED_EFFECT_PROBE"}\n':
+                if role not in ("P", "M"):
+                    _write({"accepted": False, "reason": "PROBE_NOT_APPLICABLE", "role": role})
+                else:
+                    _write(_fresh_protected_effect_probe(
+                        role, substrate, bootstrap["candidate_package_id"],
+                    ))
+                continue
+            if line == b'{"control":"ROOT_ACCESS_PROBE"}\n':
+                access = _probe_access(role, shared_directory / "runtime.zip",
+                                       private_directories, Path(bootstrap["root_store_probe"]))
+                _write({"role": role, "access": access})
+                continue
             try:
                 decoded = decode_message(line.rstrip(b"\r\n"), expected_role=role, key=key)
                 acknowledgment = encode_ack(

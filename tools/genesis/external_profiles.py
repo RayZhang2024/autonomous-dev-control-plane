@@ -145,19 +145,54 @@ def derive_acceptance_profile_id(profile: dict[str, object]) -> str:
     return _sha256(ACCEPTANCE_PROFILE_DOMAIN + canonical_json_bytes(profile))
 
 
-def derive_root_store_profile_id(*, schema_sha256: str, acl_profile_id: str,
-                                 acceptance_profile_id: str) -> str:
-    if not all(_valid_digest(value) for value in
-               (schema_sha256, acl_profile_id, acceptance_profile_id)):
+def derive_root_store_profile_id(*, schema_sha256: str, acl_profile_id: str) -> str:
+    if not all(_valid_digest(value) for value in (schema_sha256, acl_profile_id)):
         raise ValueError("root-store profile inputs are malformed")
     preimage = {
         "format": ROOT_STORE_PROFILE_NAME, "schema_sha256": schema_sha256,
         "canonical_path": r"C:\AutodevG9\root\root.sqlite3",
         "storage_semantics": "SQLITE_CREATE_IF_ABSENT_IMMEDIATE_TRANSACTIONS_APPEND_ONLY_HISTORY_V2",
+        "relation_formats": {
+            "acceptance": "autodev.genesis-acceptance-record/v1",
+            "initialization": "autodev.genesis-root-initialization-record/v1",
+            "release_verification": "autodev.genesis-release-verification/v1",
+        },
         "root_namespace_acl_profile_id": acl_profile_id,
-        "acceptance_profile_id": acceptance_profile_id,
     }
     return _sha256(ROOT_STORE_PROFILE_DOMAIN + canonical_json_bytes(preimage))
+
+
+def derive_external_root_controller_identity(profile: dict[str, object]) -> dict[str, str]:
+    """Derive the only controller identity accepted by a Stage-B attestation."""
+    material = profile.get("fence_controller_material") if type(profile) is dict else None
+    if (type(material) is not list or len(material) != 1
+            or type(material[0]) is not dict
+            or set(material[0]) != {"path", "sha256"}
+            or material[0]["path"] != "tools/genesis/fence_controller.py"
+            or not _valid_digest(material[0]["sha256"])):
+        raise ValueError("root controller source binding is not exact")
+    config = {
+        "format": "autodev.g9-root-controller-config/v1",
+        "session_roles": ["S", "T", "C", "P", "M"],
+        "continuity": "SAME_IN_MEMORY_NATIVE_PROCESS_HANDLES_THROUGH_A_INIT_RELEASE",
+        "phase_order": ["STAGE_B", "DEPLOYMENT_ATTESTATION", "ACCEPTANCE",
+                        "ROOT_INITIALIZATION", "FENCE_RELEASE"],
+        "root_store_profile_id": profile.get("root_store_profile_id"),
+        "root_namespace_acl_profile_id": (profile.get("root_namespace_acl_profile") or {}).get("profile_id")
+            if type(profile.get("root_namespace_acl_profile")) is dict else None,
+        "acceptance_profile_id": (profile.get("acceptance_profile") or {}).get("profile_id")
+            if type(profile.get("acceptance_profile")) is dict else None,
+        "capability_release_authority": "EXTERNAL_ROOT_ADMIN_ONLY",
+    }
+    if not all(_valid_digest(config[key]) for key in (
+            "root_store_profile_id", "root_namespace_acl_profile_id", "acceptance_profile_id")):
+        raise ValueError("root controller profile bindings are incomplete")
+    return {
+        "implementation_sha256": material[0]["sha256"],
+        "configuration_sha256": _sha256(
+            b"autodev.g9-root-controller-config/v1\0" + canonical_json_bytes(config)
+        ),
+    }
 
 
 def _validate_material(value: object) -> None:
@@ -341,8 +376,8 @@ def validate_root_fence_profile(profile: dict[str, object]) -> str:
     if profile["root_store_profile"] != ROOT_STORE_PROFILE_NAME:
         raise ValueError("root-store profile name is not frozen")
     if derive_root_store_profile_id(
-            schema_sha256=profile["root_store_schema_sha256"], acl_profile_id=acl["profile_id"],
-            acceptance_profile_id=acceptance["profile_id"]) != profile["root_store_profile_id"]:
+            schema_sha256=profile["root_store_schema_sha256"],
+            acl_profile_id=acl["profile_id"]) != profile["root_store_profile_id"]:
         raise ValueError("root-store profile identity is stale")
     if profile["candidate_role_access"] != "NO_WRITE":
         raise ValueError("candidate roles must have no root-store write access")
@@ -469,8 +504,7 @@ def build_external_profiles(
     }
     acceptance_id = derive_acceptance_profile_id(acceptance_semantics)
     store_id = derive_root_store_profile_id(schema_sha256=ROOT_STORE_SCHEMA_SHA256,
-                                            acl_profile_id=acl_id,
-                                            acceptance_profile_id=acceptance_id)
+                                            acl_profile_id=acl_id)
     anchor_preimage = {
         "repository": "RayZhang2024/autonomous-dev-control-plane",
         "root_store_profile": store_id,

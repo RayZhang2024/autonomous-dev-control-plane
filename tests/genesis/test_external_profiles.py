@@ -11,9 +11,11 @@ from external_profiles import (
     FIXTURE_SUBSTRATE_DOMAIN,
     ROOT_ANCHOR_DOMAIN,
     ROOT_FENCE_DOMAIN,
+    ROOT_STORE_PROFILE_DOMAIN,
     canonical_json_bytes,
     derive_root_anchor_id,
     derive_acceptance_profile_id,
+    derive_external_root_controller_identity,
     derive_root_namespace_acl_profile_id,
     derive_root_store_profile_id,
     validate_fixture_substrate_profile,
@@ -53,8 +55,7 @@ def _root_profile() -> dict[str, object]:
     }
     acceptance_id = derive_acceptance_profile_id(acceptance)
     store_id = derive_root_store_profile_id(schema_sha256="b" * 64,
-                                            acl_profile_id=acl_profile_id,
-                                            acceptance_profile_id=acceptance_id)
+                                            acl_profile_id=acl_profile_id)
     return {
         "format": "autodev.g9-root-activation-fence-profile/v1",
         "repository": "RayZhang2024/autonomous-dev-control-plane",
@@ -161,7 +162,6 @@ def test_root_fence_profile_identity_binds_each_external_host_and_authority_fact
     store_id = derive_root_store_profile_id(
         schema_sha256=changed["root_store_schema_sha256"],
         acl_profile_id=changed["root_namespace_acl_profile"]["profile_id"],
-        acceptance_profile_id=changed["acceptance_profile"]["profile_id"],
     )
     changed["root_store_profile_id"] = store_id
     changed["canonical_root_store"]["profile_id"] = store_id
@@ -179,6 +179,54 @@ def test_root_fence_profile_identity_binds_each_external_host_and_authority_fact
     changed["canonical_root_store"]["path"] = r"D:\other\root.sqlite3"
     with pytest.raises(ValueError):
         validate_root_fence_profile(changed)
+
+
+def test_root_store_derivation_is_acyclic_and_binds_relation_formats_not_acceptance_profile():
+    profile = _root_profile()
+    store_id = profile["root_store_profile_id"]
+    store_preimage = {
+        "format": "autodev.g9-canonical-root-store/v1",
+        "schema_sha256": profile["root_store_schema_sha256"],
+        "canonical_path": r"C:\AutodevG9\root\root.sqlite3",
+        "storage_semantics": "SQLITE_CREATE_IF_ABSENT_IMMEDIATE_TRANSACTIONS_APPEND_ONLY_HISTORY_V2",
+        "relation_formats": {
+            "acceptance": "autodev.genesis-acceptance-record/v1",
+            "initialization": "autodev.genesis-root-initialization-record/v1",
+            "release_verification": "autodev.genesis-release-verification/v1",
+        },
+        "root_namespace_acl_profile_id": profile["root_namespace_acl_profile"]["profile_id"],
+    }
+    assert store_id == hashlib.sha256(
+        ROOT_STORE_PROFILE_DOMAIN + canonical_json_bytes(store_preimage)
+    ).hexdigest()
+    changed_acceptance = copy.deepcopy(profile)
+    changed_acceptance["acceptance_profile"]["interactive_confirmation"] = "different-confirmation"
+    # The acceptance identity is a sibling derivation; it does not feed root-store identity.
+    assert derive_root_store_profile_id(
+        schema_sha256=changed_acceptance["root_store_schema_sha256"],
+        acl_profile_id=changed_acceptance["root_namespace_acl_profile"]["profile_id"],
+    ) == store_id
+    changed_schema_id = derive_root_store_profile_id(
+        schema_sha256="d" * 64,
+        acl_profile_id=profile["root_namespace_acl_profile"]["profile_id"],
+    )
+    changed_acl_id = derive_root_store_profile_id(
+        schema_sha256=profile["root_store_schema_sha256"], acl_profile_id="e" * 64,
+    )
+    assert changed_schema_id != store_id
+    assert changed_acl_id != store_id
+
+
+def test_external_root_controller_identity_is_derived_from_bound_source_and_profile():
+    profile = _root_profile()
+    identity = derive_external_root_controller_identity(profile)
+    assert identity["implementation_sha256"] == profile["fence_controller_material"][0]["sha256"]
+    changed = copy.deepcopy(profile)
+    changed["acceptance_profile"]["profile_id"] = "f" * 64
+    assert derive_external_root_controller_identity(changed) != identity
+    changed = copy.deepcopy(profile)
+    changed["fence_controller_material"][0]["sha256"] = "0" * 64
+    assert derive_external_root_controller_identity(changed) != identity
 
 
 @pytest.mark.parametrize("field,value", (

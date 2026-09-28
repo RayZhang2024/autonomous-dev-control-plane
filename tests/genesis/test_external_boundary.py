@@ -7,6 +7,8 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import sys
+import tempfile
 from types import SimpleNamespace
 import sqlite3
 
@@ -19,7 +21,8 @@ import role_worker
 import windows_role_runner
 import windows_substrate_launcher
 from deployment_readiness import build_deployment_readiness, verify_deployment_readiness
-from external_profiles import build_external_profiles, canonical_json_bytes, derive_host_profile_id
+from external_profiles import (build_external_profiles, canonical_json_bytes,
+                               derive_external_root_controller_identity, derive_host_profile_id)
 from fixture_substrate import (
     FixtureEffectState,
     FixtureSubstrateServer,
@@ -789,8 +792,8 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
         "deployment_session_id": session,
         "root_state_observation": root_observation,
         "roles": roles, "process_instance_observations": process_observations,
-        "external_root_controller_identity": {"implementation_sha256": "9" * 64,
-                                                "configuration_sha256": "a" * 64},
+        "external_root_controller_identity": derive_external_root_controller_identity(
+            _TEST_ROOT_PROFILE),
         "staged_external_material": sorted({
             item["path"]: item["sha256"]
             for collection in (
@@ -838,6 +841,19 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
         for path, digest in preimage["staged_external_material"]
     ]
     return root_admin.build_deployment_attestation(preimage, fence, session)
+
+
+def test_deployment_attestation_rejects_caller_selected_controller_digests():
+    fence = _test_fence_row()
+    attestation = _fixture_attestation(fence, "2" * 64)
+    changed = json.loads(json.dumps(attestation))
+    changed["preimage"]["external_root_controller_identity"] = {
+        "implementation_sha256": "9" * 64,
+        "configuration_sha256": "a" * 64,
+    }
+    changed["record_id"] = hashlib.sha256(canonical_json_bytes(changed["preimage"])).hexdigest()
+    with pytest.raises(ValueError, match="exact bound controller"):
+        root_admin._validate_deployment_attestation(changed, fence, "2" * 64)
 
 
 def test_acceptance_confirmation_binds_exact_stable_subject_not_timestamp():
@@ -943,6 +959,137 @@ def test_root_mutations_require_retained_native_session_not_a_boolean_callback()
     assert "final_liveness_check" not in inspect.signature(
         root_admin.release_capability_fence,
     ).parameters
+    with pytest.raises(TypeError, match="use RetainedRootControllerSession.launch"):
+        fence_controller.RetainedRootControllerSession()
+
+
+def test_controller_launch_generates_session_id_and_transfers_exact_process_set(monkeypatch):
+    session_id = "d" * 64
+    processes = {role: object() for role in ("S", "T", "C", "P", "M")}
+
+    class FakeRetained:
+        def __init__(self, received_id, received_processes):
+            assert received_id == session_id
+            assert received_processes is processes
+            self.deployment_session_id = received_id
+
+        def assert_live(self):
+            return None
+
+    import windows_role_runner
+
+    monkeypatch.setattr(windows_role_runner, "_host_profiles", lambda: (
+        _TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES,
+    ))
+    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes", lambda value: {
+        "_root_fence_profile": _TEST_ROOT_PROFILE,
+        "_deployment_session_id": value,
+        "_retained_process_instances": processes,
+    })
+    monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session_id)
+    monkeypatch.setattr(fence_controller, "RetainedDeploymentSession", FakeRetained)
+    controller = fence_controller.RetainedRootControllerSession.launch()
+    assert controller.deployment_session_id == session_id
+    assert controller.controller_identity == derive_external_root_controller_identity(_TEST_ROOT_PROFILE)
+
+
+@pytest.mark.parametrize("role", ("P", "M"))
+def test_fresh_effect_probe_is_role_bound_and_fails_closed(role):
+    package_id = "a" * 64
+
+    class Substrate:
+        def read_publication_fence(self):
+            return {"fence": "FENCED", "revision": 0,
+                    "candidate_package_id": package_id}
+
+        def read_merge_fence(self):
+            return {"fence": "FENCED", "revision": 0,
+                    "candidate_package_id": package_id}
+
+        def prepare_publication(self, effect_id, payload):
+            assert effect_id == "root-release-readiness-probe" and payload == b""
+            return {"accepted": False, "reason": "TARGET_FENCED",
+                    "candidate_package_id": package_id}
+
+        def prepare_merge(self, effect_id, payload):
+            assert effect_id == "root-release-readiness-probe" and payload == b""
+            return {"accepted": False, "reason": "TARGET_FENCED",
+                    "candidate_package_id": package_id}
+
+    assert role_worker._fresh_protected_effect_probe(role, Substrate(), package_id) == {
+        "control_probe": "PROTECTED_EFFECT", "role": role, "fence": "FENCED",
+        "revision": 0, "protected_effect_accepted": False,
+        "candidate_package_id": package_id,
+    }
+
+    class Released(Substrate):
+        def read_publication_fence(self):
+            return {"fence": "RELEASED", "revision": 1,
+                    "candidate_package_id": package_id}
+
+        def read_merge_fence(self):
+            return {"fence": "RELEASED", "revision": 1,
+                    "candidate_package_id": package_id}
+
+    with pytest.raises(PermissionError, match="exact frozen denied state"):
+        role_worker._fresh_protected_effect_probe(role, Released(), package_id)
+
+
+@pytest.mark.parametrize("role", ("T", "C", "P", "M"))
+def test_role_fence_release_probe_is_closed_and_never_authorizes_release(role):
+    assert role_worker._fence_release_probe(role) == {
+        "control_probe": "FENCE_RELEASE", "role": role,
+        "accepted": False, "reason": "NO_RELEASE_CAPABILITY",
+    }
+    with pytest.raises(ValueError, match="unsupported"):
+        role_worker._fence_release_probe("S")
+
+
+def test_token_groups_native_layout_aligns_the_flexible_array_for_win64():
+    import ctypes
+
+    pointer_alignment = ctypes.alignment(root_admin._SidAndAttributes)
+    expected_offset = ((ctypes.sizeof(ctypes.c_ulong) + pointer_alignment - 1)
+                       // pointer_alignment) * pointer_alignment
+    assert root_admin._TokenGroups.groups.offset == expected_offset
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        assert root_admin._TokenGroups.groups.offset == 8
+
+
+@pytest.mark.parametrize(("attributes", "expected"), (
+    (0x4, True),
+    (0x0, False),
+    (0x10, False),
+    (0x4 | 0x10, False),
+))
+def test_admin_group_must_be_enabled_and_not_deny_only(attributes, expected):
+    assert root_admin._group_attributes_are_enabled_admin(attributes) is expected
+
+
+def test_root_acl_uses_protected_not_conflicting_unprotected_dacl_flag():
+    assert root_admin._ROOT_ACL_SECURITY_INFORMATION & 0x80000000
+    assert not (root_admin._ROOT_ACL_SECURITY_INFORMATION
+                & root_admin._UNPROTECTED_DACL_SECURITY_INFORMATION)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows token APIs")
+def test_native_current_token_reports_exact_sid_and_elevation_boolean():
+    sid, primary, elevated, enabled_admin = root_admin._current_token_facts()
+    assert sid.startswith("S-1-")
+    assert primary is True
+    assert type(elevated) is bool
+    assert type(enabled_admin) is bool
+    assert root_admin._current_token_identity() == (sid, primary and elevated and enabled_admin)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+def test_native_protected_acl_application_and_readback_use_temporary_directory_only():
+    sid, _ = root_admin._current_token_identity()
+    with tempfile.TemporaryDirectory(prefix="g9-acl-native-") as directory:
+        namespace = Path(directory)
+        sddl = f"O:{sid}G:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;S-1-5-18)"
+        root_admin._set_and_verify_root_acl(namespace, sddl)
+        assert namespace.is_dir()
 
 
 def _authorize_temp_root_mutation(monkeypatch):

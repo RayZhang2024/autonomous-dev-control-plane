@@ -19,7 +19,8 @@ from typing import Any, Callable, Mapping
 
 from external_profiles import (
     canonical_json_bytes, derive_root_anchor_id, derive_root_store_profile_id,
-    derive_execution_isolation_dependency_id, derive_host_profile_id,
+    derive_execution_isolation_dependency_id, derive_external_root_controller_identity,
+    derive_host_profile_id,
     validate_fixture_substrate_profile,
     validate_root_fence_profile,
 )
@@ -31,6 +32,8 @@ ACCEPTANCE_FORMAT = "autodev.genesis-acceptance-record/v1"
 INITIALIZATION_FORMAT = "autodev.genesis-root-initialization-record/v1"
 RELEASE_FORMAT = "autodev.genesis-release-verification/v1"
 ROOT_STORE_PROFILE = "autodev.g9-canonical-root-store/v1"
+_ROOT_ACL_SECURITY_INFORMATION = 0x00000001 | 0x00000002 | 0x00000004 | 0x80000000
+_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 BOOTSTRAP_APPROVER_ACCOUNT = r"ray\zhang"
 BOOTSTRAP_APPROVER_SID = "S-1-5-21-711519901-190585334-3846127459-1001"
 
@@ -64,6 +67,21 @@ RELEASE_FIELDS = (
     "external_material_identities", "protected_effect_denial_observation",
     "resulting_release_fence_identity", "released_by", "released_at",
 )
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_ulong)]
+
+
+class _TokenGroups(ctypes.Structure):
+    # TOKEN_GROUPS contains a DWORD followed by SID_AND_ATTRIBUTES[ANYSIZE_ARRAY].
+    # ctypes supplies the native pointer-alignment padding required on Win64.
+    _fields_ = [("group_count", ctypes.c_ulong),
+                ("groups", _SidAndAttributes * 1)]
+
+
+def _group_attributes_are_enabled_admin(attributes: int) -> bool:
+    return type(attributes) is int and bool(attributes & 0x4) and not bool(attributes & 0x10)
 ATTESTATION_FIELDS = frozenset({
     "format", "candidate_package_id", "genesis_manifest_id", "deterministic_evidence_ids",
     "review_record_id", "repository_source_commit", "runtime_artifact_sha256", "python_runtime",
@@ -569,7 +587,6 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
     if derive_root_store_profile_id(
             schema_sha256=preimage["root_store_schema_sha256"],
             acl_profile_id=preimage["root_namespace_acl_profile_id"],
-            acceptance_profile_id=preimage["acceptance_profile_id"],
     ) != preimage["root_store_profile_id"]:
         raise ValueError("deployment attestation root-store profile identity is inconsistent")
     if derive_root_anchor_id({
@@ -759,9 +776,10 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
                     for path in sorted(expected_material)]:
         raise ValueError("deployment attestation staged material differs from bound profiles")
     controller = preimage["external_root_controller_identity"]
-    if (type(controller) is not dict or set(controller) != {"implementation_sha256", "configuration_sha256"}
-            or not all(_digest(value) for value in controller.values())):
-        raise ValueError("deployment attestation root-controller identity is malformed")
+    if (type(controller) is not dict
+            or set(controller) != {"implementation_sha256", "configuration_sha256"}
+            or controller != derive_external_root_controller_identity(root_profile)):
+        raise ValueError("deployment attestation root-controller identity is not the exact bound controller")
     return record["record_id"]
 
 
@@ -850,6 +868,17 @@ class RetainedDeploymentSession:
             return True
         except (AttributeError, KeyError, TypeError):
             return False
+
+    def assert_live(self) -> None:
+        """Fail closed unless the original exact native process handles remain live."""
+        for role, captured in self._captured.items():
+            process, pid, sid, token_type, administrator, creation, handle = captured
+            if (process is not self._processes[role] or process.pid != pid
+                    or process.sid != sid or process.token_type != token_type
+                    or process.is_administrator is not administrator
+                    or process.creation_time_100ns != creation
+                    or process.process_handle != handle or process.is_live() is not True):
+                raise PermissionError("retained root-controller process/session continuity was lost")
 
 
 def append_acceptance(
@@ -1550,16 +1579,34 @@ def _set_and_verify_root_acl(namespace: Path, expected_sddl: str) -> None:
     convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
                         ctypes.POINTER(ctypes.c_ulong)]
     convert.restype = ctypes.c_int
-    flags = 0x00000001 | 0x00000002 | 0x00000004 | 0x80000000 | 0x20000000
+    # Set and read the exact protected owner/group/DACL only. PROTECTED and
+    # UNPROTECTED are opposing inheritance controls and must never be combined.
+    flags = _ROOT_ACL_SECURITY_INFORMATION
+    to_sddl = advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    to_sddl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                        ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong)]
+    to_sddl.restype = ctypes.c_int
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
     if not convert(expected_sddl, 1, ctypes.byref(descriptor), None):
         raise ctypes.WinError(ctypes.get_last_error())
+    expected_normalized = ctypes.c_wchar_p()
+    expected_chars = ctypes.c_ulong()
     try:
+        if not to_sddl(descriptor, 1, flags, ctypes.byref(expected_normalized),
+                       ctypes.byref(expected_chars)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        normalized_sddl = expected_normalized.value
+        kernel.LocalFree(expected_normalized)
+        expected_normalized = ctypes.c_wchar_p()
         set_security = advapi.SetFileSecurityW
         set_security.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_void_p]
         set_security.restype = ctypes.c_int
         if not set_security(str(namespace), flags, descriptor):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
+        if expected_normalized:
+            kernel.LocalFree(expected_normalized)
         kernel.LocalFree.argtypes = [ctypes.c_void_p]
         kernel.LocalFree.restype = ctypes.c_void_p
         kernel.LocalFree(descriptor)
@@ -1575,21 +1622,17 @@ def _set_and_verify_root_acl(namespace: Path, expected_sddl: str) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
     actual = ctypes.c_wchar_p()
     out_chars = ctypes.c_ulong()
-    to_sddl = advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW
-    to_sddl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
-                        ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong)]
-    to_sddl.restype = ctypes.c_int
     if not to_sddl(buffer, 1, flags, ctypes.byref(actual), ctypes.byref(out_chars)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        if actual.value != expected_sddl:
+        if actual.value != normalized_sddl:
             raise PermissionError("canonical root namespace ACL differs from its bound profile")
     finally:
         kernel.LocalFree(actual)
 
 
-def _current_token_identity() -> tuple[str, bool]:
-    """Return exact TokenUser SID and enabled-admin/elevation facts for current primary token."""
+def _current_token_facts() -> tuple[str, bool, bool, bool]:
+    """Read TokenUser, primary type, elevation, and enabled non-deny-only Admin SID."""
     if sys.platform != "win32":
         raise PermissionError("external root administration requires Windows")
     advapi, kernel = ctypes.WinDLL("advapi32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1636,23 +1679,28 @@ def _current_token_identity() -> tuple[str, bool]:
         primary = ctypes.cast(token_type, ctypes.POINTER(ctypes.c_ulong)).contents.value == 1
         elevated = bool(ctypes.cast(elevation, ctypes.POINTER(ctypes.c_ulong)).contents.value)
         groups = token_buffer(2)
-        count = ctypes.cast(groups, ctypes.POINTER(ctypes.c_ulong)).contents.value
-        offset = ctypes.sizeof(ctypes.c_ulong)
-        class _SidAndAttributes(ctypes.Structure):
-            _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_ulong)]
-        group_ptr = ctypes.cast(ctypes.addressof(groups) + offset, ctypes.POINTER(_SidAndAttributes))
+        token_groups = ctypes.cast(groups, ctypes.POINTER(_TokenGroups)).contents
+        count = token_groups.group_count
+        group_ptr = ctypes.cast(ctypes.addressof(groups) + _TokenGroups.groups.offset,
+                                ctypes.POINTER(_SidAndAttributes))
         admin_sid = ctypes.c_void_p()
         if not advapi.ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(admin_sid)):
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             enabled = any(advapi.EqualSid(group_ptr[i].sid, admin_sid)
-                          and (group_ptr[i].attributes & 0x4)
-                          and not (group_ptr[i].attributes & 0x10) for i in range(count))
+                          and _group_attributes_are_enabled_admin(group_ptr[i].attributes)
+                          for i in range(count))
         finally:
             kernel.LocalFree(admin_sid)
-        return sid, bool(primary and elevated and enabled)
+        return sid, primary, elevated, enabled
     finally:
         kernel.CloseHandle(token)
+
+
+def _current_token_identity() -> tuple[str, bool]:
+    """Return exact SID and conjunction of the frozen elevated-primary-admin facts."""
+    sid, primary, elevated, enabled_admin = _current_token_facts()
+    return sid, bool(primary and elevated and enabled_admin)
 
 
 def _require_external_root_admin(expected_admin_sid: str) -> str:
