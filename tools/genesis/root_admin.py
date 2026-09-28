@@ -24,6 +24,10 @@ from external_profiles import (
     validate_fixture_substrate_profile,
     validate_root_fence_profile,
 )
+from genesis_provenance import (
+    stage_b_subject_digest, validate_genesis_exact_head_review_record,
+    validate_post_merge_binding,
+)
 
 ROOT_STORE_PATH = Path(r"C:\AutodevG9\root\root.sqlite3")
 ROOT_STATE_FORMAT = "autodev.g9-root-state/v1"
@@ -84,7 +88,8 @@ def _group_attributes_are_enabled_admin(attributes: int) -> bool:
     return type(attributes) is int and bool(attributes & 0x4) and not bool(attributes & 0x10)
 ATTESTATION_FIELDS = frozenset({
     "format", "candidate_package_id", "genesis_manifest_id", "deterministic_evidence_ids",
-    "review_record_id", "repository_source_commit", "runtime_artifact_sha256", "python_runtime",
+    "genesis_review_record", "post_merge_binding", "stage_b_subject_digest",
+    "external_root_controller_security_context", "runtime_artifact_sha256", "python_runtime",
     "execution_isolation_dependency_id", "execution_isolation_profile_sha256",
     "execution_isolation_profile", "root_fence_dependency_id", "root_fence_profile_sha256",
     "root_fence_profile", "root_store_profile_id",
@@ -524,17 +529,33 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
             or preimage["fixture_substrate_dependency_id"]
                != fence["fixture_effect_substrate_dependency_id"]):
         raise ValueError("deployment attestation is stale or belongs to another session")
-    for field in ("review_record_id", "runtime_artifact_sha256", "execution_isolation_profile_sha256",
+    for field in ("runtime_artifact_sha256", "execution_isolation_profile_sha256",
                   "root_fence_profile_sha256", "root_store_profile_id", "root_store_schema_sha256",
                   "root_namespace_acl_profile_id", "acceptance_profile_id",
                   "fixture_substrate_profile_sha256", "root_anchor_id", "deployment_session_id",
                   "host_profile_id"):
         if not _digest(preimage[field]):
             raise ValueError(f"deployment attestation {field} is malformed")
-    if (type(preimage["repository_source_commit"]) is not str
-            or len(preimage["repository_source_commit"]) != 40
-            or any(c not in "0123456789abcdef" for c in preimage["repository_source_commit"])):
-        raise ValueError("deployment attestation repository provenance is malformed")
+    review_record = validate_genesis_exact_head_review_record(preimage["genesis_review_record"])
+    post_merge_binding = validate_post_merge_binding(
+        preimage["post_merge_binding"], review_record,
+    )
+    review = review_record["preimage"]
+    binding = post_merge_binding["preimage"]
+    candidate = binding["post_merge_candidate"]
+    if (preimage["stage_b_subject_digest"] != stage_b_subject_digest(review_record, post_merge_binding)
+            or preimage["candidate_package_id"] != candidate["candidate_package_id"]
+            or preimage["genesis_manifest_id"] != candidate["genesis_manifest_id"]
+            or preimage["deterministic_evidence_ids"] != [candidate["deterministic_evidence_id"]]
+            or preimage["runtime_artifact_sha256"] != candidate["runtime_artifact_sha256"]
+            or preimage["root_anchor_id"] != candidate["root_anchor_id"]
+            or preimage["root_fence_dependency_id"] != candidate["ROOT_ACTIVATION_FENCE"]
+            or preimage["execution_isolation_dependency_id"] != candidate["EXECUTION_ISOLATION"]
+            or preimage["fixture_substrate_dependency_id"] != candidate["FIXTURE_EFFECT_SUBSTRATE"]
+            or review["reviewed_head_sha"] != binding["reviewed_head_sha"]
+            or review["pr_number"] != binding["pr_number"]
+            or binding["current_main_sha"] != binding["merge_commit_sha"]):
+        raise ValueError("deployment attestation provenance conflicts with its Stage-B subject")
     for field in ("execution_isolation_dependency_id", "root_fence_dependency_id",
                   "fixture_substrate_dependency_id"):
         value = preimage[field]
@@ -765,6 +786,7 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
     expected_material: dict[str, str] = {}
     for collection in (
         root_profile["root_admin_tool_material"], root_profile["fence_controller_material"],
+        root_profile["genesis_provenance_material"],
         substrate_profile["implementation_material"], isolation_profile["role_interpreter_modules"],
     ):
         for item in collection:
@@ -780,15 +802,41 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
             or set(controller) != {"implementation_sha256", "configuration_sha256"}
             or controller != derive_external_root_controller_identity(root_profile)):
         raise ValueError("deployment attestation root-controller identity is not the exact bound controller")
+    security_context = preimage["external_root_controller_security_context"]
+    expected_security_context = {
+        "root_admin_sid": root_profile["root_admin_principal"]["sid"],
+        "primary_token": True,
+        "elevated_admin": True,
+        "administrators_sid_enabled": True,
+        "controller_implementation_identity": controller["implementation_sha256"],
+        "controller_configuration_identity": controller["configuration_sha256"],
+        "deployment_session_id": session_id,
+    }
+    if (type(security_context) is not dict
+            or set(security_context) != set(expected_security_context)
+            or security_context != expected_security_context):
+        raise ValueError("deployment attestation external root-controller security context is invalid")
     return record["record_id"]
 
 
 def build_deployment_attestation(preimage: dict[str, object], fence_row: dict[str, object],
-                                 deployment_session_id: str) -> dict[str, object]:
-    """Content-address a supplied Stage-B evidence preimage and verify its closed bindings."""
+                                 controller_session: object) -> dict[str, object]:
+    """Content-address S only from the exact live controller that selected Stage B."""
+    from fence_controller import RetainedRootControllerSession
+
+    if type(controller_session) is not RetainedRootControllerSession:
+        raise TypeError("S construction requires the exact retained Stage-B root controller")
+    controller_session.assert_live()
+    deployment_session_id = controller_session.deployment_session_id
     fence = _validate_fence_row(fence_row)
     if type(preimage) is not dict or set(preimage) != ATTESTATION_FIELDS:
         raise ValueError("deployment attestation preimage has an open or incomplete field set")
+    if (preimage.get("genesis_review_record") != controller_session._genesis_review_record
+            or preimage.get("post_merge_binding") != controller_session._post_merge_binding
+            or preimage.get("stage_b_subject_digest") != controller_session._stage_b_subject_digest
+            or preimage.get("external_root_controller_security_context")
+               != controller_session._controller_security_context):
+        raise PermissionError("S provenance was not selected by this retained Stage-B controller")
     record = {
         "record_id": hashlib.sha256(canonical_json_bytes(preimage)).hexdigest(),
         "preimage": preimage,
@@ -1697,6 +1745,22 @@ def _current_token_facts() -> tuple[str, bool, bool, bool]:
         kernel.CloseHandle(token)
 
 
+def _require_external_root_admin_context(expected_admin_sid: str) -> dict[str, object]:
+    """Authenticate the exact profile-bound elevated primary admin token."""
+    if not _is_hex_sid(expected_admin_sid):
+        raise PermissionError("expected external root-admin SID is invalid")
+    sid, primary, elevated, enabled_admin = _current_token_facts()
+    if (sid != expected_admin_sid or primary is not True or elevated is not True
+            or enabled_admin is not True):
+        raise PermissionError("caller is not the profile-bound elevated external root administrator")
+    return {
+        "root_admin_sid": sid,
+        "primary_token": True,
+        "elevated_admin": True,
+        "administrators_sid_enabled": True,
+    }
+
+
 def _current_token_identity() -> tuple[str, bool]:
     """Return exact SID and conjunction of the frozen elevated-primary-admin facts."""
     sid, primary, elevated, enabled_admin = _current_token_facts()
@@ -1704,12 +1768,7 @@ def _current_token_identity() -> tuple[str, bool]:
 
 
 def _require_external_root_admin(expected_admin_sid: str) -> str:
-    if not _is_hex_sid(expected_admin_sid):
-        raise PermissionError("expected external root-admin SID is invalid")
-    actual_sid, is_elevated_admin = _current_token_identity()
-    if actual_sid != expected_admin_sid or not is_elevated_admin:
-        raise PermissionError("caller is not the profile-bound elevated external root administrator")
-    return actual_sid
+    return _require_external_root_admin_context(expected_admin_sid)["root_admin_sid"]
 
 
 def main() -> int:

@@ -48,7 +48,7 @@ ROOT_FENCE_FIELDS = frozenset({
     "format", "repository", "design_lineage", "root_anchor_namespace",
     "root_store_profile", "root_store_profile_id", "root_store_schema_sha256",
     "root_namespace_acl_profile", "acceptance_profile", "root_admin_tool_material",
-    "fence_controller_material", "python_runtime", "root_admin_principal",
+    "fence_controller_material", "genesis_provenance_material", "python_runtime", "root_admin_principal",
     "canonical_root_store", "candidate_role_access", "capability_release_authority",
     "production_github_mutation_credentials",
 })
@@ -182,6 +182,7 @@ def derive_external_root_controller_identity(profile: dict[str, object]) -> dict
             if type(profile.get("root_namespace_acl_profile")) is dict else None,
         "acceptance_profile_id": (profile.get("acceptance_profile") or {}).get("profile_id")
             if type(profile.get("acceptance_profile")) is dict else None,
+        "genesis_provenance_material": profile.get("genesis_provenance_material"),
         "capability_release_authority": "EXTERNAL_ROOT_ADMIN_ONLY",
     }
     if not all(_valid_digest(config[key]) for key in (
@@ -348,12 +349,16 @@ def validate_root_fence_profile(profile: dict[str, object]) -> str:
         raise ValueError("Genesis Acceptance profile ID is stale")
     _validate_material(profile["root_admin_tool_material"])
     _validate_material(profile["fence_controller_material"])
+    _validate_material(profile["genesis_provenance_material"])
     if [item["path"] for item in profile["root_admin_tool_material"]] != [
             "tools/genesis/external_profiles.py", "tools/genesis/root_admin.py"]:
         raise ValueError("root-admin tool source closure is not the exact implementation dependency set")
     if [item["path"] for item in profile["fence_controller_material"]] != [
             "tools/genesis/fence_controller.py"]:
         raise ValueError("fence-controller source closure is not exact")
+    if [item["path"] for item in profile["genesis_provenance_material"]] != [
+            "tools/genesis/genesis_provenance.py", "tools/genesis/post_merge_binding.py"]:
+        raise ValueError("Genesis provenance verifier source closure is not exact")
     runtime = profile["python_runtime"]
     principal = profile["root_admin_principal"]
     store = profile["canonical_root_store"]
@@ -465,6 +470,7 @@ def build_external_profiles(
         raise ValueError("staged Python runtime identity is not exact")
     root_tools = source_material(root, (
         "tools/genesis/external_profiles.py", "tools/genesis/fence_controller.py",
+        "tools/genesis/genesis_provenance.py", "tools/genesis/post_merge_binding.py",
         "tools/genesis/root_admin.py",
     ))
     substrate_tools = source_material(root, (
@@ -536,6 +542,9 @@ def build_external_profiles(
         "root_admin_tool_material": root_admin_material,
         "fence_controller_material": [item for item in root_tools
                                       if item["path"].endswith("fence_controller.py")],
+        "genesis_provenance_material": [item for item in root_tools
+                                        if item["path"].endswith(
+                                            ("genesis_provenance.py", "post_merge_binding.py"))],
         "python_runtime": dict(python_runtime),
         "root_admin_principal": dict(root_admin_principal),
         "canonical_root_store": {

@@ -20,6 +20,7 @@ import root_admin
 import role_worker
 import windows_role_runner
 import windows_substrate_launcher
+from genesis_provenance import stage_b_subject_digest
 from deployment_readiness import build_deployment_readiness, verify_deployment_readiness
 from external_profiles import (build_external_profiles, canonical_json_bytes,
                                derive_external_root_controller_identity, derive_host_profile_id)
@@ -31,6 +32,7 @@ from fixture_substrate import (
     new_channel_keys,
 )
 from role_adapter import RoleSubstrateAdapter, construct_candidate_runtime, role_capability_surface
+from provenance_fixtures import make_github_observation, make_post_merge_binding, make_review_record
 
 
 PACKAGE = "b" * 64
@@ -763,13 +765,35 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
         "deployment_session_id": session, "initialization_record_count": 0,
         "release_verification_count": 0, "schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
     }
+    review_record = make_review_record(
+        package_id=fence["candidate_package_id"], manifest_id=fence["manifest_id"],
+        evidence_id="D-" + "1" * 24, runtime_sha256=fence["runtime_artifact_sha256"],
+        root_anchor_id=fence["root_anchor_id"], dependencies={
+            "ROOT_ACTIVATION_FENCE": _TEST_DEPENDENCIES[0],
+            "EXECUTION_ISOLATION": _TEST_ISOLATION_DEPENDENCY,
+            "FIXTURE_EFFECT_SUBSTRATE": _TEST_DEPENDENCIES[1],
+        },
+    )
+    post_merge_binding = make_post_merge_binding(review_record)
+    controller_identity = derive_external_root_controller_identity(_TEST_ROOT_PROFILE)
+    controller_security_context = {
+        "root_admin_sid": ADMIN_SID,
+        "primary_token": True,
+        "elevated_admin": True,
+        "administrators_sid_enabled": True,
+        "controller_implementation_identity": controller_identity["implementation_sha256"],
+        "controller_configuration_identity": controller_identity["configuration_sha256"],
+        "deployment_session_id": session,
+    }
     preimage = {
         "format": "autodev.genesis-deployment-attestation/v1",
         "candidate_package_id": fence["candidate_package_id"],
         "genesis_manifest_id": fence["manifest_id"],
         "deterministic_evidence_ids": ["D-" + "1" * 24],
-        "review_record_id": "2" * 64,
-        "repository_source_commit": "3" * 40,
+        "genesis_review_record": review_record,
+        "post_merge_binding": post_merge_binding,
+        "stage_b_subject_digest": stage_b_subject_digest(review_record, post_merge_binding),
+        "external_root_controller_security_context": controller_security_context,
         "runtime_artifact_sha256": fence["runtime_artifact_sha256"],
         "python_runtime": _TEST_ROOT_PROFILE["python_runtime"],
         "execution_isolation_dependency_id": fence["execution_isolation_dependency_id"],
@@ -799,6 +823,7 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
             for collection in (
                 _TEST_ROOT_PROFILE["root_admin_tool_material"],
                 _TEST_ROOT_PROFILE["fence_controller_material"],
+                _TEST_ROOT_PROFILE["genesis_provenance_material"],
                 _TEST_SUBSTRATE_PROFILE["implementation_material"],
                 _TEST_ISOLATION_PROFILE["role_interpreter_modules"],
             ) for item in collection
@@ -840,7 +865,10 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
         {"path": path, "sha256": digest}
         for path, digest in preimage["staged_external_material"]
     ]
-    return root_admin.build_deployment_attestation(preimage, fence, session)
+    record = {"record_id": hashlib.sha256(canonical_json_bytes(preimage)).hexdigest(),
+              "preimage": preimage}
+    root_admin._validate_deployment_attestation(record, fence, session)
+    return record
 
 
 def test_deployment_attestation_rejects_caller_selected_controller_digests():
@@ -854,6 +882,34 @@ def test_deployment_attestation_rejects_caller_selected_controller_digests():
     changed["record_id"] = hashlib.sha256(canonical_json_bytes(changed["preimage"])).hexdigest()
     with pytest.raises(ValueError, match="exact bound controller"):
         root_admin._validate_deployment_attestation(changed, fence, "2" * 64)
+
+
+def test_s_requires_exact_review_merge_binding_and_has_no_generic_commit_assertion():
+    fence = _test_fence_row()
+    session = "2" * 64
+    attestation = _fixture_attestation(fence, session)
+    preimage = attestation["preimage"]
+    assert "review_record_id" not in preimage
+    assert "repository_source_commit" not in preimage
+    assert "genesis_review_record" in preimage
+    assert "post_merge_binding" in preimage
+    assert "stage_b_subject_digest" in preimage
+
+    missing_binding = json.loads(json.dumps(attestation))
+    del missing_binding["preimage"]["post_merge_binding"]
+    missing_binding["record_id"] = hashlib.sha256(
+        canonical_json_bytes(missing_binding["preimage"])
+    ).hexdigest()
+    with pytest.raises(ValueError, match="unsupported"):
+        root_admin._validate_deployment_attestation(missing_binding, fence, session)
+
+    stale_time = json.loads(json.dumps(attestation))
+    stale_time["preimage"]["observed_at"] = "2026-09-28T12:00:00Z"
+    stale_time["record_id"] = hashlib.sha256(
+        canonical_json_bytes(stale_time["preimage"])
+    ).hexdigest()
+    with pytest.raises(ValueError, match="timestamp"):
+        root_admin._validate_deployment_attestation(stale_time, fence, session)
 
 
 def test_acceptance_confirmation_binds_exact_stable_subject_not_timestamp():
@@ -966,6 +1022,9 @@ def test_root_mutations_require_retained_native_session_not_a_boolean_callback()
 def test_controller_launch_generates_session_id_and_transfers_exact_process_set(monkeypatch):
     session_id = "d" * 64
     processes = {role: object() for role in ("S", "T", "C", "P", "M")}
+    fence = _test_fence_row()
+    fixture_s = _fixture_attestation(fence, session_id)
+    fixture_preimage = fixture_s["preimage"]
 
     class FakeRetained:
         def __init__(self, received_id, received_processes):
@@ -976,21 +1035,146 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
         def assert_live(self):
             return None
 
+        def verify(self, attestation, received_id):
+            return received_id == session_id and attestation["preimage"][
+                "deployment_session_id"] == session_id
+
     import windows_role_runner
 
     monkeypatch.setattr(windows_role_runner, "_host_profiles", lambda: (
         _TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES,
     ))
-    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes", lambda value: {
+    readiness_keys = (
+        "roles", "shared_runtime_read_only", "cross_role_private_write_denial",
+        "candidate_root_store_write_denial", "protected_endpoint_state", "host_profile_id",
+    )
+    launch_payload = {
         "_root_fence_profile": _TEST_ROOT_PROFILE,
-        "_deployment_session_id": value,
+        "_deployment_session_id": session_id,
         "_retained_process_instances": processes,
-    })
+        "_deployment_readiness_preimage": {
+            key: fixture_preimage[key] for key in readiness_keys
+        },
+        "_candidate_build_definition": {
+            "execution_isolation_dependency_id": fixture_preimage[
+                "execution_isolation_dependency_id"],
+            "execution_isolation_profile": fixture_preimage["execution_isolation_profile"],
+            "root_fence_dependency_id": fixture_preimage["root_fence_dependency_id"],
+            "fixture_effect_substrate_dependency_id": fixture_preimage[
+                "fixture_substrate_dependency_id"],
+            "external_tcb_material": fixture_preimage["staged_external_material"],
+        },
+        "_fixture_substrate_profile": fixture_preimage["fixture_substrate_profile"],
+        "candidate_package_id": fixture_preimage["candidate_package_id"],
+        "manifest_id": fixture_preimage["genesis_manifest_id"],
+        "deterministic_evidence_id": fixture_preimage["deterministic_evidence_ids"][0],
+        "runtime_sha256": fixture_preimage["runtime_artifact_sha256"],
+        "root_anchor_id": fixture_preimage["root_anchor_id"],
+    }
+    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
+                        lambda value: dict(launch_payload, _deployment_session_id=value))
     monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session_id)
+    monkeypatch.setattr(root_admin, "_current_token_facts", lambda: (
+        ADMIN_SID, True, True, True,
+    ))
     monkeypatch.setattr(fence_controller, "RetainedDeploymentSession", FakeRetained)
-    controller = fence_controller.RetainedRootControllerSession.launch()
+    monkeypatch.setattr(fence_controller, "revalidate_post_merge_binding", lambda *args: {})
+    monkeypatch.setattr(fence_controller, "verify_local_merge_subject", lambda *_args: {})
+    monkeypatch.setattr(fence_controller.RetainedRootControllerSession,
+                        "_current_process_observations",
+                        lambda _self: fixture_preimage["process_instance_observations"])
+    monkeypatch.setattr(fence_controller.RetainedRootControllerSession,
+                        "_current_substrate_service",
+                        lambda _self: fixture_preimage["substrate_service"])
+    monkeypatch.setattr(root_admin, "inspect_uninitialized_root",
+                        lambda _path, *, expected_fence_row, deployment_session_id: (
+                            fixture_preimage["root_state_observation"]
+                            if expected_fence_row == fence and deployment_session_id == session_id
+                            else pytest.fail("S builder used a different root/session subject")))
+    reviewed = fixture_preimage["genesis_review_record"]
+    binding = fixture_preimage["post_merge_binding"]
+    observation = make_github_observation(
+        reviewed, merge_commit_sha=binding["preimage"]["merge_commit_sha"],
+    )
+    monkeypatch.setattr(fence_controller, "_confirm_stage_b_subject", lambda digest: None)
+    controller = fence_controller.RetainedRootControllerSession.launch(
+        genesis_review_record=reviewed, post_merge_binding=binding,
+        github_observation=observation,
+    )
     assert controller.deployment_session_id == session_id
     assert controller.controller_identity == derive_external_root_controller_identity(_TEST_ROOT_PROFILE)
+    attestation = controller.build_deployment_attestation(expected_fence_row=fence)
+    assert root_admin._validate_deployment_attestation(attestation, fence, session_id)
+    assert root_admin._is_exact_utc(attestation["preimage"]["observed_at"])
+    assert attestation["preimage"]["genesis_review_record"] == reviewed
+    assert attestation["preimage"]["post_merge_binding"] == binding
+    assert controller._retained is not None
+    controller._retained.assert_live()
+
+
+@pytest.mark.parametrize("token_facts", (
+    ("S-1-5-21-711519901-190585334-3846127459-9999", True, True, True),
+    (ADMIN_SID, False, True, True),
+    (ADMIN_SID, True, False, True),
+    (ADMIN_SID, True, True, False),
+))
+def test_controller_authentication_failure_precedes_stage_b_and_role_launch(
+        monkeypatch, token_facts):
+    import windows_role_runner
+
+    monkeypatch.setattr(windows_role_runner, "_host_profiles", lambda: (
+        _TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES,
+    ))
+    monkeypatch.setattr(root_admin, "_current_token_facts", lambda: token_facts)
+    launches = []
+    confirmations = []
+    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
+                        lambda _session: launches.append("launched"))
+    monkeypatch.setattr(fence_controller, "_confirm_stage_b_subject",
+                        lambda _digest: confirmations.append("confirmed"))
+    with pytest.raises(PermissionError, match="profile-bound elevated external root administrator"):
+        fence_controller.RetainedRootControllerSession.launch(
+            genesis_review_record={}, post_merge_binding={}, github_observation={},
+        )
+    assert confirmations == []
+    assert launches == []
+
+
+@pytest.mark.parametrize("failure", (
+    ValueError("local main is stale"),
+    ValueError("regenerated CP2 differs from the reviewed subject"),
+))
+def test_controller_stale_or_conflicting_post_merge_proof_stops_before_confirmation_and_launch(
+        monkeypatch, failure):
+    import windows_role_runner
+
+    session = "d" * 64
+    fixture = _fixture_attestation(_test_fence_row(), session)["preimage"]
+    monkeypatch.setattr(windows_role_runner, "_host_profiles", lambda: (
+        _TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES,
+    ))
+    monkeypatch.setattr(root_admin, "_current_token_facts", lambda: (
+        ADMIN_SID, True, True, True,
+    ))
+    monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session)
+    monkeypatch.setattr(fence_controller, "revalidate_post_merge_binding",
+                        lambda *_args: (_ for _ in ()).throw(failure))
+    confirmations, launches = [], []
+    monkeypatch.setattr(fence_controller, "_confirm_stage_b_subject",
+                        lambda _digest: confirmations.append("confirmed"))
+    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
+                        lambda _session: launches.append("launched"))
+    with pytest.raises(type(failure), match=str(failure)):
+        fence_controller.RetainedRootControllerSession.launch(
+            genesis_review_record=fixture["genesis_review_record"],
+            post_merge_binding=fixture["post_merge_binding"],
+            github_observation=make_github_observation(
+                fixture["genesis_review_record"],
+                merge_commit_sha=fixture["post_merge_binding"]["preimage"]["merge_commit_sha"],
+            ),
+        )
+    assert confirmations == []
+    assert launches == []
 
 
 @pytest.mark.parametrize("role", ("P", "M"))

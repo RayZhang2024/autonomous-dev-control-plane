@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 import sys
-from datetime import datetime, timezone
 from typing import Any
 
 import root_admin
 from external_profiles import canonical_json_bytes, derive_external_root_controller_identity
+from genesis_provenance import (
+    stage_b_subject_digest, validate_genesis_exact_head_review_record,
+    validate_post_merge_binding,
+)
+from post_merge_binding import revalidate_post_merge_binding, verify_local_merge_subject
 from root_admin import ROOT_STORE_PATH, RetainedDeploymentSession, release_capability_fence
-
-
-_COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 
 
 class RetainedRootControllerSession:
@@ -25,22 +25,39 @@ class RetainedRootControllerSession:
     source/configuration from the active ROOT_ACTIVATION_FENCE profile.
     """
 
-    __slots__ = ("_retained", "_launch", "_profile", "_controller_identity", "_attestation")
+    __slots__ = (
+        "_retained", "_launch", "_profile", "_controller_identity", "_controller_security_context",
+        "_genesis_review_record", "_post_merge_binding", "_github_observation",
+        "_stage_b_subject_digest", "_attestation",
+    )
 
     def __init__(self, *args: object) -> None:
         raise TypeError("use RetainedRootControllerSession.launch()")
 
     @classmethod
-    def launch(cls) -> "RetainedRootControllerSession":
+    def launch(
+        cls, *, genesis_review_record: dict[str, object], post_merge_binding: dict[str, object],
+        github_observation: dict[str, object],
+    ) -> "RetainedRootControllerSession":
         from build_definition import sha256
-        from windows_role_runner import _host_profiles, _launch_retained_deployment_processes
+        from windows_role_runner import REPOSITORY, _host_profiles, _launch_retained_deployment_processes
 
         root_profile, _, _, _ = _host_profiles()
+        security_context = root_admin._require_external_root_admin_context(
+            root_profile["root_admin_principal"]["sid"],
+        )
         identity = derive_external_root_controller_identity(root_profile)
         implementation = sha256(Path(__file__).read_bytes())
         if identity["implementation_sha256"] != implementation:
             raise PermissionError("running root-controller bytes differ from the bound fence profile")
+        validate_genesis_exact_head_review_record(genesis_review_record)
+        validate_post_merge_binding(post_merge_binding, genesis_review_record)
+        revalidate_post_merge_binding(
+            REPOSITORY, genesis_review_record, post_merge_binding, github_observation,
+        )
         session_id = root_admin.new_deployment_session_id()
+        subject_digest = stage_b_subject_digest(genesis_review_record, post_merge_binding)
+        _confirm_stage_b_subject(subject_digest)
         launched = _launch_retained_deployment_processes(session_id)
         if (launched.get("_root_fence_profile") != root_profile
                 or launched.get("_deployment_session_id") != session_id):
@@ -58,6 +75,16 @@ class RetainedRootControllerSession:
         instance._launch = launched
         instance._profile = root_profile
         instance._controller_identity = identity
+        instance._controller_security_context = {
+            **security_context,
+            "controller_implementation_identity": identity["implementation_sha256"],
+            "controller_configuration_identity": identity["configuration_sha256"],
+            "deployment_session_id": session_id,
+        }
+        instance._genesis_review_record = genesis_review_record
+        instance._post_merge_binding = post_merge_binding
+        instance._github_observation = github_observation
+        instance._stage_b_subject_digest = subject_digest
         instance._attestation = None
         return instance
 
@@ -71,23 +98,24 @@ class RetainedRootControllerSession:
 
     def assert_live(self) -> None:
         self._retained.assert_live()
+        sid, primary, elevated, enabled_admin = root_admin._current_token_facts()
+        context = self._controller_security_context
+        if (sid != context["root_admin_sid"] or primary is not True or elevated is not True
+                or enabled_admin is not True):
+            raise PermissionError("profile-bound root-controller security context continuity was lost")
         if derive_external_root_controller_identity(self._profile) != self._controller_identity:
             raise PermissionError("root-controller configuration continuity was lost")
         if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != self._controller_identity[
                 "implementation_sha256"]:
             raise PermissionError("root-controller implementation continuity was lost")
+        from windows_role_runner import REPOSITORY
+        verify_local_merge_subject(REPOSITORY, self._genesis_review_record, self._github_observation)
 
     def build_deployment_attestation(
-        self, *, expected_fence_row: dict[str, object], review_record_id: str,
-        repository_source_commit: str,
+        self, *, expected_fence_row: dict[str, object],
     ) -> dict[str, object]:
         """Construct S from current retained process facts and exact bound staged evidence."""
         self.assert_live()
-        if (type(review_record_id) is not str or len(review_record_id) != 64
-                or any(char not in "0123456789abcdef" for char in review_record_id)
-                or type(repository_source_commit) is not str
-                or _COMMIT.fullmatch(repository_source_commit) is None):
-            raise ValueError("post-review repository provenance is malformed")
         readiness = self._launch["_deployment_readiness_preimage"]
         build = self._launch["_candidate_build_definition"]
         substrate_profile = self._launch["_fixture_substrate_profile"]
@@ -102,8 +130,10 @@ class RetainedRootControllerSession:
             "candidate_package_id": self._launch["candidate_package_id"],
             "genesis_manifest_id": self._launch["manifest_id"],
             "deterministic_evidence_ids": [self._launch["deterministic_evidence_id"]],
-            "review_record_id": review_record_id,
-            "repository_source_commit": repository_source_commit,
+            "genesis_review_record": self._genesis_review_record,
+            "post_merge_binding": self._post_merge_binding,
+            "stage_b_subject_digest": self._stage_b_subject_digest,
+            "external_root_controller_security_context": self._controller_security_context,
             "runtime_artifact_sha256": self._launch["runtime_sha256"],
             "python_runtime": self._profile["python_runtime"],
             "execution_isolation_dependency_id": build["execution_isolation_dependency_id"],
@@ -136,10 +166,10 @@ class RetainedRootControllerSession:
             "recovery_fence_inventory": [substrate_profile["external_recovery_endpoint"]["endpoint_id"]],
             "production_github_mutation_credentials": "NONE",
             "host_profile_id": readiness["host_profile_id"],
-            "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "observed_at": root_admin._now_utc(),
         }
         attestation = root_admin.build_deployment_attestation(
-            preimage, expected_fence_row, session_id,
+            preimage, expected_fence_row, self,
         )
         if not self._retained.verify(attestation, session_id):
             raise PermissionError("live process observations do not match retained controller handles")
@@ -353,6 +383,16 @@ class RetainedRootControllerSession:
             raise RuntimeError("substrate service did not stop cleanly")
         for process in processes.values():
             process.close()
+
+
+def _confirm_stage_b_subject(subject_digest: str) -> None:
+    if (type(subject_digest) is not str or len(subject_digest) != 64
+            or any(char not in "0123456789abcdef" for char in subject_digest)):
+        raise ValueError("Stage-B subject digest is malformed")
+    expected = f"STAGE_B {subject_digest}"
+    response = input(f"Confirm exact authenticated Stage-B subject by typing {expected}: ")
+    if response != expected:
+        raise PermissionError("exact Stage-B subject confirmation did not match")
 
 
 def _close_launched_processes(launched: dict[str, object]) -> None:

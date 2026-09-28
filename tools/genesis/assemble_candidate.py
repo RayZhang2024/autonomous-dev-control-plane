@@ -423,6 +423,7 @@ def assemble_candidate(
          "sha256": sha256(Path(__file__).with_name(name).read_bytes())}
         for name in (
             "external_profiles.py", "root_admin.py", "fence_controller.py",
+            "genesis_provenance.py", "post_merge_binding.py",
             "fixture_substrate.py", "role_adapter.py", "substrate_client.py",
             "canonical_state_channel.py",
             "windows_substrate_launcher.py",

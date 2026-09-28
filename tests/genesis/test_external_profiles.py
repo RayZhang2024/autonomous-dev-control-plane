@@ -74,6 +74,10 @@ def _root_profile() -> dict[str, object]:
                if key not in ("format", "acceptance_tool_material")}},
         "root_admin_tool_material": tools,
         "fence_controller_material": [_material("tools/genesis/fence_controller.py")],
+        "genesis_provenance_material": [
+            _material("tools/genesis/genesis_provenance.py"),
+            _material("tools/genesis/post_merge_binding.py"),
+        ],
         "python_runtime": {
             "identity": "CPython", "version": "3.13.14",
             "path": r"C:\AutodevG9\shared\python313\python.exe", "sha256": "c" * 64,
@@ -226,6 +230,9 @@ def test_external_root_controller_identity_is_derived_from_bound_source_and_prof
     assert derive_external_root_controller_identity(changed) != identity
     changed = copy.deepcopy(profile)
     changed["fence_controller_material"][0]["sha256"] = "0" * 64
+    assert derive_external_root_controller_identity(changed) != identity
+    changed = copy.deepcopy(profile)
+    changed["genesis_provenance_material"][0]["sha256"] = "0" * 64
     assert derive_external_root_controller_identity(changed) != identity
 
 
