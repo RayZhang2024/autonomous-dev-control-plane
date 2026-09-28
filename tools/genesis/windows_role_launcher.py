@@ -283,16 +283,26 @@ class WindowsRoleProcess:
         self._kernel.CloseHandle(self.process_handle)
 
 
+def _profile_environment_arguments(role: str) -> tuple[int, int, None, None]:
+    if role not in ROLE_PRINCIPALS:
+        raise ValueError("unknown G9 role")
+    return _LOGON_WITH_PROFILE, 0, None, None
+
+
 def launch_role(role: str, *, python_executable: Path, worker_script: Path,
-                working_directory: Path, environment: Mapping[str, str]) -> WindowsRoleProcess:
+                working_directory: Path) -> WindowsRoleProcess:
     """Launch a role under its dedicated primary token after hidden input.
 
+    Windows creates the target user's environment from its loaded profile.
     Only the standard input/output/error pipes are inherited. The password is
     entered with echo disabled and is never included in process arguments or
     environment variables.
     """
     if role not in ROLE_PRINCIPALS:
         raise ValueError("unknown G9 role")
+    logon_flags, creation_flags, environment_buffer, environment_pointer = (
+        _profile_environment_arguments(role)
+    )
     account, _ = ROLE_PRINCIPALS[role]
     domain, username = _DOMAIN, account
     password = getpass.getpass(f"Password for {domain}\\{username} (input hidden): ")
@@ -335,17 +345,15 @@ def launch_role(role: str, *, python_executable: Path, worker_script: Path,
         command = subprocess.list2cmdline([str(python_executable), "-I", "-S", "-B",
                                            str(worker_script)])
         command_buffer = ctypes.create_unicode_buffer(command)
-        environment_text = "\0".join(f"{key}={value}" for key, value in sorted(environment.items())) + "\0\0"
-        environment_buffer = ctypes.create_unicode_buffer(environment_text)
         create = advapi.CreateProcessWithLogonW
         create.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
                            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, wintypes.LPVOID,
                            wintypes.LPCWSTR, ctypes.POINTER(_StartupInfo),
                            ctypes.POINTER(_ProcessInformation)]
         create.restype = wintypes.BOOL
-        ok = create(username, domain, password_buffer, _LOGON_WITH_PROFILE,
-                    str(python_executable), command_buffer, _CREATE_UNICODE_ENVIRONMENT,
-                    ctypes.cast(environment_buffer, wintypes.LPVOID), str(working_directory),
+        ok = create(username, domain, password_buffer, logon_flags,
+                    str(python_executable), command_buffer, creation_flags,
+                    environment_pointer, str(working_directory),
                     ctypes.byref(startup), ctypes.byref(process_info))
         ctypes.memset(ctypes.addressof(password_buffer), 0, ctypes.sizeof(password_buffer))
         if not ok:
