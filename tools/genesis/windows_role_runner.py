@@ -27,9 +27,9 @@ from assemble_candidate import assemble_candidate, write_package
 from build_definition import sha256
 from ipc import encode_message
 from windows_role_launcher import ROLE_PRINCIPALS, launch_role
-from external_profiles import build_external_profiles, canonical_json_bytes
+from external_profiles import build_external_profiles, canonical_json_bytes, derive_host_profile_id
 from fixture_substrate import new_channel_keys
-from root_admin import inspect_uninitialized_root
+from root_admin import build_fence_row, inspect_uninitialized_root, new_deployment_session_id, _insert_fence
 from deployment_readiness import build_deployment_readiness, verify_deployment_readiness
 from windows_substrate_launcher import launch_substrate
 
@@ -131,6 +131,7 @@ def _deployment_role_evidence(
         "runtime_role_identity": preparation["runtime_role_identity"],
         "runtime_binding_id": preparation["runtime_binding_id"],
         "runtime_active": preparation["runtime_active"],
+        "canonical_state": preparation["canonical_state"],
     }
 
 
@@ -199,7 +200,8 @@ def _stage(package) -> tuple[Path, Path, Path]:
 def _role_bootstrap(package, graph: dict[str, object], candidate: Path, worker: Path,
                     role: str, keys: dict[str, bytes], endpoint: str,
                     substrate_endpoint: tuple[str, int], substrate_key: bytes,
-                    runtime_run_id: str) -> dict[str, object]:
+                    runtime_run_id: str,
+                    canonical_state_bootstrap: dict[str, object]) -> dict[str, object]:
     member = next(item for item in graph["members"] if item["role"] == role)
     raw = package.raw_resources
     security = raw[member["security_context_config_resource"]]
@@ -222,6 +224,7 @@ def _role_bootstrap(package, graph: dict[str, object], candidate: Path, worker: 
         "substrate_resource_id": "runtime",
         "substrate_resource_sha256": sha256(package.runtime_artifact),
         "runtime_run_id": runtime_run_id,
+        "canonical_state_bootstrap": canonical_state_bootstrap,
     }
     if role in keys:
         value["channel_key_hex"] = keys[role].hex()
@@ -242,12 +245,33 @@ def run_realized_roles() -> dict[str, object]:
     )
     candidate, worker, external = _stage(package)
     graph = json.loads(package.graph)
+    members = {item["role"]: item for item in graph["members"]}
+    security_context_ids = {
+        role: sha256(package.raw_resources[members[role]["security_context_config_resource"]])
+        for role in ROLE_ORDER
+    }
+    endpoint_ids = {
+        role: sha256(package.raw_resources[members[role]["capability_wiring_resource"]])
+        for role in ("C", "P", "M")
+    }
+    fence_row = build_fence_row(
+        root_anchor_id=root_anchor_id, candidate_package_id=package.candidate_package_id,
+        manifest_id=package.manifest_id, runtime_artifact_sha256=package.runtime_sha256,
+        runtime_generation=f"g9-generation-{package.runtime_sha256[:24]}",
+        execution_isolation_dependency_id=json.loads(package.build_definition)[
+            "execution_isolation_dependency_id"],
+        fixture_effect_substrate_dependency_id=substrate_dependency_id,
+        security_context_identities=security_context_ids,
+        prepared_endpoint_identities=endpoint_ids,
+    )
     keys = {role: secrets.token_bytes(32) for role in ("C", "P", "M")}
+    c_state_t_key = secrets.token_bytes(32)
     substrate_keys = new_channel_keys()
     endpoints = {role: secrets.token_hex(32) for role in ROLE_ORDER}
     processes = {}
     reports = {}
     runtime_run_id = secrets.token_hex(32)
+    deployment_session_id = new_deployment_session_id()
     substrate_process = None
     substrate_state: dict[str, object] | None = None
     try:
@@ -274,7 +298,24 @@ def run_realized_roles() -> dict[str, object]:
                 or substrate_process.sid != substrate_profile["service_principal"]["sid"]
                 or substrate_process.token_type != 1 or substrate_process.is_administrator):
             raise AssertionError("external substrate process does not match the profile-bound identity")
-        for role in ROLE_ORDER:
+        # C must establish the one canonical backend and its T-only channel
+        # before the other roles receive their immutable projections.
+        for role in ("C", "T", "P", "M"):
+            if role == "C":
+                canonical_state_bootstrap = {
+                    "role": "C", "t_key_hex": c_state_t_key.hex(),
+                }
+            else:
+                c_state = reports["C"]["runtime_preparation"]["canonical_state"]
+                projection = c_state["projection"]
+                if role == "T":
+                    canonical_state_bootstrap = {
+                        "role": "T", "projection": projection,
+                        "endpoint": c_state["channel_endpoint"],
+                        "t_key_hex": c_state_t_key.hex(),
+                    }
+                else:
+                    canonical_state_bootstrap = {"role": role, "projection": projection}
             process = launch_role(
                 role, python_executable=PYTHON, worker_script=worker,
                 working_directory=PRIVATE / role,
@@ -285,6 +326,7 @@ def run_realized_roles() -> dict[str, object]:
             process.send_json_line(_role_bootstrap(
                 package, graph, candidate, worker, role, keys, endpoints[role],
                 substrate_process.endpoint, substrate_keys[role], runtime_run_id,
+                canonical_state_bootstrap,
             ))
             report = process.read_json_line()
             report = _validate_role_identity_report(role, report)
@@ -309,6 +351,19 @@ def run_realized_roles() -> dict[str, object]:
                     or type(role_preparation.get("runtime_role_identity")) is not str
                     or len(role_preparation["runtime_role_identity"]) != 64):
                 raise AssertionError(f"role {role} did not construct the exact frozen candidate runtime")
+            canonical_state = role_preparation.get("canonical_state")
+            expected_projection = (
+                reports["C"]["runtime_preparation"]["canonical_state"]["projection"]
+                if role != "C" else None
+            )
+            if (type(canonical_state) is not dict
+                    or canonical_state.get("role") != role
+                    or canonical_state.get("backend_owner_role") != "C"
+                    or canonical_state.get("direct_backend_object") is not (role == "C")
+                    or canonical_state.get("authenticated_t_to_c_client") is not (role == "T")
+                    or canonical_state.get("read_only_projection") is not (role != "C")
+                    or (role != "C" and canonical_state.get("projection") != expected_projection)):
+                raise AssertionError(f"role {role} canonical state is not bound to C's state owner")
             if role in ("P", "M") and (
                     role_preparation.get("protected_fence") != {
                         "fence": "FENCED", "revision": 0,
@@ -408,17 +463,13 @@ def run_realized_roles() -> dict[str, object]:
                 from root_admin import _SCHEMA_STATEMENTS
                 for statement in _SCHEMA_STATEMENTS:
                     connection.execute(statement)
-                connection.execute(
-                    "INSERT INTO capability_fence(candidate_package_id, root_anchor_id, state, revision) "
-                    "VALUES (?, ?, 'FENCED', 0)",
-                    (package.candidate_package_id, root_anchor_id),
-                )
+                _insert_fence(connection, fence_row)
                 connection.commit()
             finally:
                 connection.close()
             observed_root = inspect_uninitialized_root(
-                fixture_database, expected_anchor_id=root_anchor_id,
-                expected_candidate_package_id=package.candidate_package_id,
+                fixture_database, expected_fence_row=fence_row,
+                deployment_session_id=deployment_session_id,
             )
             observed_root["observation_scope"] = "NON_AUTHORITATIVE_TEMPORARY_FIXTURE_ONLY"
             observed_root["canonical_root_database"] = "ABSENT_UNTOUCHED"
@@ -438,8 +489,11 @@ def run_realized_roles() -> dict[str, object]:
             )
         root_profile_sha = sha256(canonical_json_bytes(root_profile))
         substrate_profile_sha = sha256(canonical_json_bytes(substrate_profile))
+        execution_isolation_profile = json.loads(package.build_definition)["execution_isolation_profile"]
+        execution_isolation_profile_sha = sha256(canonical_json_bytes(execution_isolation_profile))
         readiness_preimage = {
             "format": "autodev.genesis-deployment-readiness/v1",
+            "deployment_session_id": deployment_session_id,
             "candidate_package_id": package.candidate_package_id,
             "genesis_manifest_id": package.manifest_id,
             "deterministic_evidence_ids": [package.deterministic_evidence_id],
@@ -448,6 +502,7 @@ def run_realized_roles() -> dict[str, object]:
             "python_runtime": {"identity": "CPython", "version": "3.13.14",
                                "path": str(PYTHON), "sha256": sha256(PYTHON.read_bytes())},
             "execution_isolation_dependency_id": json.loads(package.build_definition)["execution_isolation_dependency_id"],
+            "execution_isolation_profile_sha256": execution_isolation_profile_sha,
             "root_fence_dependency_id": root_dependency_id,
             "root_fence_profile_sha256": root_profile_sha,
             "fixture_substrate_dependency_id": substrate_dependency_id,
@@ -480,7 +535,11 @@ def run_realized_roles() -> dict[str, object]:
             },
             "recovery_fence_inventory": [substrate_profile["external_recovery_endpoint"]["endpoint_id"]],
             "production_github_mutation_credentials": "NONE",
-            "host_profile_id": sha256(canonical_json_bytes((root_profile, substrate_profile))),
+            "host_profile_id": derive_host_profile_id(
+                root_fence_profile_sha256=root_profile_sha,
+                fixture_substrate_profile_sha256=substrate_profile_sha,
+                execution_isolation_profile_sha256=execution_isolation_profile_sha,
+            ),
             "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         }
         readiness = build_deployment_readiness(readiness_preimage)

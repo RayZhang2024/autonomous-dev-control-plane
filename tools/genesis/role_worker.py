@@ -172,7 +172,7 @@ def main() -> int:
                   "private_directories", "security_context_identity", "entrypoint_identity",
                   "shared_directory", "root_store_probe", "substrate_endpoint",
                   "substrate_channel_key_hex", "substrate_resource_id",
-                  "substrate_resource_sha256", "runtime_run_id"}
+                  "substrate_resource_sha256", "runtime_run_id", "canonical_state_bootstrap"}
         if role in ("C", "P", "M"):
             fields.add("channel_key_hex")
         if type(role) is not str or role not in _ENTRY or set(bootstrap) != fields:
@@ -206,6 +206,7 @@ def main() -> int:
         stage = _StartupStage.ADAPTER_IMPORT
         from role_adapter import (
             RoleSubstrateAdapter, SubstrateTransportError, construct_candidate_runtime,
+            close_canonical_state_owner,
         )
         transport_error_type = SubstrateTransportError
 
@@ -234,6 +235,7 @@ def main() -> int:
         runtime_preparation = construct_candidate_runtime(
             role=role, candidate_package_id=bootstrap["candidate_package_id"],
             substrate_adapter=substrate, runtime_run_id=bootstrap["runtime_run_id"],
+            canonical_state_bootstrap=bootstrap["canonical_state_bootstrap"],
         )
 
         stage = _StartupStage.CHANNEL_SETUP
@@ -274,13 +276,16 @@ def main() -> int:
         while True:
             line = sys.stdin.buffer.readline(64 * 1024 + 1)
             if not line or len(line) > 64 * 1024:
+                close_canonical_state_owner(bootstrap["runtime_run_id"])
                 return 0
             if role == "T":
                 if line == b'{"control":"STOP"}\n':
+                    close_canonical_state_owner(bootstrap["runtime_run_id"])
                     return 0
                 _write({"accepted": False, "reason": "NO_DESTINATION_CHANNEL_CREDENTIALS"})
                 continue
             if line == b'{"control":"STOP"}\n':
+                close_canonical_state_owner(bootstrap["runtime_run_id"])
                 return 0
             try:
                 decoded = decode_message(line.rstrip(b"\r\n"), expected_role=role, key=key)

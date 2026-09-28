@@ -101,9 +101,32 @@ def _api() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel.TerminateProcess.restype = wintypes.BOOL
     return kernel, ctypes.WinDLL("advapi32", use_last_error=True)
+
+
+def process_creation_time_100ns(process: int, kernel: ctypes.WinDLL | None = None) -> int:
+    """Read immutable process creation FILETIME through an existing handle."""
+    if kernel is None:
+        kernel, _ = _api()
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+    if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                  ctypes.byref(kernel_time), ctypes.byref(user_time)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (created.dwHighDateTime << 32) | created.dwLowDateTime
 
 
 def _sid_string(kernel: ctypes.WinDLL, advapi: ctypes.WinDLL, sid: int) -> str:
@@ -243,11 +266,22 @@ class WindowsRoleProcess:
     token_type: int
     is_administrator: bool
     process_handle: int
+    creation_time_100ns: int
     thread_handle: int
     stdin: object
     stdout: object
     stderr: object
     _kernel: ctypes.WinDLL
+
+    def is_live(self) -> bool:
+        if (self._kernel.GetProcessId(self.process_handle) != self.pid
+                or self._kernel.WaitForSingleObject(self.process_handle, 0) != 258):
+            return False
+        if process_creation_time_100ns(self.process_handle, self._kernel) != self.creation_time_100ns:
+            return False
+        evidence = _primary_token_evidence(self.process_handle)
+        return (evidence.user_sid == self.sid and evidence.token_type == self.token_type
+                and evidence.is_administrator is self.is_administrator)
 
     def send_json_line(self, value: Mapping[str, object]) -> None:
         raw = json.dumps(value, ensure_ascii=True, allow_nan=False,
@@ -365,6 +399,7 @@ def launch_role(role: str, *, python_executable: Path, worker_script: Path,
         try:
             evidence = _primary_token_evidence(process_info.hProcess)
             _validate_role_token(role, evidence)
+            creation_time = process_creation_time_100ns(process_info.hProcess, kernel)
         except BaseException:
             kernel.TerminateProcess(process_info.hProcess, 120)
             kernel.CloseHandle(process_info.hThread)
@@ -379,7 +414,7 @@ def launch_role(role: str, *, python_executable: Path, worker_script: Path,
         return WindowsRoleProcess(
             role, int(process_info.dwProcessId), evidence.user_sid,
             evidence.token_type, evidence.is_administrator,
-            process_info.hProcess, process_info.hThread,
+            process_info.hProcess, creation_time, process_info.hThread,
             os.fdopen(stdin_fd, "wb", buffering=0),
             os.fdopen(stdout_fd, "rb", buffering=0),
             os.fdopen(stderr_fd, "rb", buffering=0), kernel,

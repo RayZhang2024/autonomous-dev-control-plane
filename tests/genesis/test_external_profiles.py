@@ -13,6 +13,9 @@ from external_profiles import (
     ROOT_FENCE_DOMAIN,
     canonical_json_bytes,
     derive_root_anchor_id,
+    derive_acceptance_profile_id,
+    derive_root_namespace_acl_profile_id,
+    derive_root_store_profile_id,
     validate_fixture_substrate_profile,
     validate_root_fence_profile,
 )
@@ -23,26 +26,61 @@ def _material(path: str, digest: str = "a" * 64) -> dict[str, str]:
 
 
 def _root_profile() -> dict[str, object]:
+    admin_sid, substrate_sid = "S-1-5-21-1-1001", "S-1-5-21-1-1020"
+    role_sids = {role: f"S-1-5-21-1-{1100 + index}"
+                 for index, role in enumerate(("T", "C", "P", "M"))}
+    sddl = f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})"
+    acl_profile_id = derive_root_namespace_acl_profile_id({
+        "format": "autodev.g9-root-namespace-acl-profile/v1",
+        "security_descriptor_sddl": sddl, "root_admin_sid": admin_sid,
+        "substrate_sid": substrate_sid, "system_sid": "S-1-5-18",
+        "candidate_role_sids": role_sids, "inherited_acl": "DENY", "candidate_role_access": "NO_ACCESS",
+    })
+    tools = [_material("tools/genesis/external_profiles.py"), _material("tools/genesis/root_admin.py")]
+    acceptance = {
+        "format": "autodev.g9-acceptance-profile/v1",
+        "authority_model": "WINDOWS_EXTERNAL_ROOT_AUTHORITY",
+        "eligible_bootstrap_approver": {"account": r"Ray\zhang", "sid": admin_sid,
+                                          "administrator_required": True},
+        "authentication_method": "CURRENT_PROCESS_PRIMARY_TOKEN_EXACT_SID_ELEVATED_ADMIN",
+        "acceptance_record_format": "autodev.genesis-acceptance-record/v1",
+        "acceptance_storage": "CANONICAL_ROOT_DB_APPEND_ONLY",
+        "decision_domain": "GENESIS_BOOTSTRAP",
+        "validity_model": "IDENTITY_AND_SESSION_BOUND_NO_TIME_TTL",
+        "interactive_confirmation": "LOCAL_CONSOLE_EXACT_SUBJECT_CONFIRMATION",
+        "acceptance_tool_material": tools,
+        "production_github_mutation_credentials": "NONE",
+    }
+    acceptance_id = derive_acceptance_profile_id(acceptance)
+    store_id = derive_root_store_profile_id(schema_sha256="b" * 64,
+                                            acl_profile_id=acl_profile_id,
+                                            acceptance_profile_id=acceptance_id)
     return {
         "format": "autodev.g9-root-activation-fence-profile/v1",
         "repository": "RayZhang2024/autonomous-dev-control-plane",
-        "design_lineage": "issue-55-g9-completion-repair-v0.2",
+        "design_lineage": "issue-55-g9-completion-repair-v0.5",
         "root_anchor_namespace": "autodev-v2-first-genesis-root",
         "root_store_profile": "autodev.g9-canonical-root-store/v1",
+        "root_store_profile_id": store_id,
         "root_store_schema_sha256": "b" * 64,
-        "root_admin_tool_material": [
-            _material("tools/genesis/external_profiles.py"),
-            _material("tools/genesis/root_admin.py"),
-        ],
+        "root_namespace_acl_profile": {
+            "profile_id": acl_profile_id, "security_descriptor_sddl": sddl,
+            "root_admin_sid": admin_sid, "substrate_sid": substrate_sid,
+            "system_sid": "S-1-5-18", "candidate_role_sids": role_sids,
+        },
+        "acceptance_profile": {"profile_id": acceptance_id,
+            **{key: value for key, value in acceptance.items()
+               if key not in ("format", "acceptance_tool_material")}},
+        "root_admin_tool_material": tools,
         "fence_controller_material": [_material("tools/genesis/fence_controller.py")],
         "python_runtime": {
             "identity": "CPython", "version": "3.13.14",
             "path": r"C:\AutodevG9\shared\python313\python.exe", "sha256": "c" * 64,
         },
-        "root_admin_principal": {"account": r"Ray\zhang", "sid": "S-1-5-21-1-1001",
+        "root_admin_principal": {"account": r"Ray\zhang", "sid": admin_sid,
                                  "administrator": True},
         "canonical_root_store": {
-            "profile_id": "autodev.g9-canonical-root-store/v1",
+            "profile_id": store_id,
             "path": r"C:\AutodevG9\root\root.sqlite3",
         },
         "candidate_role_access": "NO_WRITE",
@@ -56,8 +94,6 @@ def _substrate_profile() -> dict[str, object]:
         "format": "autodev.g9-fixture-effect-substrate-profile/v1",
         "implementation_material": [
             _material("tools/genesis/fixture_substrate.py"),
-            _material("tools/genesis/role_adapter.py", "d" * 64),
-            _material("tools/genesis/windows_role_launcher.py"),
             _material("tools/genesis/windows_substrate_launcher.py"),
         ],
         "f_read_verify_endpoint": {
@@ -120,14 +156,22 @@ def test_root_fence_profile_identity_binds_each_external_host_and_authority_fact
     assert identity == "dep-root-activation-fence-" + hashlib.sha256(
         ROOT_FENCE_DOMAIN + canonical_json_bytes(profile)
     ).hexdigest()
-    mutations = (
-        ("root_store_schema_sha256", "e" * 64),
+    changed = copy.deepcopy(profile)
+    changed["root_store_schema_sha256"] = "e" * 64
+    store_id = derive_root_store_profile_id(
+        schema_sha256=changed["root_store_schema_sha256"],
+        acl_profile_id=changed["root_namespace_acl_profile"]["profile_id"],
+        acceptance_profile_id=changed["acceptance_profile"]["profile_id"],
+    )
+    changed["root_store_profile_id"] = store_id
+    changed["canonical_root_store"]["profile_id"] = store_id
+    assert validate_root_fence_profile(changed) != identity
+    for field, value in (
         ("root_anchor_namespace", "different-namespace"),
-        ("root_admin_principal", {"account": r"Ray\other", "sid": "S-1-5-21-1-1002",
+        ("root_admin_principal", {"account": r"Ray\other", "sid": profile["root_admin_principal"]["sid"],
                                    "administrator": True}),
         ("python_runtime", dict(profile["python_runtime"], sha256="f" * 64)),
-    )
-    for field, value in mutations:
+    ):
         changed = copy.deepcopy(profile)
         changed[field] = value
         assert validate_root_fence_profile(changed) != identity

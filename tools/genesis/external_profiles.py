@@ -15,13 +15,39 @@ from typing import Mapping
 ROOT_ANCHOR_DOMAIN = b"autodev.g9-root-trust-anchor/v1\0"
 ROOT_FENCE_DOMAIN = b"autodev.g9-root-activation-fence-dependency/v1\0"
 FIXTURE_SUBSTRATE_DOMAIN = b"autodev.g9-fixture-effect-substrate-dependency/v1\0"
+ROOT_STORE_PROFILE_DOMAIN = b"autodev.g9-canonical-root-store-profile/v2\0"
+ACL_PROFILE_DOMAIN = b"autodev.g9-root-namespace-acl-profile/v1\0"
+ACCEPTANCE_PROFILE_DOMAIN = b"autodev.g9-acceptance-profile/v1\0"
+EXECUTION_ISOLATION_DOMAIN = b"autodev.g9-execution-isolation-dependency/v1\0"
+HOST_PROFILE_DOMAIN = b"autodev.g9-host-profile/v1\0"
+ROOT_STORE_PROFILE_NAME = "autodev.g9-canonical-root-store/v1"
+_EXECUTION_PROFILE_FIELDS = (
+    "format", "host_profile", "role_principals", "python_runtime", "staging_profile",
+    "channel_profile", "external_adapter_material", "role_interpreter_modules",
+    "production_github_mutation_credentials",
+)
+EXECUTION_ISOLATION_PROFILE_FIELDS = _EXECUTION_PROFILE_FIELDS
+_EXECUTION_RECORD_FIELDS = {
+    "host_profile": ("profile_id", "platform", "architecture", "domain"),
+    "python_runtime": ("identity", "version", "path", "sha256"),
+    "staging_profile": (
+        "profile_id", "root", "shared_role_access", "shared_operator_administrator_system_access",
+        "private_role_access", "root_store_role_access", "external_fence_release",
+    ),
+    "channel_profile": (
+        "profile_id", "format", "directions", "destination_credentials",
+        "controller_destination_credentials", "cross_role_messages",
+    ),
+}
+_EXECUTION_ROLES = ("T", "C", "P", "M")
 
 ROOT_ANCHOR_FIELDS = frozenset({
     "repository", "root_store_profile", "design_lineage", "namespace",
 })
 ROOT_FENCE_FIELDS = frozenset({
     "format", "repository", "design_lineage", "root_anchor_namespace",
-    "root_store_profile", "root_store_schema_sha256", "root_admin_tool_material",
+    "root_store_profile", "root_store_profile_id", "root_store_schema_sha256",
+    "root_namespace_acl_profile", "acceptance_profile", "root_admin_tool_material",
     "fence_controller_material", "python_runtime", "root_admin_principal",
     "canonical_root_store", "candidate_role_access", "capability_release_authority",
     "production_github_mutation_credentials",
@@ -66,6 +92,74 @@ def _valid_digest(value: object) -> bool:
             and all(char in "0123456789abcdef" for char in value))
 
 
+def _is_sid(value: object) -> bool:
+    return type(value) is str and value.startswith("S-1-") and all(
+        part.isdecimal() for part in value.split("-")[1:]
+    )
+
+
+def derive_root_namespace_acl_profile_id(profile: dict[str, object]) -> str:
+    if type(profile) is not dict or set(profile) != {
+            "format", "security_descriptor_sddl", "root_admin_sid", "substrate_sid",
+            "system_sid", "candidate_role_sids", "inherited_acl", "candidate_role_access"}:
+        raise ValueError("root ACL profile is not closed")
+    if (profile["format"] != "autodev.g9-root-namespace-acl-profile/v1"
+            or type(profile["security_descriptor_sddl"]) is not str
+            or not profile["security_descriptor_sddl"].startswith("O:")
+            or not _is_sid(profile["root_admin_sid"]) or not _is_sid(profile["substrate_sid"])
+            or profile["system_sid"] != "S-1-5-18"
+            or type(profile["candidate_role_sids"]) is not dict
+            or set(profile["candidate_role_sids"]) != {"T", "C", "P", "M"}
+            or any(not _is_sid(sid) for sid in profile["candidate_role_sids"].values())
+            or set(profile["candidate_role_sids"].values()) & {
+                profile["root_admin_sid"], profile["substrate_sid"], "S-1-5-18"}
+            or profile["inherited_acl"] != "DENY"
+            or profile["candidate_role_access"] != "NO_ACCESS"):
+        raise ValueError("root ACL profile semantics are invalid")
+    return _sha256(ACL_PROFILE_DOMAIN + canonical_json_bytes(profile))
+
+
+def derive_acceptance_profile_id(profile: dict[str, object]) -> str:
+    if type(profile) is not dict or set(profile) != {
+            "format", "authority_model", "eligible_bootstrap_approver", "authentication_method",
+            "acceptance_record_format", "acceptance_storage", "decision_domain", "validity_model",
+            "interactive_confirmation", "acceptance_tool_material",
+            "production_github_mutation_credentials"}:
+        raise ValueError("Genesis Acceptance profile is not closed")
+    approver = profile["eligible_bootstrap_approver"]
+    if (type(approver) is not dict or set(approver) != {"account", "sid", "administrator_required"}
+            or type(approver["account"]) is not str or not approver["account"]
+            or not _is_sid(approver["sid"]) or approver["administrator_required"] is not True):
+        raise ValueError("Genesis Acceptance eligible approver is invalid")
+    _validate_material(profile["acceptance_tool_material"])
+    if (profile["format"] != "autodev.g9-acceptance-profile/v1"
+            or profile["authority_model"] != "WINDOWS_EXTERNAL_ROOT_AUTHORITY"
+            or profile["authentication_method"] != "CURRENT_PROCESS_PRIMARY_TOKEN_EXACT_SID_ELEVATED_ADMIN"
+            or profile["acceptance_record_format"] != "autodev.genesis-acceptance-record/v1"
+            or profile["acceptance_storage"] != "CANONICAL_ROOT_DB_APPEND_ONLY"
+            or profile["decision_domain"] != "GENESIS_BOOTSTRAP"
+            or profile["validity_model"] != "IDENTITY_AND_SESSION_BOUND_NO_TIME_TTL"
+            or profile["interactive_confirmation"] != "LOCAL_CONSOLE_EXACT_SUBJECT_CONFIRMATION"
+            or profile["production_github_mutation_credentials"] != "NONE"):
+        raise ValueError("Genesis Acceptance profile semantics are invalid")
+    return _sha256(ACCEPTANCE_PROFILE_DOMAIN + canonical_json_bytes(profile))
+
+
+def derive_root_store_profile_id(*, schema_sha256: str, acl_profile_id: str,
+                                 acceptance_profile_id: str) -> str:
+    if not all(_valid_digest(value) for value in
+               (schema_sha256, acl_profile_id, acceptance_profile_id)):
+        raise ValueError("root-store profile inputs are malformed")
+    preimage = {
+        "format": ROOT_STORE_PROFILE_NAME, "schema_sha256": schema_sha256,
+        "canonical_path": r"C:\AutodevG9\root\root.sqlite3",
+        "storage_semantics": "SQLITE_CREATE_IF_ABSENT_IMMEDIATE_TRANSACTIONS_APPEND_ONLY_HISTORY_V2",
+        "root_namespace_acl_profile_id": acl_profile_id,
+        "acceptance_profile_id": acceptance_profile_id,
+    }
+    return _sha256(ROOT_STORE_PROFILE_DOMAIN + canonical_json_bytes(preimage))
+
+
 def _validate_material(value: object) -> None:
     if type(value) is not list or not value:
         raise ValueError("external material must be a non-empty list")
@@ -95,6 +189,87 @@ def derive_root_anchor_id(preimage: dict[str, object]) -> str:
     return _sha256(ROOT_ANCHOR_DOMAIN + canonical_json_bytes(preimage))
 
 
+def derive_execution_isolation_dependency_id(profile: dict[str, object]) -> str:
+    """Validate and content-address the closed role-isolation dependency profile."""
+    if type(profile) is not dict or set(profile) != set(_EXECUTION_PROFILE_FIELDS):
+        raise ValueError("execution-isolation profile has an open field set")
+    if profile["format"] != "autodev.g9-execution-isolation-profile/v1":
+        raise ValueError("execution-isolation profile format is unsupported")
+    for field, expected_fields in _EXECUTION_RECORD_FIELDS.items():
+        value = profile[field]
+        if type(value) is not dict or set(value) != set(expected_fields):
+            raise ValueError(f"execution-isolation {field} has an open field set")
+        non_direction_values = (
+            [item for key, item in value.items() if key != "directions"]
+            if field == "channel_profile" else list(value.values())
+        )
+        if any(type(item) is not str or not item for item in non_direction_values):
+            raise ValueError(f"execution-isolation {field} contains an invalid value")
+    principals = profile["role_principals"]
+    if (type(principals) is not list or len(principals) != 4
+            or tuple(item.get("role") for item in principals if type(item) is dict) != _EXECUTION_ROLES
+            or any(type(item) is not dict
+                   or set(item) != {"role", "account", "sid", "token_type", "administrator"}
+                   or any(type(item[key]) is not str or not item[key]
+                          for key in ("role", "account", "sid", "token_type"))
+                   or type(item["administrator"]) is not bool for item in principals)):
+        raise ValueError("execution-isolation role-principal set is not closed")
+    if profile["production_github_mutation_credentials"] != "NONE":
+        raise ValueError("execution-isolation profile admits production GitHub credentials")
+    adapters = profile["external_adapter_material"]
+    if (type(adapters) is not list or len(adapters) != 7
+            or any(type(item) is not dict or set(item) != {"path", "sha256"} for item in adapters)):
+        raise ValueError("execution-isolation adapter material is not closed")
+    expected_paths = tuple(sorted({
+        "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
+        "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
+        "tools/genesis/role_adapter.py", "tools/genesis/substrate_client.py",
+        "tools/genesis/canonical_state_channel.py",
+    }))
+    if tuple(item["path"] for item in adapters) != expected_paths:
+        raise ValueError("execution-isolation adapter material has unexpected paths or order")
+    if any(not _valid_digest(item["sha256"]) for item in adapters):
+        raise ValueError("execution-isolation adapter material digest is invalid")
+    modules = profile["role_interpreter_modules"]
+    expected_modules = (
+        ("ipc", "IMPORTED", "tools/genesis/ipc.py"),
+        ("role_worker", "SCRIPT", "tools/genesis/role_worker.py"),
+        ("role_adapter", "IMPORTED", "tools/genesis/role_adapter.py"),
+        ("substrate_client", "IMPORTED", "tools/genesis/substrate_client.py"),
+        ("canonical_state_channel", "IMPORTED", "tools/genesis/canonical_state_channel.py"),
+    )
+    if (type(modules) is not list or len(modules) != len(expected_modules)
+            or any(type(item) is not dict
+                   or set(item) != {"module_name", "execution", "path", "sha256"} for item in modules)):
+        raise ValueError("execution-isolation role-interpreter module set is not closed")
+    for item, expected in zip(modules, expected_modules, strict=True):
+        if (tuple(item[key] for key in ("module_name", "execution", "path")) != expected
+                or item["sha256"] != next(record["sha256"] for record in adapters
+                                           if record["path"] == item["path"])):
+            raise ValueError("execution-isolation module identity is not bound to adapter material")
+    if (type(profile["channel_profile"].get("directions")) is not list
+            or not all(type(direction) is str for direction in profile["channel_profile"]["directions"])):
+        raise ValueError("execution-isolation channel direction set is invalid")
+    return "dep-execution-isolation-" + _sha256(
+        EXECUTION_ISOLATION_DOMAIN + canonical_json_bytes(profile)
+    )
+
+
+def derive_host_profile_id(*, root_fence_profile_sha256: str,
+                           fixture_substrate_profile_sha256: str,
+                           execution_isolation_profile_sha256: str) -> str:
+    identities = (root_fence_profile_sha256, fixture_substrate_profile_sha256,
+                  execution_isolation_profile_sha256)
+    if not all(_valid_digest(item) for item in identities):
+        raise ValueError("host profile external-profile identities are malformed")
+    return _sha256(HOST_PROFILE_DOMAIN + canonical_json_bytes({
+        "format": "autodev.g9-host-profile/v1",
+        "root_fence_profile_sha256": root_fence_profile_sha256,
+        "fixture_substrate_profile_sha256": fixture_substrate_profile_sha256,
+        "execution_isolation_profile_sha256": execution_isolation_profile_sha256,
+    }))
+
+
 def validate_root_fence_profile(profile: dict[str, object]) -> str:
     """Validate the exact external fence profile and return its dependency ID."""
     if not _closed_record(profile, ROOT_FENCE_FIELDS):
@@ -102,13 +277,40 @@ def validate_root_fence_profile(profile: dict[str, object]) -> str:
     if profile["format"] != "autodev.g9-root-activation-fence-profile/v1":
         raise ValueError("root-fence profile format is unsupported")
     for name in ("repository", "design_lineage", "root_anchor_namespace",
-                 "root_store_profile", "capability_release_authority"):
+                 "root_store_profile", "root_store_profile_id", "capability_release_authority"):
         if type(profile[name]) is not str or not profile[name]:
             raise ValueError(f"root-fence {name} is invalid")
     if profile["repository"] != "RayZhang2024/autonomous-dev-control-plane":
         raise ValueError("root-fence repository identity is not frozen")
     if not _valid_digest(profile["root_store_schema_sha256"]):
         raise ValueError("root-store schema digest is invalid")
+    acl = profile["root_namespace_acl_profile"]
+    if (type(acl) is not dict or set(acl) != {"profile_id", "security_descriptor_sddl",
+            "root_admin_sid", "substrate_sid", "system_sid", "candidate_role_sids"}
+            or not _valid_digest(acl["profile_id"])):
+        raise ValueError("root namespace ACL identity is not exact")
+    acl_semantics = {"format": "autodev.g9-root-namespace-acl-profile/v1",
+                     "security_descriptor_sddl": acl["security_descriptor_sddl"],
+                     "root_admin_sid": acl["root_admin_sid"], "substrate_sid": acl["substrate_sid"],
+                     "system_sid": acl["system_sid"], "candidate_role_sids": acl["candidate_role_sids"],
+                     "inherited_acl": "DENY", "candidate_role_access": "NO_ACCESS"}
+    if derive_root_namespace_acl_profile_id(acl_semantics) != acl["profile_id"]:
+        raise ValueError("root ACL profile ID is stale")
+    acceptance = profile["acceptance_profile"]
+    acceptance_fields = {"profile_id", "authority_model", "eligible_bootstrap_approver",
+                         "authentication_method", "acceptance_record_format", "acceptance_storage",
+                         "decision_domain", "validity_model", "interactive_confirmation",
+                         "production_github_mutation_credentials"}
+    if (type(acceptance) is not dict or set(acceptance) != acceptance_fields
+            or not _valid_digest(acceptance["profile_id"])):
+        raise ValueError("Genesis Acceptance profile identity is not exact")
+    acceptance_preimage = {
+        "format": "autodev.g9-acceptance-profile/v1",
+        **{key: value for key, value in acceptance.items() if key != "profile_id"},
+        "acceptance_tool_material": profile["root_admin_tool_material"],
+    }
+    if derive_acceptance_profile_id(acceptance_preimage) != acceptance["profile_id"]:
+        raise ValueError("Genesis Acceptance profile ID is stale")
     _validate_material(profile["root_admin_tool_material"])
     _validate_material(profile["fence_controller_material"])
     if [item["path"] for item in profile["root_admin_tool_material"]] != [
@@ -133,9 +335,15 @@ def validate_root_fence_profile(profile: dict[str, object]) -> str:
         raise ValueError("root-admin principal identity is invalid")
     if not _closed_record(store, _STORE_FIELDS):
         raise ValueError("canonical root-store record is invalid")
-    if (store["profile_id"] != "autodev.g9-canonical-root-store/v1"
+    if (store["profile_id"] != profile["root_store_profile_id"]
             or store["path"] != r"C:\AutodevG9\root\root.sqlite3"):
         raise ValueError("canonical root-store path/profile is not frozen")
+    if profile["root_store_profile"] != ROOT_STORE_PROFILE_NAME:
+        raise ValueError("root-store profile name is not frozen")
+    if derive_root_store_profile_id(
+            schema_sha256=profile["root_store_schema_sha256"], acl_profile_id=acl["profile_id"],
+            acceptance_profile_id=acceptance["profile_id"]) != profile["root_store_profile_id"]:
+        raise ValueError("root-store profile identity is stale")
     if profile["candidate_role_access"] != "NO_WRITE":
         raise ValueError("candidate roles must have no root-store write access")
     if profile["capability_release_authority"] != "EXTERNAL_ROOT_ADMIN_ONLY":
@@ -155,9 +363,7 @@ def validate_fixture_substrate_profile(profile: dict[str, object]) -> str:
         raise ValueError("fixture-substrate profile format is unsupported")
     _validate_material(profile["implementation_material"])
     if [item["path"] for item in profile["implementation_material"]] != [
-            "tools/genesis/fixture_substrate.py", "tools/genesis/role_adapter.py",
-            "tools/genesis/windows_role_launcher.py",
-            "tools/genesis/windows_substrate_launcher.py"]:
+            "tools/genesis/fixture_substrate.py", "tools/genesis/windows_substrate_launcher.py"]:
         raise ValueError("fixture-substrate implementation closure is not exact")
     for name in ("f_read_verify_endpoint", "publication_authority_endpoint",
                  "merge_authority_endpoint", "external_recovery_endpoint"):
@@ -227,13 +433,48 @@ def build_external_profiles(
         "tools/genesis/root_admin.py",
     ))
     substrate_tools = source_material(root, (
-        "tools/genesis/fixture_substrate.py", "tools/genesis/role_adapter.py",
-        "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_substrate_launcher.py",
+        "tools/genesis/fixture_substrate.py", "tools/genesis/windows_substrate_launcher.py",
     ))
+    from windows_role_launcher import ROLE_PRINCIPALS
+    role_sids = {role: item[1] for role, item in ROLE_PRINCIPALS.items()}
+    root_admin_material = [item for item in root_tools
+                           if item["path"].endswith(("external_profiles.py", "root_admin.py"))]
+    acl_semantics = {
+        "format": "autodev.g9-root-namespace-acl-profile/v1",
+        "security_descriptor_sddl": (
+            f"O:{root_admin_principal['sid']}G:S-1-5-18D:P"
+            f"(A;;FA;;;S-1-5-18)(A;;FA;;;{root_admin_principal['sid']})"
+            f"(A;;GR;;;{substrate_principal['sid']})"
+        ),
+        "root_admin_sid": root_admin_principal["sid"], "substrate_sid": substrate_principal["sid"],
+        "system_sid": "S-1-5-18", "candidate_role_sids": role_sids,
+        "inherited_acl": "DENY", "candidate_role_access": "NO_ACCESS",
+    }
+    acl_id = derive_root_namespace_acl_profile_id(acl_semantics)
+    acceptance_semantics = {
+        "format": "autodev.g9-acceptance-profile/v1",
+        "authority_model": "WINDOWS_EXTERNAL_ROOT_AUTHORITY",
+        "eligible_bootstrap_approver": {
+            "account": root_admin_principal["account"], "sid": root_admin_principal["sid"],
+            "administrator_required": True,
+        },
+        "authentication_method": "CURRENT_PROCESS_PRIMARY_TOKEN_EXACT_SID_ELEVATED_ADMIN",
+        "acceptance_record_format": "autodev.genesis-acceptance-record/v1",
+        "acceptance_storage": "CANONICAL_ROOT_DB_APPEND_ONLY",
+        "decision_domain": "GENESIS_BOOTSTRAP",
+        "validity_model": "IDENTITY_AND_SESSION_BOUND_NO_TIME_TTL",
+        "interactive_confirmation": "LOCAL_CONSOLE_EXACT_SUBJECT_CONFIRMATION",
+        "acceptance_tool_material": root_admin_material,
+        "production_github_mutation_credentials": "NONE",
+    }
+    acceptance_id = derive_acceptance_profile_id(acceptance_semantics)
+    store_id = derive_root_store_profile_id(schema_sha256=ROOT_STORE_SCHEMA_SHA256,
+                                            acl_profile_id=acl_id,
+                                            acceptance_profile_id=acceptance_id)
     anchor_preimage = {
         "repository": "RayZhang2024/autonomous-dev-control-plane",
-        "root_store_profile": "autodev.g9-canonical-root-store/v1",
-        "design_lineage": "issue-55-g9-completion-repair-v0.2",
+        "root_store_profile": store_id,
+        "design_lineage": "issue-55-g9-completion-repair-v0.5",
         "namespace": "autodev-v2-first-genesis-root",
     }
     anchor_id = derive_root_anchor_id(anchor_preimage)
@@ -242,16 +483,29 @@ def build_external_profiles(
         "repository": anchor_preimage["repository"],
         "design_lineage": anchor_preimage["design_lineage"],
         "root_anchor_namespace": anchor_preimage["namespace"],
-        "root_store_profile": anchor_preimage["root_store_profile"],
+        "root_store_profile": ROOT_STORE_PROFILE_NAME,
+        "root_store_profile_id": store_id,
         "root_store_schema_sha256": ROOT_STORE_SCHEMA_SHA256,
-        "root_admin_tool_material": [item for item in root_tools
-                                     if item["path"].endswith(("external_profiles.py", "root_admin.py"))],
+        "root_namespace_acl_profile": {
+            "profile_id": acl_id,
+            "security_descriptor_sddl": acl_semantics["security_descriptor_sddl"],
+            "root_admin_sid": acl_semantics["root_admin_sid"],
+            "substrate_sid": acl_semantics["substrate_sid"],
+            "system_sid": acl_semantics["system_sid"],
+            "candidate_role_sids": role_sids,
+        },
+        "acceptance_profile": {
+            "profile_id": acceptance_id,
+            **{key: value for key, value in acceptance_semantics.items()
+               if key not in ("format", "acceptance_tool_material")},
+        },
+        "root_admin_tool_material": root_admin_material,
         "fence_controller_material": [item for item in root_tools
                                       if item["path"].endswith("fence_controller.py")],
         "python_runtime": dict(python_runtime),
         "root_admin_principal": dict(root_admin_principal),
         "canonical_root_store": {
-            "profile_id": "autodev.g9-canonical-root-store/v1",
+            "profile_id": store_id,
             "path": r"C:\AutodevG9\root\root.sqlite3",
         },
         "candidate_role_access": "NO_WRITE",

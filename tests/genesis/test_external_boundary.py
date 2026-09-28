@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
 
@@ -17,6 +19,7 @@ import role_worker
 import windows_role_runner
 import windows_substrate_launcher
 from deployment_readiness import build_deployment_readiness, verify_deployment_readiness
+from external_profiles import build_external_profiles, canonical_json_bytes, derive_host_profile_id
 from fixture_substrate import (
     FixtureEffectState,
     FixtureSubstrateServer,
@@ -27,10 +30,35 @@ from fixture_substrate import (
 from role_adapter import RoleSubstrateAdapter, construct_candidate_runtime, role_capability_surface
 
 
-ANCHOR = "a" * 64
 PACKAGE = "b" * 64
 MANIFEST = "c" * 64
-ADMIN_SID = "S-1-5-21-1-1001"
+ADMIN_SID = "S-1-5-21-711519901-190585334-3846127459-1001"
+_REPOSITORY = Path(__file__).resolve().parents[2]
+_TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES = build_external_profiles(
+    str(_REPOSITORY),
+    root_admin_principal={"account": r"ray\zhang", "sid": ADMIN_SID, "administrator": True},
+    substrate_principal={"account": r"Ray\autodev-g9-s",
+                         "sid": "S-1-5-21-711519901-190585334-3846127459-1020",
+                         "token_type": "PRIMARY", "administrator": False},
+    python_runtime={"identity": "CPython", "version": "3.13.14",
+                    "path": r"C:\AutodevG9\shared\python313\python.exe", "sha256": "8" * 64},
+)
+_TEST_STORE_ID = _TEST_ROOT_PROFILE["root_store_profile_id"]
+_TEST_ACL_ID = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["profile_id"]
+_TEST_ACCEPTANCE_ID = _TEST_ROOT_PROFILE["acceptance_profile"]["profile_id"]
+from build_definition import sha256 as _sha256
+from assemble_candidate import _derive_execution_isolation_dependency_id, _make_execution_isolation_profile
+_EXTERNAL_PATHS = (
+    "ipc.py", "role_worker.py", "windows_role_launcher.py", "windows_role_runner.py",
+    "role_adapter.py", "substrate_client.py", "canonical_state_channel.py",
+)
+_TEST_ISOLATION_MATERIAL = [
+    {"path": f"tools/genesis/{name}", "sha256": _sha256((_REPOSITORY / "tools" / "genesis" / name).read_bytes())}
+    for name in sorted(_EXTERNAL_PATHS)
+]
+_TEST_ISOLATION_PROFILE = _make_execution_isolation_profile(_TEST_ISOLATION_MATERIAL)
+_TEST_ISOLATION_DEPENDENCY = _derive_execution_isolation_dependency_id(_TEST_ISOLATION_PROFILE)
+_TEST_STORE_ID = _TEST_ROOT_PROFILE["root_store_profile_id"]
 
 
 def _substrate_ready_record(port=54321):
@@ -98,8 +126,18 @@ def test_launcher_probe_failure_is_fixed_and_stops_before_any_role_launch(
 
     monkeypatch.setattr(root_admin, "ROOT_STORE_PATH", tmp_path / "absent-root" / "root.sqlite3")
     monkeypatch.setattr(windows_role_runner, "_host_profiles",
-                        lambda: ({}, {}, "anchor", ("root-dep", "substrate-dep")))
-    package = SimpleNamespace(graph=b"{}", raw_resources={}, candidate_package_id=PACKAGE)
+                        lambda: ({}, {}, ANCHOR, ("root-dep", "substrate-dep")))
+    role_members = [{"role": role, "security_context_config_resource": f"security-{role}",
+                     "capability_wiring_resource": f"wiring-{role}"}
+                    for role in ("T", "C", "P", "M")]
+    raw_resources = {f"security-{role}": role.encode() for role in ("T", "C", "P", "M")}
+    raw_resources.update({f"wiring-{role}": (role + "-wiring").encode()
+                          for role in ("C", "P", "M")})
+    package = SimpleNamespace(
+        graph=json.dumps({"members": role_members}).encode(), raw_resources=raw_resources,
+        candidate_package_id=PACKAGE, manifest_id=MANIFEST, runtime_sha256="d" * 64,
+        build_definition=json.dumps({"execution_isolation_dependency_id": "dep-exec-test"}).encode(),
+    )
     monkeypatch.setattr(windows_role_runner, "assemble_candidate", lambda **_kwargs: package)
     monkeypatch.setattr(windows_role_runner, "_stage",
                         lambda _package: (tmp_path, tmp_path / "worker.py", tmp_path))
@@ -560,39 +598,65 @@ def test_send_and_receive_diagnostics_remain_phase_only_without_socket_details(
     assert str(error_number) not in diagnostic
 
 
+def _test_fence_row(candidate_package_id: str = PACKAGE, manifest_id: str = MANIFEST,
+                    runtime_sha256: str = "d" * 64) -> dict[str, object]:
+    return root_admin.build_fence_row(
+        root_anchor_id=ANCHOR, candidate_package_id=candidate_package_id,
+        manifest_id=manifest_id, runtime_artifact_sha256=runtime_sha256,
+        runtime_generation="g9-generation-test",
+        execution_isolation_dependency_id=_TEST_ISOLATION_DEPENDENCY,
+        fixture_effect_substrate_dependency_id=_TEST_DEPENDENCIES[1],
+        security_context_identities={role: hashlib.sha256(role.encode()).hexdigest()
+                                     for role in ("T", "C", "P", "M")},
+        prepared_endpoint_identities={role: hashlib.sha256((role + "-endpoint").encode()).hexdigest()
+                                      for role in ("C", "P", "M")},
+    )
+
+
 def _root_fixture(path, *, root_rows: bool = False, state: str = "FENCED", revision: int = 0,
-                  candidate_package_id: str = PACKAGE) -> None:
+                  candidate_package_id: str = PACKAGE) -> dict[str, object]:
+    fence = _test_fence_row(candidate_package_id)
+    fence["state"], fence["revision"] = state, revision
     connection = sqlite3.connect(path)
     try:
         for statement in root_admin._SCHEMA_STATEMENTS:
             connection.execute(statement)
-        connection.execute(
-            "INSERT INTO capability_fence(candidate_package_id, root_anchor_id, state, revision) "
-            "VALUES (?, ?, ?, ?)", (candidate_package_id, ANCHOR, state, revision),
-        )
+        columns = ",".join(root_admin.FENCE_BINDING_FIELDS)
+        placeholders = ",".join("?" for _ in root_admin.FENCE_BINDING_FIELDS)
+        connection.execute(f"INSERT INTO capability_fence({columns}) VALUES ({placeholders})",
+                           tuple(fence[field] for field in root_admin.FENCE_BINDING_FIELDS))
         if root_rows:
             connection.execute(
                 "INSERT INTO root_state(format, root_anchor_id, active_manifest_id, transition, revision) "
-                "VALUES (?, ?, ?, 'G_OPEN', 1)",
+                "VALUES (?, ?, ?, 'open', 1)",
                 (root_admin.ROOT_STATE_FORMAT, ANCHOR, MANIFEST),
             )
         connection.commit()
     finally:
         connection.close()
+    return fence
 
 
 def test_root_store_inspection_is_read_only_and_recognizes_only_exact_stage_b_state(tmp_path):
     database = tmp_path / "fixture.sqlite3"
-    _root_fixture(database)
+    fence = _root_fixture(database)
     before = database.read_bytes()
     evidence = root_admin.inspect_uninitialized_root(
-        database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
+        database, expected_fence_row=fence, deployment_session_id="e" * 64,
     )
     assert evidence == {
         "status": "UNINITIALIZED", "root_anchor_id": ANCHOR,
         "candidate_package_id": PACKAGE, "root_state_row_count": 0,
         "capability_fence_row_count": 1, "fence_state": "FENCED",
-        "fence_revision": 0, "schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
+        "manifest_id": MANIFEST, "fence_id": fence["fence_id"],
+        "fence_revision": 0, "capability_fence": fence,
+        "acceptance_history_count": 0, "initialization_record_count": 0,
+        "acceptance_history_digest": hashlib.sha256(
+            b"autodev.genesis-acceptance-history/v1\0[]"
+        ).hexdigest(),
+        "applicable_acceptance_for_this_deployment_session": None,
+        "deployment_session_id": "e" * 64,
+        "release_verification_count": 0, "schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
     }
     assert database.read_bytes() == before
 
@@ -607,8 +671,9 @@ def test_root_store_inspection_fails_closed_on_initialized_stale_or_ambiguous_st
     database = tmp_path / "fixture.sqlite3"
     _root_fixture(database, **kwargs)
     with pytest.raises(ValueError):
+        expected = _test_fence_row()
         root_admin.inspect_uninitialized_root(
-            database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
+            database, expected_fence_row=expected, deployment_session_id="e" * 64,
         )
 
 
@@ -621,51 +686,452 @@ def test_root_store_inspection_fails_closed_on_schema_tampering(tmp_path):
     connection.close()
     with pytest.raises(ValueError, match="schema"):
         root_admin.inspect_uninitialized_root(
-            database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
+            database, expected_fence_row=_test_fence_row(), deployment_session_id="e" * 64,
         )
 
 
-def test_external_root_admin_genesis_initialization_is_explicit_and_create_once(tmp_path, monkeypatch):
-    database = tmp_path / "fixture.sqlite3"
-    _root_fixture(database, state="RELEASED", revision=1)
+def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, object]:
+    roles: dict[str, dict[str, object]] = {}
+    process_observations: dict[str, dict[str, object]] = {}
+    role_types = {"T": "TrustedControllerRuntime", "C": "ControlStateGateRuntime",
+                  "P": "PublicationGateRuntime", "M": "MergeGateRuntime"}
+    role_sids = {item["role"]: item["sid"] for item in _TEST_ISOLATION_PROFILE["role_principals"]}
+    for index, role in enumerate(("T", "C", "P", "M"), start=101):
+        role_record: dict[str, object] = {
+            "sid": role_sids[role],
+            "token_type": 1, "administrator": False, "pid": index,
+            "ppid": 900, "candidate_package_id": fence["candidate_package_id"],
+        "runtime_sha256": fence["runtime_artifact_sha256"],
+            "entrypoint_identity": hashlib.sha256((role + "-entry").encode()).hexdigest(),
+            "security_context_identity": fence[f"security_context_{role.lower()}_identity"],
+            "wiring_identity": hashlib.sha256((role + "-wiring").encode()).hexdigest(),
+            "endpoint_identity": hashlib.sha256((role + "-endpoint").encode()).hexdigest(),
+            "private_directory": f"C:/AutodevG9/private/{role}",
+            "destination_channel_credentials": "NONE" if role == "T" else "ROLE_LOCAL_ONLY",
+            "runtime_type": role_types[role],
+            "runtime_role_identity": hashlib.sha256((role + "-runtime-role").encode()).hexdigest(),
+            "runtime_binding_id": hashlib.sha256((role + "-binding").encode()).hexdigest(),
+            "runtime_active": role in ("T", "C"), "canonical_state": {},
+        }
+        roles[role] = role_record
+        process_subject = {
+            "role": role, "pid": index, "creation_time_100ns": index * 100,
+            "sid": role_record["sid"], "token_type": 1, "administrator": False,
+            "deployment_session_id": session,
+            "security_context_identity": role_record["security_context_identity"],
+            "entrypoint_identity": role_record["entrypoint_identity"],
+            "wiring_identity": role_record["wiring_identity"],
+            "endpoint_identity": role_record["endpoint_identity"],
+            "runtime_role_identity": role_record["runtime_role_identity"],
+            "runtime_binding_id": role_record["runtime_binding_id"],
+        }
+        process_observations[role] = {
+            **process_subject,
+            "process_instance_id": hashlib.sha256(
+                b"autodev.g9-process-instance/v1\0" + canonical_json_bytes(process_subject)
+            ).hexdigest(),
+        }
+    process_subject = {
+        "role": "S", "pid": 100, "creation_time_100ns": 10000,
+        "sid": "S-1-5-21-711519901-190585334-3846127459-1020",
+        "token_type": 1, "administrator": False, "deployment_session_id": session,
+        "security_context_identity": hashlib.sha256(b"S-context").hexdigest(),
+        "entrypoint_identity": hashlib.sha256(b"S-entry").hexdigest(),
+        "wiring_identity": hashlib.sha256(b"S-wiring").hexdigest(),
+        "endpoint_identity": hashlib.sha256(b"S-endpoint").hexdigest(),
+        "runtime_role_identity": hashlib.sha256(b"S-runtime").hexdigest(),
+        "runtime_binding_id": hashlib.sha256(b"S-binding").hexdigest(),
+    }
+    process_observations["S"] = {
+        **process_subject,
+        "process_instance_id": hashlib.sha256(
+            b"autodev.g9-process-instance/v1\0" + canonical_json_bytes(process_subject)
+        ).hexdigest(),
+    }
+    root_observation = {
+        "status": "UNINITIALIZED", "root_anchor_id": fence["root_anchor_id"],
+        "candidate_package_id": fence["candidate_package_id"], "manifest_id": fence["manifest_id"],
+        "root_state_row_count": 0, "capability_fence_row_count": 1,
+        "fence_id": fence["fence_id"], "fence_state": "FENCED", "fence_revision": 0,
+        "capability_fence": fence, "acceptance_history_count": 0,
+        "acceptance_history_digest": hashlib.sha256(
+            b"autodev.genesis-acceptance-history/v1\0[]"
+        ).hexdigest(), "applicable_acceptance_for_this_deployment_session": None,
+        "deployment_session_id": session, "initialization_record_count": 0,
+        "release_verification_count": 0, "schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
+    }
+    preimage = {
+        "format": "autodev.genesis-deployment-attestation/v1",
+        "candidate_package_id": fence["candidate_package_id"],
+        "genesis_manifest_id": fence["manifest_id"],
+        "deterministic_evidence_ids": ["D-" + "1" * 24],
+        "review_record_id": "2" * 64,
+        "repository_source_commit": "3" * 40,
+        "runtime_artifact_sha256": fence["runtime_artifact_sha256"],
+        "python_runtime": _TEST_ROOT_PROFILE["python_runtime"],
+        "execution_isolation_dependency_id": fence["execution_isolation_dependency_id"],
+        "execution_isolation_profile": _TEST_ISOLATION_PROFILE,
+        "execution_isolation_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(_TEST_ISOLATION_PROFILE)).hexdigest(),
+        "root_fence_dependency_id": _TEST_DEPENDENCIES[0],
+        "root_fence_profile": _TEST_ROOT_PROFILE,
+        "root_fence_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(_TEST_ROOT_PROFILE)).hexdigest(),
+        "root_store_profile_id": _TEST_STORE_ID,
+        "root_store_schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
+        "root_namespace_acl_profile_id": _TEST_ACL_ID,
+        "acceptance_profile_id": _TEST_ACCEPTANCE_ID,
+        "fixture_substrate_dependency_id": fence["fixture_effect_substrate_dependency_id"],
+        "fixture_substrate_profile": _TEST_SUBSTRATE_PROFILE,
+        "fixture_substrate_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest(),
+        "root_anchor_id": fence["root_anchor_id"],
+        "deployment_session_id": session,
+        "root_state_observation": root_observation,
+        "roles": roles, "process_instance_observations": process_observations,
+        "external_root_controller_identity": {"implementation_sha256": "9" * 64,
+                                                "configuration_sha256": "a" * 64},
+        "staged_external_material": sorted({
+            item["path"]: item["sha256"]
+            for collection in (
+                _TEST_ROOT_PROFILE["root_admin_tool_material"],
+                _TEST_ROOT_PROFILE["fence_controller_material"],
+                _TEST_SUBSTRATE_PROFILE["implementation_material"],
+                _TEST_ISOLATION_PROFILE["role_interpreter_modules"],
+            ) for item in collection
+        }.items()),
+        "substrate_service": {"sid": process_subject["sid"], "token_type": 1,
+            "administrator": False, "pid": process_subject["pid"],
+            "endpoint_identity": process_subject["endpoint_identity"],
+            "implementation_identity": next(
+                item["sha256"] for item in _TEST_SUBSTRATE_PROFILE["implementation_material"]
+                if item["path"] == "tools/genesis/fixture_substrate.py"),
+            "configuration_identity": hashlib.sha256(
+                canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest(),
+            "working_directory": r"C:\AutodevG9\shared"},
+        "shared_runtime_read_only": True,
+        "cross_role_private_write_denial": {role: True for role in ("T", "C", "P", "M")},
+        "candidate_root_store_write_denial": {role: True for role in ("T", "C", "P", "M")},
+        "protected_endpoint_state": {
+            "C_WRITER": {"state": "FENCED", "identity": fence["prepared_endpoint_c_identity"],
+                          "credential_withheld": True},
+            "P_PUBLICATION": {"state": "FENCED", "identity": fence["prepared_endpoint_p_identity"],
+                              "credential_withheld": True},
+            "M_MERGE": {"state": "FENCED", "identity": fence["prepared_endpoint_m_identity"],
+                        "credential_withheld": True},
+        },
+        "recovery_fence_inventory": [
+            _TEST_SUBSTRATE_PROFILE["external_recovery_endpoint"]["endpoint_id"],
+        ],
+        "production_github_mutation_credentials": "NONE",
+        "host_profile_id": derive_host_profile_id(
+            root_fence_profile_sha256=hashlib.sha256(canonical_json_bytes(_TEST_ROOT_PROFILE)).hexdigest(),
+            fixture_substrate_profile_sha256=hashlib.sha256(
+                canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest(),
+            execution_isolation_profile_sha256=hashlib.sha256(
+                canonical_json_bytes(_TEST_ISOLATION_PROFILE)).hexdigest(),
+        ),
+        "observed_at": "2026-09-28T12:00:00.000000Z",
+    }
+    preimage["staged_external_material"] = [
+        {"path": path, "sha256": digest}
+        for path, digest in preimage["staged_external_material"]
+    ]
+    return root_admin.build_deployment_attestation(preimage, fence, session)
+
+
+def test_acceptance_confirmation_binds_exact_stable_subject_not_timestamp():
+    preimage = root_admin.acceptance_preimage(
+        acceptance_profile_id=_TEST_ACCEPTANCE_ID, approver_account=r"ray\zhang",
+        approver_sid=ADMIN_SID, candidate_package_id=PACKAGE, genesis_manifest_id=MANIFEST,
+        runtime_artifact_sha256="d" * 64, root_anchor_id=ANCHOR,
+        deployment_attestation_id="1" * 64, deployment_session_id="2" * 64,
+    )
+    assert preimage["activation_subject"] == {
+        "kind": "GENESIS_BOOTSTRAP", "manifest_id": MANIFEST,
+    }
+    digest = root_admin.acceptance_confirmation_subject(preimage)
+    stable = {key: value for key, value in preimage.items() if key != "accepted_at"}
+    assert digest == hashlib.sha256(
+        b"autodev.genesis-acceptance-subject/v1\0" + canonical_json_bytes(stable)
+    ).hexdigest()
+    changed_timestamp = dict(preimage, accepted_at="2026-09-28T12:00:00.000001Z")
+    assert root_admin.acceptance_confirmation_subject(changed_timestamp) == digest
+    changed_subject = dict(preimage, deployment_session_id="3" * 64)
+    assert root_admin.acceptance_confirmation_subject(changed_subject) != digest
+    malformed = dict(preimage, activation_subject={
+        "kind": "GENESIS_BOOTSTRAP", "genesis_manifest_id": MANIFEST,
+    })
+    with pytest.raises(ValueError, match="confirmation subject"):
+        root_admin.acceptance_confirmation_subject(malformed)
+
+
+def _fixture_live_observation(attestation: dict[str, object]) -> dict[str, object]:
+    preimage = attestation["preimage"]
+    return {
+        "deployment_session_id": preimage["deployment_session_id"],
+        "deployment_attestation_id": attestation["record_id"],
+        "candidate_package_id": preimage["candidate_package_id"],
+        "genesis_manifest_id": preimage["genesis_manifest_id"],
+        "runtime_artifact_sha256": preimage["runtime_artifact_sha256"],
+        "root_anchor_id": preimage["root_anchor_id"],
+        "root_profile_identities": {
+            "root_store_profile_id": preimage["root_store_profile_id"],
+            "root_namespace_acl_profile_id": preimage["root_namespace_acl_profile_id"],
+            "acceptance_profile_id": preimage["acceptance_profile_id"],
+            "root_fence_dependency_id": preimage["root_fence_dependency_id"],
+            "execution_isolation_dependency_id": preimage["execution_isolation_dependency_id"],
+            "fixture_substrate_dependency_id": preimage["fixture_substrate_dependency_id"],
+            "root_anchor_id": preimage["root_anchor_id"],
+        },
+        "security_context_identities": {
+            role: preimage["roles"][role]["security_context_identity"]
+            for role in ("T", "C", "P", "M")
+        },
+        "role_bindings": {
+            role: {key: preimage["roles"][role][key] for key in (
+                "security_context_identity", "entrypoint_identity", "wiring_identity",
+                "endpoint_identity", "runtime_role_identity", "runtime_binding_id")}
+            for role in ("T", "C", "P", "M")
+        },
+        "process_instance_identities": {
+            role: item["process_instance_id"]
+            for role, item in preimage["process_instance_observations"].items()
+        },
+        "external_material_identities": {
+            item["path"]: item["sha256"] for item in preimage["staged_external_material"]
+        },
+        "substrate_endpoint_identity": preimage["substrate_service"]["endpoint_identity"],
+        "protected_effect_denial_observation": {
+            "p_target_fence_state": "FENCED", "m_target_fence_state": "FENCED",
+            "p_protected_effect_denied": True, "m_protected_effect_denied": True,
+            "candidate_root_store_write_denied": True, "candidate_fence_release_denied": True,
+            "production_github_mutation_credentials": "NONE",
+        },
+    }
+
+
+def test_fresh_release_observation_is_bound_to_exact_s_processes_material_and_denials():
+    fence = _test_fence_row()
+    attestation = _fixture_attestation(fence, "2" * 64)
+    observation = _fixture_live_observation(attestation)
+    assert root_admin._verify_live_observation(
+        observation, fence, "2" * 64, attestation,
+    )
+    for mutate in (
+        lambda value: value["process_instance_identities"].update(T="0" * 64),
+        lambda value: value["external_material_identities"].update(
+            {"tools/genesis/root_admin.py": "0" * 64}),
+        lambda value: value["role_bindings"]["P"].update(runtime_binding_id="0" * 64),
+        lambda value: value["protected_effect_denial_observation"].update(
+            m_protected_effect_denied=False),
+        lambda value: value["root_profile_identities"].update(root_store_profile_id="0" * 64),
+    ):
+        altered = json.loads(json.dumps(observation))
+        mutate(altered)
+        assert not root_admin._verify_live_observation(altered, fence, "2" * 64, attestation)
+
+
+def test_root_mutations_require_retained_native_session_not_a_boolean_callback():
+    with pytest.raises(TypeError, match="exact retained native launcher process type"):
+        root_admin.RetainedDeploymentSession(
+            "1" * 64, {role: object() for role in ("S", "T", "C", "P", "M")},
+        )
+    assert "final_liveness_check" not in inspect.signature(
+        root_admin.initialize_genesis_state,
+    ).parameters
+    assert "final_liveness_check" not in inspect.signature(
+        root_admin.release_capability_fence,
+    ).parameters
+
+
+def _authorize_temp_root_mutation(monkeypatch):
+    class _FixtureRetainedSession:
+        def __init__(self, deployment_session_id, process_instances):
+            self.deployment_session_id = deployment_session_id
+            self.process_instances = process_instances
+
+        def verify(self, attestation, session_id):
+            observations = attestation["preimage"]["process_instance_observations"]
+            return (session_id == self.deployment_session_id
+                    and set(self.process_instances) == set(observations)
+                    and all(self.process_instances[role].pid == observations[role]["pid"]
+                            and self.process_instances[role].creation_time_100ns
+                                == observations[role]["creation_time_100ns"]
+                            and self.process_instances[role].is_live() is True
+                            for role in observations))
+
     monkeypatch.setattr(root_admin, "_is_canonical_path", lambda _: True)
-    monkeypatch.setattr(root_admin, "_require_external_root_admin", lambda _: None)
-    monkeypatch.setattr(fence_controller, "_require_external_root_admin", lambda _: None)
+    monkeypatch.setattr(root_admin, "_require_external_root_admin", lambda _: ADMIN_SID)
+    monkeypatch.setattr(root_admin, "_set_and_verify_root_acl", lambda *_: None)
+    monkeypatch.setattr(root_admin, "_confirm_human_action", lambda *_: None)
+    monkeypatch.setattr(root_admin, "RetainedDeploymentSession", _FixtureRetainedSession)
+
+
+def _test_retained_session(attestation):
+    observations = attestation["preimage"]["process_instance_observations"]
+    return root_admin.RetainedDeploymentSession(
+        attestation["preimage"]["deployment_session_id"],
+        {role: SimpleNamespace(
+            pid=record["pid"], creation_time_100ns=record["creation_time_100ns"],
+            is_live=lambda: True,
+        ) for role, record in observations.items()},
+    )
+
+
+def test_external_root_admin_genesis_initializes_while_fence_remains_fenced_zero(tmp_path, monkeypatch):
+    database = tmp_path / "fixture.sqlite3"
+    fence = _root_fixture(database)
+    _authorize_temp_root_mutation(monkeypatch)
+    session = "e" * 64
+    attestation = _fixture_attestation(fence, session)
+    retained_session = _test_retained_session(attestation)
+    accepted = root_admin.append_acceptance(
+        database, expected_admin_sid=ADMIN_SID, approver_account=r"ray\zhang",
+        acceptance_profile_id=_TEST_ACCEPTANCE_ID, expected_fence_row=fence,
+        deployment_attestation=attestation, deployment_session_id=session,
+        retained_session=retained_session,
+        explicit_acceptance=True, expected_acl_sddl="test-acl",
+    )
+    repeated_acceptance = root_admin.append_acceptance(
+        database, expected_admin_sid=ADMIN_SID, approver_account=r"ray\zhang",
+        acceptance_profile_id=_TEST_ACCEPTANCE_ID, expected_fence_row=fence,
+        deployment_attestation=attestation, deployment_session_id=session,
+        retained_session=retained_session,
+        explicit_acceptance=True, expected_acl_sddl="test-acl",
+    )
+    assert repeated_acceptance == accepted
+    historical = root_admin.inspect_uninitialized_root(
+        database, expected_fence_row=fence, deployment_session_id="a" * 64,
+    )
+    assert historical["acceptance_history_count"] == 1
+    assert historical["acceptance_history_digest"] == hashlib.sha256(
+        b"autodev.genesis-acceptance-history/v1\0"
+        + canonical_json_bytes([accepted["acceptance_id"]])
+    ).hexdigest()
+    assert historical["applicable_acceptance_for_this_deployment_session"] is None
     with pytest.raises(PermissionError, match="explicit"):
         root_admin.initialize_genesis_state(
-            database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
-            active_manifest_id=MANIFEST, explicit_initialization=False,
-            expected_admin_sid=ADMIN_SID,
+            database, expected_admin_sid=ADMIN_SID, expected_fence_row=fence,
+            acceptance_id=accepted["acceptance_id"], deployment_attestation=attestation,
+            deployment_session_id=session, explicit_initialization=False,
+            retained_session=retained_session, expected_acl_sddl="test-acl",
         )
-    assert root_admin.initialize_genesis_state(
-        database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
-        active_manifest_id=MANIFEST, explicit_initialization=True,
-        expected_admin_sid=ADMIN_SID,
-    ) == 1
-    with pytest.raises(ValueError, match="precondition"):
-        root_admin.initialize_genesis_state(
-            database, expected_anchor_id=ANCHOR, expected_candidate_package_id=PACKAGE,
-            active_manifest_id=MANIFEST, explicit_initialization=True,
-            expected_admin_sid=ADMIN_SID,
-        )
+    initialized = root_admin.initialize_genesis_state(
+        database, expected_admin_sid=ADMIN_SID, expected_fence_row=fence,
+        acceptance_id=accepted["acceptance_id"], deployment_attestation=attestation,
+        deployment_session_id=session, explicit_initialization=True,
+        retained_session=retained_session, expected_acl_sddl="test-acl",
+    )
+    assert initialized["root_state"] == {
+        "format": root_admin.ROOT_STATE_FORMAT, "root_anchor_id": ANCHOR,
+        "active_manifest_id": MANIFEST, "transition": "open", "revision": 1,
+    }
+    assert initialized["fence_state"] == "FENCED" and initialized["fence_revision"] == 0
+    repeated = root_admin.initialize_genesis_state(
+        database, expected_admin_sid=ADMIN_SID, expected_fence_row=fence,
+        acceptance_id=accepted["acceptance_id"], deployment_attestation=attestation,
+        deployment_session_id=session, explicit_initialization=True,
+        retained_session=retained_session, expected_acl_sddl="test-acl",
+    )
+    assert repeated["result"] == "ALREADY_INITIALIZED_EXACT"
+    assert repeated["initialization_record"] == initialized["initialization_record"]
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT transition, revision FROM root_state").fetchall() == [("open", 1)]
+        assert connection.execute("SELECT state, revision FROM capability_fence").fetchall() == [("FENCED", 0)]
+        assert connection.execute("SELECT COUNT(*) FROM genesis_root_initialization").fetchone()[0] == 1
+    finally:
+        connection.close()
 
 
-def test_external_fence_is_root_admin_only_and_exact_revision_cas(tmp_path, monkeypatch):
-    database = tmp_path / "fixture.sqlite3"
-    _root_fixture(database)
-    monkeypatch.setattr(root_admin, "_is_canonical_path", lambda _: True)
-    monkeypatch.setattr(root_admin, "_require_external_root_admin", lambda _: None)
-    monkeypatch.setattr(fence_controller, "_require_external_root_admin", lambda _: None)
-    assert fence_controller.set_fence(
-        database, expected_admin_sid=ADMIN_SID, candidate_package_id=PACKAGE,
-        expected_revision=0, state="RELEASED",
-    ) == {"candidate_package_id": PACKAGE, "state": "RELEASED", "revision": 1,
-          "authority": "EXTERNAL_ROOT_ADMIN_ONLY"}
-    with pytest.raises(ValueError, match="stale"):
-        fence_controller.set_fence(
-            database, expected_admin_sid=ADMIN_SID, candidate_package_id=PACKAGE,
-            expected_revision=0, state="FENCED",
+def test_external_root_admin_release_is_atomic_and_exactly_reconciled_read_only(tmp_path, monkeypatch):
+    database = tmp_path / "release-fixture.sqlite3"
+    fence = _root_fixture(database)
+    _authorize_temp_root_mutation(monkeypatch)
+    session = "f" * 64
+    attestation = _fixture_attestation(fence, session)
+    retained_session = _test_retained_session(attestation)
+    accepted = root_admin.append_acceptance(
+        database, expected_admin_sid=ADMIN_SID, approver_account=r"ray\zhang",
+        acceptance_profile_id=_TEST_ACCEPTANCE_ID, expected_fence_row=fence,
+        deployment_attestation=attestation, deployment_session_id=session,
+        retained_session=retained_session, explicit_acceptance=True, expected_acl_sddl="test-acl",
+    )
+    initialized = root_admin.initialize_genesis_state(
+        database, expected_admin_sid=ADMIN_SID, expected_fence_row=fence,
+        acceptance_id=accepted["acceptance_id"], deployment_attestation=attestation,
+        deployment_session_id=session, explicit_initialization=True,
+        retained_session=retained_session, expected_acl_sddl="test-acl",
+    )
+    observation = _fixture_live_observation(attestation)
+    release_args = dict(
+        expected_admin_sid=ADMIN_SID, expected_fence_row=fence,
+        acceptance_id=accepted["acceptance_id"],
+        initialization_record_id=initialized["initialization_record"]["record_id"],
+        deployment_attestation=attestation, deployment_session_id=session,
+        explicit_release=True, retained_session=retained_session,
+        expected_acl_sddl="test-acl",
+    )
+    stale_observation = json.loads(json.dumps(observation))
+    stale_observation["process_instance_identities"]["T"] = "0" * 64
+    with pytest.raises(ValueError, match="fresh live deployment observation"):
+        root_admin.release_capability_fence(
+            database, live_observation=stale_observation, **release_args,
         )
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT state,revision FROM capability_fence").fetchall() == [("FENCED", 0)]
+        assert connection.execute("SELECT COUNT(*) FROM genesis_release_verification").fetchone()[0] == 0
+    finally:
+        connection.close()
+    released = root_admin.release_capability_fence(
+        database, live_observation=observation, **release_args,
+    )
+    assert released["result"] == "RELEASED"
+    assert released["fence_state"] == "RELEASED" and released["fence_revision"] == 1
+    record = released["release_verification"]
+    assert record["preimage"]["initialization_record_id"] == initialized["initialization_record"]["record_id"]
+    assert record["preimage"]["release_operation_id"] == root_admin.release_operation_id(
+        initialization_record_id=initialized["initialization_record"]["record_id"],
+        acceptance_id=accepted["acceptance_id"], deployment_attestation_id=attestation["record_id"],
+        deployment_session_id=session, root_state_identity=hashlib.sha256(
+            b"autodev.g9-root-state-identity/v1\0" + canonical_json_bytes(initialized["root_state"])
+        ).hexdigest(), fence_row=fence,
+    )
+    reconciled = root_admin.release_capability_fence(
+        database, live_observation=observation, **release_args,
+    )
+    assert reconciled == {
+        "result": "ALREADY_RELEASED_EXACT", "fence_state": "RELEASED", "fence_revision": 1,
+        "release_verification": record,
+    }
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT state,revision FROM capability_fence").fetchall() == [("RELEASED", 1)]
+        assert connection.execute("SELECT COUNT(*) FROM genesis_release_verification").fetchone()[0] == 1
+        for table in ("genesis_acceptance", "genesis_root_initialization", "genesis_release_verification"):
+            columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+            stored_rows = connection.execute(f"SELECT * FROM {table}").fetchall()
+            assert len(stored_rows) == 1
+            placeholders = ",".join("?" for _ in columns)
+            column_sql = ",".join(columns)
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"UPDATE {table} SET {columns[0]}={columns[0]}")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"DELETE FROM {table}")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"INSERT OR REPLACE INTO {table}({column_sql}) VALUES({placeholders})",
+                    stored_rows[0],
+                )
+    finally:
+        connection.close()
+
+
+def test_generic_external_fence_cas_surface_is_removed():
+    assert not hasattr(fence_controller, "set_fence")
+    assert callable(fence_controller.release_first_genesis)
 
 
 def test_substrate_protocol_role_scopes_keep_all_protected_endpoints_fenced(monkeypatch):
@@ -756,15 +1222,26 @@ def test_each_real_candidate_runtime_role_constructs_with_only_its_narrow_substr
             "P": "PublicationGateRuntime", "M": "MergeGateRuntime",
         }
         observations = {}
-        for role in ("T", "C", "P", "M"):
+        runtime_run_id = "f" * 64
+        t_state_key = b"t" * 32
+        for role in ("C", "T", "P", "M"):
             adapter = RoleSubstrateAdapter(
                 role=role, address=service.address, key=keys[role],
                 candidate_package_id=PACKAGE,
             )
             assert adapter.verify_resource("runtime", hashlib.sha256(resource).hexdigest())
+            if role == "C":
+                state_bootstrap = {"role": "C", "t_key_hex": t_state_key.hex()}
+            else:
+                canonical = observations["C"]["canonical_state"]
+                state_bootstrap = {"role": role, "projection": canonical["projection"]}
+                if role == "T":
+                    state_bootstrap.update(endpoint=canonical["channel_endpoint"],
+                                           t_key_hex=t_state_key.hex())
             prepared = construct_candidate_runtime(
                 role=role, candidate_package_id=PACKAGE, substrate_adapter=adapter,
-                runtime_run_id="f" * 64,
+                runtime_run_id=runtime_run_id,
+                canonical_state_bootstrap=state_bootstrap,
             )
             assert prepared["role"] == role
             assert prepared["runtime_type"] == expected_types[role]
@@ -786,7 +1263,14 @@ def test_each_real_candidate_runtime_role_constructs_with_only_its_narrow_substr
             "F_READ_VERIFY", "MERGE_PREPARE", "M_FENCE_READ",
         )
         assert observations["P"]["runtime_role_identity"] != observations["M"]["runtime_role_identity"]
+        assert observations["C"]["canonical_state"]["direct_backend_object"] is True
+        for role in ("T", "P", "M"):
+            assert observations[role]["canonical_state"]["direct_backend_object"] is False
+            assert observations[role]["canonical_state"]["projection"] == observations["C"]["canonical_state"]["projection"]
+        assert observations["T"]["canonical_state"]["authenticated_t_to_c_client"] is True
     finally:
+        from role_adapter import close_canonical_state_owner
+        close_canonical_state_owner("f" * 64)
         service.close()
 
 
@@ -809,6 +1293,21 @@ def test_substrate_requires_one_complete_line_and_rejects_trailing_frame_bytes()
 
 
 def _readiness_preimage() -> dict[str, object]:
+    manifest_id = "3" * 64
+    fence = _test_fence_row(manifest_id=manifest_id, runtime_sha256="d" * 64)
+    projection = {
+        "format": "autodev.g9-canonical-state-channel/v1", "owner_role": "C",
+        "owner_process_id": 1002, "owner_instance_id": "c" * 64,
+        "backend_generation": 1,
+        "state_record_counts": {name: 0 for name in (
+            "contracts", "authorizations", "tasks", "candidates", "candidate_materializations",
+            "operations", "memberships", "attempts", "evidence", "histories", "supersessions")},
+        "resolved_target_registration_ids": [],
+    }
+    projection["projection_digest"] = hashlib.sha256(
+        b"autodev.g9-canonical-state-projection/v1\0"
+        + __import__("external_profiles").canonical_json_bytes(projection)
+    ).hexdigest()
     roles = {}
     for index, role in enumerate(("T", "C", "P", "M"), start=1):
         roles[role] = {
@@ -822,27 +1321,46 @@ def _readiness_preimage() -> dict[str, object]:
                              "P": "PublicationGateRuntime", "M": "MergeGateRuntime"}[role],
             "runtime_role_identity": "a" * 64, "runtime_binding_id": "b" * 64,
             "runtime_active": role in ("T", "C"),
+            "canonical_state": {
+                "role": role, "backend_owner_role": "C", "backend_owner_instance_id": "c" * 64,
+                "projection_digest": projection["projection_digest"], "backend_generation": 1,
+                "projection": projection, "direct_backend_object": role == "C",
+                "authenticated_t_to_c_client": role == "T", "read_only_projection": role != "C",
+                **({"channel_endpoint": ["127.0.0.1", 54321]} if role == "C" else {}),
+                **({"channel_identity": "d" * 64} if role == "T" else {}),
+            },
         }
     return {
         "format": "autodev.genesis-deployment-readiness/v1",
+        "deployment_session_id": "9" * 64,
         "candidate_package_id": PACKAGE,
-        "genesis_manifest_id": "3" * 64,
+        "genesis_manifest_id": manifest_id,
         "deterministic_evidence_ids": ["D-001", "D-002"],
         "repository_source_commit": "4" * 40,
         "runtime_artifact_sha256": "d" * 64,
         "python_runtime": {"identity": "CPython", "version": "3.13.14",
                            "path": r"C:\AutodevG9\shared\python313\python.exe", "sha256": "5" * 64},
-        "execution_isolation_dependency_id": "dep-execution-isolation-test",
-        "root_fence_dependency_id": "dep-root-activation-fence-test",
-        "root_fence_profile_sha256": "6" * 64,
-        "fixture_substrate_dependency_id": "dep-fixture-effect-substrate-test",
-        "fixture_substrate_profile_sha256": "7" * 64,
+        "execution_isolation_dependency_id": _TEST_ISOLATION_DEPENDENCY,
+        "execution_isolation_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(_TEST_ISOLATION_PROFILE)).hexdigest(),
+        "root_fence_dependency_id": _TEST_DEPENDENCIES[0],
+        "root_fence_profile_sha256": hashlib.sha256(canonical_json_bytes(_TEST_ROOT_PROFILE)).hexdigest(),
+        "fixture_substrate_dependency_id": _TEST_DEPENDENCIES[1],
+        "fixture_substrate_profile_sha256": hashlib.sha256(
+            canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest(),
         "root_anchor_id": ANCHOR,
         "root_state_observation": {
             "status": "UNINITIALIZED", "root_anchor_id": ANCHOR,
-            "candidate_package_id": PACKAGE, "root_state_row_count": 0,
-            "capability_fence_row_count": 1, "fence_state": "FENCED",
-            "fence_revision": 0, "schema_sha256": "8" * 64,
+            "candidate_package_id": PACKAGE, "manifest_id": manifest_id, "root_state_row_count": 0,
+            "capability_fence_row_count": 1, "fence_id": fence["fence_id"],
+            "fence_state": "FENCED", "fence_revision": 0, "capability_fence": fence,
+            "acceptance_history_count": 0, "initialization_record_count": 0,
+            "acceptance_history_digest": hashlib.sha256(
+                b"autodev.genesis-acceptance-history/v1\0[]"
+            ).hexdigest(),
+            "applicable_acceptance_for_this_deployment_session": None,
+            "deployment_session_id": "9" * 64,
+            "release_verification_count": 0, "schema_sha256": root_admin.ROOT_STORE_SCHEMA_SHA256,
             "observation_scope": "NON_AUTHORITATIVE_TEMPORARY_FIXTURE_ONLY",
             "canonical_root_database": "ABSENT_UNTOUCHED",
             "fixture_database_sha256": "9" * 64,
@@ -867,7 +1385,13 @@ def _readiness_preimage() -> dict[str, object]:
         },
         "recovery_fence_inventory": ["external-start-held-recovery"],
         "production_github_mutation_credentials": "NONE",
-        "host_profile_id": "g9-host-profile-test",
+        "host_profile_id": derive_host_profile_id(
+            root_fence_profile_sha256=hashlib.sha256(canonical_json_bytes(_TEST_ROOT_PROFILE)).hexdigest(),
+            fixture_substrate_profile_sha256=hashlib.sha256(
+                canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest(),
+            execution_isolation_profile_sha256=hashlib.sha256(
+                canonical_json_bytes(_TEST_ISOLATION_PROFILE)).hexdigest(),
+        ),
         "observed_at": "2026-09-27T00:00:00Z",
     }
 
@@ -900,6 +1424,7 @@ def test_runner_projects_complete_closed_role_evidence_for_deployment_readiness(
             "runtime_role_identity": "a" * 64,
             "runtime_binding_id": "b" * 64,
             "runtime_active": True,
+            "canonical_state": _readiness_preimage()["roles"]["T"]["canonical_state"],
         },
     }
 
@@ -920,6 +1445,7 @@ def test_runner_projects_complete_closed_role_evidence_for_deployment_readiness(
         "runtime_type": "TrustedControllerRuntime",
         "runtime_role_identity": "a" * 64, "runtime_binding_id": "b" * 64,
         "runtime_active": True,
+        "canonical_state": _readiness_preimage()["roles"]["T"]["canonical_state"],
     }
     assert set(evidence) == set(_readiness_preimage()["roles"]["T"])
 
@@ -932,6 +1458,8 @@ def test_runner_projects_complete_closed_role_evidence_for_deployment_readiness(
     lambda p: p["root_state_observation"].update(fence_state="RELEASED"),
     lambda p: p["protected_endpoint_state"]["M_MERGE"].update(credential_withheld=False),
     lambda p: p["candidate_root_store_write_denial"].update(C=False),
+    lambda p: p.update(execution_isolation_profile_sha256="0" * 64),
+    lambda p: p.update(host_profile_id="0" * 64),
 ))
 def test_deployment_readiness_rejects_missing_or_overlapping_authority_proofs(change):
     import copy

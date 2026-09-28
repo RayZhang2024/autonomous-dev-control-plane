@@ -7,7 +7,7 @@ import secrets
 import threading
 from typing import Mapping
 
-from fixture_substrate import SubstrateTransportError, call_service
+from substrate_client import SubstrateTransportError, call_service
 
 
 _ALLOWED = {
@@ -273,7 +273,8 @@ class _MergeAuthority:
 
 def construct_candidate_runtime(*, role: str, candidate_package_id: str,
                                 substrate_adapter: RoleSubstrateAdapter,
-                                runtime_run_id: str) -> dict[str, object]:
+                                runtime_run_id: str,
+                                canonical_state_bootstrap: dict[str, object]) -> dict[str, object]:
     """Construct one real G1-G7 role from its own process-local closed inputs.
 
     No object is shared across T/C/P/M processes. Every adapter is deliberately
@@ -317,12 +318,52 @@ def construct_candidate_runtime(*, role: str, candidate_package_id: str,
             ("M", TrustedRuntimeRole.MERGE_GATE, "M"),
         )
     }
-    backend = InMemoryCanonicalStateBackend()
-    read_client = backend.read_client()
+    from canonical_state_channel import (
+        CanonicalStateChannelServer, CanonicalStateClient, CanonicalStateReadProjection,
+        register_owner,
+    )
+    if type(canonical_state_bootstrap) is not dict or canonical_state_bootstrap.get("role") != role:
+        raise ValueError("canonical-state role bootstrap is not exact")
+    backend = None
+    c_state_client = None
+    c_state_server = None
+    if role == "C":
+        if set(canonical_state_bootstrap) != {"role", "t_key_hex"}:
+            raise ValueError("C canonical-state owner bootstrap is not closed")
+        key_hex = canonical_state_bootstrap["t_key_hex"]
+        if type(key_hex) is not str or len(key_hex) != 64:
+            raise ValueError("T-to-C state-channel key is malformed")
+        backend = InMemoryCanonicalStateBackend()
+        read_client = backend.read_client()
+        owner_instance_id = hashlib.sha256(("autodev.g9-C-state-owner/v1\0" +
+                                             str(__import__("os").getpid()) + "\0" + runtime_run_id).encode()).hexdigest()
+        c_state_server = CanonicalStateChannelServer(
+            backend, owner_process_id=__import__("os").getpid(),
+            owner_instance_id=owner_instance_id, t_key=bytes.fromhex(key_hex),
+        )
+        c_state_server.start()
+        register_owner(runtime_run_id, c_state_server)
+        projection = c_state_server.projection
+    else:
+        expected = {"role", "projection"} | ({"endpoint", "t_key_hex"} if role == "T" else set())
+        if set(canonical_state_bootstrap) != expected:
+            raise ValueError("canonical-state read projection bootstrap is not closed")
+        projection = canonical_state_bootstrap["projection"]
+        projected = CanonicalStateReadProjection(projection)
+        read_client = projected.client
+        if role == "T":
+            endpoint = canonical_state_bootstrap["endpoint"]
+            key_hex = canonical_state_bootstrap["t_key_hex"]
+            if (type(endpoint) is not list or len(endpoint) != 2 or endpoint[0] != "127.0.0.1"
+                    or type(endpoint[1]) is not int or not 1 <= endpoint[1] <= 65535
+                    or type(key_hex) is not str or len(key_hex) != 64):
+                raise ValueError("T-to-C authenticated state channel binding is malformed")
+            c_state_client = CanonicalStateClient((endpoint[0], endpoint[1]), bytes.fromhex(key_hex), projection)
     audit = _AuditSink()
     registry = _Registry()
     runtime_identity = object()
-    registry.activate_local(root_context, generation.value, "C", runtime_identity)
+    if role == "C":
+        registry.activate_local(root_context, generation.value, "C", runtime_identity)
 
     if role == "T":
         import autodev_control.trusted.runtime_roles as runtime_module
@@ -330,7 +371,7 @@ def construct_candidate_runtime(*, role: str, candidate_package_id: str,
         controller = runtime_module._new_controller(object(), read_client, {}, None)
         runtime = TrustedControllerRuntime(
             controller, read_client, substrate_adapter, {}, {}, {}, {}, {}, {},
-            None, binding, audit,
+            c_state_client, binding, audit,
         )
         constructed_type = "TrustedControllerRuntime"
         active = True
@@ -374,6 +415,22 @@ def construct_candidate_runtime(*, role: str, candidate_package_id: str,
         + runtime_run_id + "\0" + role + "\0" + constructed_type + "\0"
         + binding.runtime_binding_id.raw_sha256.value
     ).encode("ascii")).hexdigest()
+    owner_identity = projection["owner_instance_id"]
+    canonical_state = {
+        "role": role,
+        "backend_owner_role": "C",
+        "backend_owner_instance_id": owner_identity,
+        "projection_digest": projection["projection_digest"],
+        "backend_generation": projection["backend_generation"],
+        "projection": projection,
+        "direct_backend_object": role == "C",
+        "authenticated_t_to_c_client": bool(role == "T" and c_state_client is not None),
+        "read_only_projection": role in ("T", "P", "M"),
+    }
+    if role == "C":
+        canonical_state["channel_endpoint"] = [c_state_server.endpoint[0], c_state_server.endpoint[1]]
+    if role == "T":
+        canonical_state["channel_identity"] = c_state_client.channel_identity
     return {
         "role": role, "runtime_type": constructed_type,
         "runtime_role_identity": identity,
@@ -385,4 +442,11 @@ def construct_candidate_runtime(*, role: str, candidate_package_id: str,
         "protected_fence": role_fence,
         "fenced_effect_probe_accepted": fenced_effect_probe,
         "independent_process_local_composition": True,
+        "canonical_state": canonical_state,
     }
+
+
+def close_canonical_state_owner(runtime_run_id: str) -> None:
+    from canonical_state_channel import close_owner
+
+    close_owner(runtime_run_id)

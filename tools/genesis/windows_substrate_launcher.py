@@ -25,6 +25,7 @@ from windows_role_launcher import (
     _CREATE_UNICODE_ENVIRONMENT, _HANDLE_FLAG_INHERIT, _LOGON_WITH_PROFILE,
     _STARTF_USESTDHANDLES, _NativeTokenApi, _ProcessInformation, _SecurityAttributes,
     _StartupInfo, _TOKEN_PRIMARY, _primary_token_evidence,
+    process_creation_time_100ns,
 )
 
 
@@ -70,19 +71,37 @@ def _validate_and_probe_readiness(
 
 
 class SubstrateProcess:
-    __slots__ = ("pid", "sid", "token_type", "is_administrator", "endpoint", "endpoint_identity",
+    __slots__ = ("role", "pid", "sid", "token_type", "is_administrator", "creation_time_100ns",
+                 "endpoint", "endpoint_identity",
                  "candidate_package_id", "stdin", "stdout", "_kernel", "_process", "_thread")
 
     def __init__(self, pid: int, sid: str, token_type: int, is_administrator: bool,
                  endpoint: tuple[str, int], endpoint_identity: str, candidate_package_id: str,
-                 stdin: object, stdout: object, kernel: ctypes.WinDLL,
+                 creation_time_100ns: int, stdin: object, stdout: object, kernel: ctypes.WinDLL,
                  process: int, thread: int) -> None:
+        self.role = "S"
         self.pid, self.sid = pid, sid
         self.token_type, self.is_administrator = token_type, is_administrator
+        self.creation_time_100ns = creation_time_100ns
         self.endpoint, self.endpoint_identity = endpoint, endpoint_identity
         self.candidate_package_id = candidate_package_id
         self.stdin, self.stdout = stdin, stdout
         self._kernel, self._process, self._thread = kernel, process, thread
+
+    def is_live(self) -> bool:
+        self._kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+        self._kernel.GetProcessId.restype = wintypes.DWORD
+        if (self._kernel.GetProcessId(self._process) != self.pid
+                or self._kernel.WaitForSingleObject(self._process, 0) != 258
+                or process_creation_time_100ns(self._process, self._kernel) != self.creation_time_100ns):
+            return False
+        evidence = _primary_token_evidence(self._process)
+        return (evidence.user_sid == self.sid and evidence.token_type == self.token_type
+                and evidence.is_administrator is self.is_administrator)
+
+    @property
+    def process_handle(self) -> int:
+        return self._process
 
     def stop(self) -> int:
         if not self.stdin.closed:
@@ -190,6 +209,7 @@ def launch_substrate(
         if evidence.user_sid != expected_sid or evidence.token_type != _TOKEN_PRIMARY or evidence.is_administrator:
             kernel.TerminateProcess(process_info.hProcess, 121)
             raise PermissionError("substrate process identity is not the dedicated non-admin principal")
+        creation_time = process_creation_time_100ns(int(process_info.hProcess), kernel)
         stdin_fd = msvcrt.open_osfhandle(parent_stdin_write, os.O_WRONLY | os.O_BINARY)
         pipes.remove(parent_stdin_write)
         stdout_fd = msvcrt.open_osfhandle(parent_stdout_read, os.O_RDONLY | os.O_BINARY)
@@ -219,7 +239,7 @@ def launch_substrate(
                                 evidence.token_type, evidence.is_administrator,
                                 ready_endpoint,
                                 startup["endpoint_identity"], startup["candidate_package_id"],
-                                stdin, stdout, kernel,
+                                creation_time, stdin, stdout, kernel,
                                 int(process_info.hProcess), int(process_info.hThread))
     finally:
         if password_buffer is not None:

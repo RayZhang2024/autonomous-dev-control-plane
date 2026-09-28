@@ -1,54 +1,27 @@
-"""External-only capability-fence controller for non-authoritative G9 tooling."""
+"""External-root first-genesis release controller; no generic CAS is exposed."""
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
 
-from root_admin import ROOT_STORE_PATH, _require_external_root_admin, compare_and_swap_fence
+from root_admin import ROOT_STORE_PATH, RetainedDeploymentSession, release_capability_fence
 
 
-def set_fence(
-    database: Path, *, expected_admin_sid: str, candidate_package_id: str,
-    expected_revision: int, state: str,
+def release_first_genesis(
+    database: Path = ROOT_STORE_PATH, *, expected_admin_sid: str,
+    expected_fence_row: dict[str, object], acceptance_id: str,
+    initialization_record_id: str, deployment_attestation: dict[str, object],
+    deployment_session_id: str, live_observation: dict[str, object],
+    explicit_release: bool, retained_session: RetainedDeploymentSession,
+    expected_acl_sddl: str,
 ) -> dict[str, object]:
-    """Apply one profile-bound external-admin CAS; candidate roles have no entrypoint."""
-    _require_external_root_admin(expected_admin_sid)
-    revision = compare_and_swap_fence(
+    """Perform only the frozen atomic FENCED/0 -> RELEASED/1 ceremony."""
+    return release_capability_fence(
         database, expected_admin_sid=expected_admin_sid,
-        candidate_package_id=candidate_package_id,
-        expected_revision=expected_revision, new_state=state,
+        expected_fence_row=expected_fence_row, acceptance_id=acceptance_id,
+        initialization_record_id=initialization_record_id,
+        deployment_attestation=deployment_attestation,
+        deployment_session_id=deployment_session_id, live_observation=live_observation,
+        explicit_release=explicit_release, retained_session=retained_session,
+        expected_acl_sddl=expected_acl_sddl,
     )
-    return {
-        "candidate_package_id": candidate_package_id,
-        "state": state,
-        "revision": revision,
-        "authority": "EXTERNAL_ROOT_ADMIN_ONLY",
-    }
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="External G9 capability fence CAS")
-    parser.add_argument("--database", type=Path, default=ROOT_STORE_PATH)
-    parser.add_argument("--expected-admin-sid", required=True)
-    parser.add_argument("--candidate-package-id", required=True)
-    parser.add_argument("--expected-revision", required=True, type=int)
-    parser.add_argument("--state", required=True, choices=("FENCED", "RELEASED"))
-    args = parser.parse_args()
-    try:
-        result = set_fence(
-            args.database, expected_admin_sid=args.expected_admin_sid,
-            candidate_package_id=args.candidate_package_id,
-            expected_revision=args.expected_revision, state=args.state,
-        )
-    except Exception as exc:
-        print(json.dumps({"status": "FAILED_CLOSED", "failure_type": type(exc).__name__},
-                         sort_keys=True, separators=(",", ":")))
-        return 2
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

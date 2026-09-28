@@ -112,7 +112,8 @@ def test_execution_isolation_dependency_id_is_exactly_derived_from_closed_profil
     "tools/genesis/windows_role_launcher.py",
     "tools/genesis/windows_role_runner.py",
     "tools/genesis/role_adapter.py",
-    "tools/genesis/fixture_substrate.py",
+    "tools/genesis/substrate_client.py",
+    "tools/genesis/canonical_state_channel.py",
 ))
 def test_external_isolation_code_digest_changes_dependency_assumption_manifest_and_contexts(package, path):
     profile = json.loads(package.build_definition)["execution_isolation_profile"]
@@ -169,7 +170,7 @@ def test_module_loading_policy_allowlists_exact_external_role_modules_outside_ca
     profile = build["execution_isolation_profile"]
     policy = json.loads(package.raw_resources["module-policy"])
     assert policy["third_party_runtime_policy"]["third_party_module_allowlist"] == [
-        "fixture_substrate", "ipc", "role_adapter", "role_worker",
+        "canonical_state_channel", "ipc", "role_adapter", "role_worker", "substrate_client",
     ]
     assert not set(policy["third_party_runtime_policy"]["third_party_module_allowlist"]) & set(
         policy["allowed_candidate_modules"]
@@ -184,14 +185,19 @@ def test_module_loading_policy_allowlists_exact_external_role_modules_outside_ca
         {"module_name": "role_adapter", "execution": "IMPORTED", "path": "tools/genesis/role_adapter.py",
          "sha256": next(item["sha256"] for item in build["external_tcb_material"]
                         if item["path"] == "tools/genesis/role_adapter.py")},
-        {"module_name": "fixture_substrate", "execution": "IMPORTED",
-         "path": "tools/genesis/fixture_substrate.py",
+        {"module_name": "substrate_client", "execution": "IMPORTED",
+         "path": "tools/genesis/substrate_client.py",
          "sha256": next(item["sha256"] for item in build["external_tcb_material"]
-                        if item["path"] == "tools/genesis/fixture_substrate.py")},
+                        if item["path"] == "tools/genesis/substrate_client.py")},
+        {"module_name": "canonical_state_channel", "execution": "IMPORTED",
+         "path": "tools/genesis/canonical_state_channel.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/canonical_state_channel.py")},
     ]
     with zipfile.ZipFile(__import__("io").BytesIO(package.runtime_artifact)) as archive:
         names = set(archive.namelist())
     assert not {"ipc.py", "role_worker.py", "role_adapter.py", "fixture_substrate.py"} & names
+    assert "fixture_substrate" not in policy["third_party_runtime_policy"]["third_party_module_allowlist"]
     assert all(item not in RUNTIME_MEMBERS for item in policy["third_party_runtime_policy"]["third_party_module_allowlist"])
 
 
