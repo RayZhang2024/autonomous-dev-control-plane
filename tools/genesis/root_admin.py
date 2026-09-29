@@ -787,7 +787,7 @@ def _validate_deployment_attestation(record: object, fence: dict[str, object], s
     for collection in (
         root_profile["root_admin_tool_material"], root_profile["fence_controller_material"],
         root_profile["genesis_provenance_material"],
-        substrate_profile["implementation_material"], isolation_profile["role_interpreter_modules"],
+        substrate_profile["implementation_material"], isolation_profile["external_adapter_material"],
     ):
         for item in collection:
             path, digest = item["path"], item["sha256"]

@@ -53,7 +53,11 @@ _TEST_STORE_ID = _TEST_ROOT_PROFILE["root_store_profile_id"]
 _TEST_ACL_ID = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["profile_id"]
 _TEST_ACCEPTANCE_ID = _TEST_ROOT_PROFILE["acceptance_profile"]["profile_id"]
 from build_definition import sha256 as _sha256
-from assemble_candidate import _derive_execution_isolation_dependency_id, _make_execution_isolation_profile
+from assemble_candidate import (
+    _derive_execution_isolation_dependency_id,
+    _make_execution_isolation_profile,
+    assemble_candidate,
+)
 _EXTERNAL_PATHS = (
     "ipc.py", "role_worker.py", "windows_role_launcher.py", "windows_role_runner.py",
     "role_adapter.py", "substrate_client.py", "canonical_state_channel.py",
@@ -826,7 +830,7 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
                 _TEST_ROOT_PROFILE["fence_controller_material"],
                 _TEST_ROOT_PROFILE["genesis_provenance_material"],
                 _TEST_SUBSTRATE_PROFILE["implementation_material"],
-                _TEST_ISOLATION_PROFILE["role_interpreter_modules"],
+                _TEST_ISOLATION_PROFILE["external_adapter_material"],
             ) for item in collection
         }.items()),
         "substrate_service": {"sid": process_subject["sid"], "token_type": 1,
@@ -870,6 +874,56 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
               "preimage": preimage}
     root_admin._validate_deployment_attestation(record, fence, session)
     return record
+
+
+def test_execution_isolation_material_closure_distinguishes_adapters_from_role_modules():
+    adapter_paths = {item["path"] for item in _TEST_ISOLATION_PROFILE["external_adapter_material"]}
+    interpreter_paths = {item["path"] for item in _TEST_ISOLATION_PROFILE["role_interpreter_modules"]}
+    assert len(adapter_paths) == 7
+    assert adapter_paths == {
+        "tools/genesis/ipc.py",
+        "tools/genesis/role_worker.py",
+        "tools/genesis/windows_role_launcher.py",
+        "tools/genesis/windows_role_runner.py",
+        "tools/genesis/role_adapter.py",
+        "tools/genesis/substrate_client.py",
+        "tools/genesis/canonical_state_channel.py",
+    }
+    assert len(interpreter_paths) == 5
+    assert interpreter_paths == {
+        "tools/genesis/ipc.py",
+        "tools/genesis/role_worker.py",
+        "tools/genesis/role_adapter.py",
+        "tools/genesis/substrate_client.py",
+        "tools/genesis/canonical_state_channel.py",
+    }
+
+
+@pytest.mark.parametrize(("mutation", "path"), (
+    ("omit", "tools/genesis/windows_role_launcher.py"),
+    ("omit", "tools/genesis/windows_role_runner.py"),
+    ("digest", "tools/genesis/windows_role_launcher.py"),
+    ("digest", "tools/genesis/windows_role_runner.py"),
+    ("extra", "tools/genesis/unauthorized-extra.py"),
+))
+def test_deployment_attestation_requires_exact_external_tcb_closure(mutation, path):
+    fence = _test_fence_row()
+    session = "2" * 64
+    changed = json.loads(json.dumps(_fixture_attestation(fence, session)))
+    material = changed["preimage"]["staged_external_material"]
+    if mutation == "omit":
+        material[:] = [item for item in material if item["path"] != path]
+    elif mutation == "digest":
+        selected = next(item for item in material if item["path"] == path)
+        selected["sha256"] = "0" * 64
+    else:
+        material.append({"path": path, "sha256": "f" * 64})
+        material.sort(key=lambda item: item["path"])
+    changed["record_id"] = hashlib.sha256(
+        canonical_json_bytes(changed["preimage"])
+    ).hexdigest()
+    with pytest.raises(ValueError, match="staged material differs from bound profiles"):
+        root_admin._validate_deployment_attestation(changed, fence, session)
 
 
 def test_deployment_attestation_rejects_caller_selected_controller_digests():
@@ -1026,6 +1080,19 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     fence = _test_fence_row()
     fixture_s = _fixture_attestation(fence, session_id)
     fixture_preimage = fixture_s["preimage"]
+    package = assemble_candidate(
+        git_cwd=str(_REPOSITORY),
+        root_fence_profile=_TEST_ROOT_PROFILE,
+        fixture_substrate_profile=_TEST_SUBSTRATE_PROFILE,
+        root_anchor_id=ANCHOR,
+    )
+    candidate_build_definition = json.loads(package.build_definition)
+    assert "fixture_substrate_dependency_id" in candidate_build_definition
+    assert "fixture_effect_substrate_dependency_id" not in candidate_build_definition
+    assert len(candidate_build_definition["external_tcb_material"]) == 14
+    assert candidate_build_definition["fixture_substrate_dependency_id"] == (
+        fixture_preimage["fixture_substrate_dependency_id"]
+    )
 
     class FakeRetained:
         def __init__(self, received_id, received_processes):
@@ -1056,15 +1123,7 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
         "_deployment_readiness_preimage": {
             key: fixture_preimage[key] for key in readiness_keys
         },
-        "_candidate_build_definition": {
-            "execution_isolation_dependency_id": fixture_preimage[
-                "execution_isolation_dependency_id"],
-            "execution_isolation_profile": fixture_preimage["execution_isolation_profile"],
-            "root_fence_dependency_id": fixture_preimage["root_fence_dependency_id"],
-            "fixture_effect_substrate_dependency_id": fixture_preimage[
-                "fixture_substrate_dependency_id"],
-            "external_tcb_material": fixture_preimage["staged_external_material"],
-        },
+        "_candidate_build_definition": candidate_build_definition,
         "_fixture_substrate_profile": fixture_preimage["fixture_substrate_profile"],
         "candidate_package_id": fixture_preimage["candidate_package_id"],
         "manifest_id": fixture_preimage["genesis_manifest_id"],
@@ -1072,6 +1131,10 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
         "runtime_sha256": fixture_preimage["runtime_artifact_sha256"],
         "root_anchor_id": fixture_preimage["root_anchor_id"],
     }
+    assert launch_payload["_candidate_build_definition"]["fixture_substrate_dependency_id"] == (
+        fixture_preimage["fixture_substrate_dependency_id"]
+    )
+    assert "fixture_effect_substrate_dependency_id" not in launch_payload["_candidate_build_definition"]
     monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
                         lambda value: dict(launch_payload, _deployment_session_id=value))
     monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session_id)
@@ -1111,6 +1174,12 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     assert root_admin._is_exact_utc(attestation["preimage"]["observed_at"])
     assert attestation["preimage"]["genesis_review_record"] == reviewed
     assert attestation["preimage"]["post_merge_binding"] == binding
+    assert attestation["preimage"]["fixture_substrate_dependency_id"] == (
+        candidate_build_definition["fixture_substrate_dependency_id"]
+    )
+    assert attestation["preimage"]["staged_external_material"] == (
+        candidate_build_definition["external_tcb_material"]
+    )
     assert controller._retained is not None
     controller._retained.assert_live()
 
