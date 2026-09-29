@@ -30,6 +30,14 @@ from build_definition import (
     deterministic_archive,
     sha256,
 )
+from external_profiles import (
+    validate_fixture_substrate_profile,
+    validate_root_fence_profile,
+    derive_execution_isolation_dependency_id,
+    derive_root_anchor_id,
+    EXECUTION_ISOLATION_DOMAIN as _EXECUTION_ISOLATION_DOMAIN,
+    EXECUTION_ISOLATION_PROFILE_FIELDS as _EXECUTION_ISOLATION_PROFILE_FIELDS,
+)
 
 _ROLES = ("T", "C", "P", "M")
 _EXCLUSIONS = tuple(sorted((
@@ -64,7 +72,6 @@ _POLICY_PATHS = (
 _R3_GIT_BLOB = "30d4efcaa2adb38acbc0df5635c3bcba4710fa18"
 _R3_RAW_SHA256 = "36498b5d51227a553d452ee21d3fbc61aed7483dc9304939befddb2651acfd35"
 _R3_BYTE_LENGTH = 41155
-_EXECUTION_ISOLATION_DOMAIN = b"autodev.g9-execution-isolation-dependency/v1\0"
 _STAGED_PYTHON_PATH = r"C:\AutodevG9\shared\python313\python.exe"
 _STAGED_PYTHON_SHA256 = "081786173866d86cda1b06aa671848217fa0d635edb6dcd2218644466f4229cd"
 _ROLE_PRINCIPALS = (
@@ -77,29 +84,6 @@ _ROLE_PRINCIPALS = (
     {"role": "M", "account": r"Ray\autodev-g9-m", "sid": "S-1-5-21-711519901-190585334-3846127459-1019",
      "token_type": "PRIMARY", "administrator": False},
 )
-_EXECUTION_ISOLATION_PROFILE_FIELDS = (
-    "format", "host_profile", "role_principals", "python_runtime", "staging_profile",
-    "channel_profile", "external_adapter_material", "role_interpreter_modules",
-    "production_github_mutation_credentials",
-)
-_PROFILE_RECORD_FIELDS = {
-    "host_profile": ("profile_id", "platform", "architecture", "domain"),
-    "python_runtime": ("identity", "version", "path", "sha256"),
-    "staging_profile": (
-        "profile_id", "root", "shared_role_access", "shared_operator_administrator_system_access",
-        "private_role_access", "root_store_role_access", "external_fence_release",
-    ),
-    "channel_profile": (
-        "profile_id", "format", "directions", "destination_credentials",
-        "controller_destination_credentials", "cross_role_messages",
-    ),
-}
-
-
-def _profile_record(value: object, fields: tuple[str, ...]) -> bool:
-    return type(value) is dict and set(value) == set(fields)
-
-
 def _make_execution_isolation_profile(
     external_tcb_material: list[dict[str, str]],
 ) -> dict[str, object]:
@@ -108,8 +92,10 @@ def _make_execution_isolation_profile(
     if set(by_path) != {
         "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
         "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
+        "tools/genesis/role_adapter.py", "tools/genesis/substrate_client.py",
+        "tools/genesis/canonical_state_channel.py",
     }:
-        raise ValueError("execution-isolation adapter material is not the exact four-file set")
+        raise ValueError("execution-isolation adapter material is not the exact seven-file set")
     return {
         "format": "autodev.g9-execution-isolation-profile/v1",
         "host_profile": {
@@ -151,69 +137,21 @@ def _make_execution_isolation_profile(
              "path": "tools/genesis/ipc.py", "sha256": by_path["tools/genesis/ipc.py"]},
             {"module_name": "role_worker", "execution": "SCRIPT",
              "path": "tools/genesis/role_worker.py", "sha256": by_path["tools/genesis/role_worker.py"]},
+            {"module_name": "role_adapter", "execution": "IMPORTED",
+             "path": "tools/genesis/role_adapter.py", "sha256": by_path["tools/genesis/role_adapter.py"]},
+            {"module_name": "substrate_client", "execution": "IMPORTED",
+             "path": "tools/genesis/substrate_client.py", "sha256": by_path["tools/genesis/substrate_client.py"]},
+            {"module_name": "canonical_state_channel", "execution": "IMPORTED",
+             "path": "tools/genesis/canonical_state_channel.py",
+             "sha256": by_path["tools/genesis/canonical_state_channel.py"]},
         ],
         "production_github_mutation_credentials": "NONE",
     }
 
 
 def _derive_execution_isolation_dependency_id(profile: dict[str, object]) -> str:
-    """Content-address the exact closed profile using canonical JSON and domain separation."""
-    if type(profile) is not dict or set(profile) != set(_EXECUTION_ISOLATION_PROFILE_FIELDS):
-        raise ValueError("execution-isolation profile has an open field set")
-    if profile["format"] != "autodev.g9-execution-isolation-profile/v1":
-        raise ValueError("execution-isolation profile format is unsupported")
-    for field, expected_fields in _PROFILE_RECORD_FIELDS.items():
-        if not _profile_record(profile[field], expected_fields):
-            raise ValueError(f"execution-isolation {field} has an open field set")
-        values = profile[field]
-        non_direction_values = (
-            [value for key, value in values.items() if key != "directions"]
-            if field == "channel_profile" else list(values.values())
-        )
-        if any(type(value) is not str or not value for value in non_direction_values):
-            raise ValueError(f"execution-isolation {field} contains an invalid value")
-    principals = profile["role_principals"]
-    if (type(principals) is not list or len(principals) != 4
-            or tuple(item.get("role") for item in principals if type(item) is dict) != _ROLES
-            or any(not _profile_record(item, ("role", "account", "sid", "token_type", "administrator"))
-                   or any(type(item[field]) is not str or not item[field]
-                          for field in ("role", "account", "sid", "token_type"))
-                   or type(item["administrator"]) is not bool for item in principals)):
-        raise ValueError("execution-isolation role-principal set is not closed")
-    if (type(profile["production_github_mutation_credentials"]) is not str
-            or profile["production_github_mutation_credentials"] != "NONE"):
-        raise ValueError("execution-isolation profile admits production GitHub credentials")
-    adapters = profile["external_adapter_material"]
-    if (type(adapters) is not list or len(adapters) != 4
-            or any(not _profile_record(item, ("path", "sha256")) for item in adapters)):
-        raise ValueError("execution-isolation adapter material is not closed")
-    if tuple(item["path"] for item in adapters) != tuple(sorted({
-        "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
-        "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
-    })):
-        raise ValueError("execution-isolation adapter material has unexpected paths or order")
-    for item in adapters:
-        if (type(item["sha256"]) is not str or len(item["sha256"]) != 64
-                or any(char not in "0123456789abcdef" for char in item["sha256"])):
-            raise ValueError("execution-isolation adapter digest is invalid")
-    modules = profile["role_interpreter_modules"]
-    expected_modules = (("ipc", "IMPORTED", "tools/genesis/ipc.py"),
-                        ("role_worker", "SCRIPT", "tools/genesis/role_worker.py"))
-    if (type(modules) is not list or len(modules) != len(expected_modules)
-            or any(not _profile_record(item, ("module_name", "execution", "path", "sha256"))
-                   for item in modules)):
-        raise ValueError("execution-isolation role-interpreter module set is not closed")
-    for item, expected in zip(modules, expected_modules, strict=True):
-        if (tuple(item[field] for field in ("module_name", "execution", "path")) != expected
-                or item["sha256"] != next(record["sha256"] for record in adapters
-                                           if record["path"] == item["path"])):
-            raise ValueError("execution-isolation module identity is not bound to adapter material")
-    if (type(profile["channel_profile"].get("directions")) is not list
-            or not all(type(direction) is str for direction in profile["channel_profile"]["directions"])):
-        raise ValueError("execution-isolation channel direction set is invalid")
-    return "dep-execution-isolation-" + sha256(
-        _EXECUTION_ISOLATION_DOMAIN + _json(profile)
-    )
+    """Compatibility spelling for the shared bound profile verifier."""
+    return derive_execution_isolation_dependency_id(profile)
 
 
 def _manifest_external_tcb_dependencies(graph: dict[str, object]) -> list[dict[str, str]]:
@@ -270,7 +208,11 @@ def _write_entry(role: str, runtime_id: str) -> dict[str, str]:
 
 def _make_graph_resources(
     runtime_id: str, execution_isolation_dependency_id: str,
+    root_fence_dependency_id: str = "dep-root-activation-fence-test",
+    fixture_substrate_dependency_id: str = "dep-fixture-effect-substrate-test",
+    fixture_bindings: dict[str, str] | None = None,
 ) -> tuple[dict[str, bytes], dict[str, str], dict[str, object]]:
+    bindings = _FIXTURE_BINDINGS if fixture_bindings is None else fixture_bindings
     raw: dict[str, bytes] = {}
     kinds: dict[str, str] = {}
     members: list[dict[str, str]] = []
@@ -357,10 +299,10 @@ def _make_graph_resources(
             "member_id": role,
             "canonical_state_access": access,
             "canonical_state_binding": state_binding,
-            "f_read_verify_binding": _FIXTURE_BINDINGS["f_read_verify_binding"],
-            "target_fence_binding": {"T": "NONE", "C": "NONE", "P": _FIXTURE_BINDINGS["p_target_fence_binding"], "M": _FIXTURE_BINDINGS["m_target_fence_binding"]}[role],
-            "publication_authority_binding": _FIXTURE_BINDINGS["publication_authority_binding"] if role == "P" else "NONE",
-            "merge_authority_binding": _FIXTURE_BINDINGS["merge_authority_binding"] if role == "M" else "NONE",
+            "f_read_verify_binding": bindings["f_read_verify_binding"],
+            "target_fence_binding": {"T": "NONE", "C": "NONE", "P": bindings["p_target_fence_binding"], "M": bindings["m_target_fence_binding"]}[role],
+            "publication_authority_binding": bindings["publication_authority_binding"] if role == "P" else "NONE",
+            "merge_authority_binding": bindings["merge_authority_binding"] if role == "M" else "NONE",
             "external_recovery_binding": "NONE",
         }
         credential[credential_id] = {
@@ -370,9 +312,9 @@ def _make_graph_resources(
             "production_github_mutation_credentials": "NONE",
         }
     external = (
-        ("ROOT_ACTIVATION_FENCE", "dep-root-activation-fence", "assumption-root-fence"),
+        ("ROOT_ACTIVATION_FENCE", root_fence_dependency_id, "assumption-root-fence"),
         ("EXECUTION_ISOLATION", execution_isolation_dependency_id, "assumption-execution-isolation"),
-        ("FIXTURE_EFFECT_SUBSTRATE", "dep-fixture-effect-substrate", "assumption-fixture-effects"),
+        ("FIXTURE_EFFECT_SUBSTRATE", fixture_substrate_dependency_id, "assumption-fixture-effects"),
     )
     external_roles: list[dict[str, object]] = []
     for role, dependency_id, assumption_id in external:
@@ -383,8 +325,8 @@ def _make_graph_resources(
             "role": role, "dependency_id": dependency_id, "assumption_resource": assumption_id,
         }
         if role == "FIXTURE_EFFECT_SUBSTRATE":
-            assumption["bindings"] = _FIXTURE_BINDINGS
-            graph_record["bindings"] = _FIXTURE_BINDINGS
+            assumption["bindings"] = bindings
+            graph_record["bindings"] = bindings
         raw[assumption_id] = _json(assumption)
         external_roles.append(graph_record)
 
@@ -400,7 +342,9 @@ def _make_graph_resources(
         "explicitly_excluded_modules_or_prefixes": list(_EXCLUSIONS),
         "third_party_runtime_policy": {
             "standard_library_policy": "ALLOW",
-            "third_party_module_allowlist": ["ipc", "role_worker"],
+            "third_party_module_allowlist": [
+                "canonical_state_channel", "ipc", "role_adapter", "role_worker", "substrate_client",
+            ],
         },
         "dynamic_import_fallback": "NONE",
     }
@@ -435,18 +379,67 @@ def _make_graph_resources(
     return raw, kinds, graph
 
 
-def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
+def assemble_candidate(
+    *, git_cwd: str = ".", root_fence_profile: dict[str, object] | None = None,
+    fixture_substrate_profile: dict[str, object] | None = None,
+    root_anchor_id: str | None = None,
+) -> CandidatePackage:
     """Build twice from the authorized Git object and return the same byte image."""
+    if root_fence_profile is None or fixture_substrate_profile is None or root_anchor_id is None:
+        raise RuntimeError(
+            "external root-admin and dedicated substrate host identities are required; "
+            "final CP2 cannot be assembled from guessed/default principals"
+        )
+    root_fence_dependency_id = validate_root_fence_profile(root_fence_profile)
+    fixture_substrate_dependency_id = validate_fixture_substrate_profile(fixture_substrate_profile)
+    anchor_preimage = {
+        "repository": root_fence_profile["repository"],
+        "root_store_profile": root_fence_profile["root_store_profile_id"],
+        "design_lineage": root_fence_profile["design_lineage"],
+        "namespace": root_fence_profile["root_anchor_namespace"],
+    }
+    if root_anchor_id != derive_root_anchor_id(anchor_preimage):
+        raise ValueError("root anchor identity differs from the frozen exact preimage")
+    if root_fence_profile["root_anchor_namespace"] != anchor_preimage["namespace"]:
+        raise ValueError("root-fence profile and anchor namespace do not match")
+    bindings = {
+        "f_read_verify_binding": fixture_substrate_profile["f_read_verify_endpoint"]["endpoint_id"],
+        "f_read_verify_mode": "READ_ONLY",
+        "publication_authority_binding": fixture_substrate_profile["publication_authority_endpoint"]["endpoint_id"],
+        "merge_authority_binding": fixture_substrate_profile["merge_authority_endpoint"]["endpoint_id"],
+        "external_recovery_binding": fixture_substrate_profile["external_recovery_endpoint"]["endpoint_id"],
+        "p_target_fence_binding": fixture_substrate_profile["p_target_fence"]["endpoint_id"],
+        "m_target_fence_binding": fixture_substrate_profile["m_target_fence"]["endpoint_id"],
+        "target_fence_namespace": fixture_substrate_profile["target_fence_namespace"],
+    }
+    if root_fence_profile["root_admin_principal"]["sid"] == fixture_substrate_profile["service_principal"]["sid"]:
+        raise ValueError("root administrator and substrate service principal must be distinct")
     first = build_from_git(git_cwd=git_cwd)
     second = build_from_git(git_cwd=git_cwd)
     if first != second:
         raise RuntimeError("independent deterministic builds differ")
-    external_tcb_material = [
+    all_external_tcb_material = [
         {"path": f"tools/genesis/{name}",
          "sha256": sha256(Path(__file__).with_name(name).read_bytes())}
-        for name in ("ipc.py", "role_worker.py", "windows_role_launcher.py", "windows_role_runner.py")
+        for name in (
+            "external_profiles.py", "root_admin.py", "fence_controller.py",
+            "genesis_provenance.py", "post_merge_binding.py",
+            "fixture_substrate.py", "role_adapter.py", "substrate_client.py",
+            "canonical_state_channel.py",
+            "windows_substrate_launcher.py",
+            "ipc.py", "role_worker.py", "windows_role_launcher.py", "windows_role_runner.py",
+        )
     ]
-    execution_isolation_profile = _make_execution_isolation_profile(external_tcb_material)
+    all_external_tcb_material.sort(key=lambda item: item["path"])
+    execution_isolation_material = [
+        item for item in all_external_tcb_material if item["path"] in {
+            "tools/genesis/ipc.py", "tools/genesis/role_worker.py",
+            "tools/genesis/windows_role_launcher.py", "tools/genesis/windows_role_runner.py",
+            "tools/genesis/role_adapter.py", "tools/genesis/substrate_client.py",
+            "tools/genesis/canonical_state_channel.py",
+        }
+    ]
+    execution_isolation_profile = _make_execution_isolation_profile(execution_isolation_material)
     execution_isolation_dependency_id = _derive_execution_isolation_dependency_id(
         execution_isolation_profile
     )
@@ -455,6 +448,11 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
         "repository_application_base": APPLICATION_BASE,
         "r2_executable_baseline": R2_EXECUTABLE_BASE,
         "execution_isolation_dependency_id": execution_isolation_dependency_id,
+        "root_fence_dependency_id": root_fence_dependency_id,
+        "root_fence_profile": root_fence_profile,
+        "fixture_substrate_dependency_id": fixture_substrate_dependency_id,
+        "fixture_substrate_profile": fixture_substrate_profile,
+        "root_anchor_id": root_anchor_id,
         "execution_isolation_profile": execution_isolation_profile,
         "build_tool": {
             "path": "tools/genesis/build_definition.py",
@@ -464,7 +462,7 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
             "path": "tools/genesis/assemble_candidate.py",
             "sha256": sha256(Path(__file__).read_bytes()),
         },
-        "external_tcb_material": external_tcb_material,
+        "external_tcb_material": all_external_tcb_material,
         "python_runtime": {
             "identity": "CPython", "version": platform.python_version(),
             "executable_sha256": sha256(Path(sys.executable).read_bytes()),
@@ -482,7 +480,10 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
         "runtime_artifact_sha256": sha256(first.runtime_artifact),
     })
     runtime_id = "runtime"
-    raw, kinds, graph = _make_graph_resources(runtime_id, execution_isolation_dependency_id)
+    raw, kinds, graph = _make_graph_resources(
+        runtime_id, execution_isolation_dependency_id,
+        root_fence_dependency_id, fixture_substrate_dependency_id, bindings,
+    )
     conformance = _git_blob(APPLICATION_BASE, "docs/GENESIS_CONFORMANCE.md", git_cwd)
     conformance_blob = subprocess.run(
         ["git", "hash-object", "--stdin"], cwd=git_cwd, input=conformance,
@@ -580,7 +581,12 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
         "runtime_dependencies": [],
         "execution_isolation_dependency_id": execution_isolation_dependency_id,
         "execution_isolation_profile": execution_isolation_profile,
-        "external_tcb_material": external_tcb_material,
+        "root_fence_dependency_id": root_fence_dependency_id,
+        "root_fence_profile": root_fence_profile,
+        "fixture_substrate_dependency_id": fixture_substrate_dependency_id,
+        "fixture_substrate_profile": fixture_substrate_profile,
+        "root_anchor_id": root_anchor_id,
+        "external_tcb_material": all_external_tcb_material,
     })
     evidence_id = _resource_id("D", evidence)
     package_preimage = _json({
@@ -600,10 +606,14 @@ def assemble_candidate(*, git_cwd: str = ".") -> CandidatePackage:
             {"role": role, "member_id": role, "runtime_binding": f"runtime-binding-{role}",
              "service_principal": f"service-{role}-candidate"} for role in _ROLES
         ],
-        "root_trust_anchor_profile_identity": "external-root-trust-anchor-first-genesis/v1",
+        "root_anchor_id": root_anchor_id,
+        "root_fence_dependency_id": root_fence_dependency_id,
+        "root_fence_profile": root_fence_profile,
+        "fixture_substrate_dependency_id": fixture_substrate_dependency_id,
+        "fixture_substrate_profile": fixture_substrate_profile,
         "execution_isolation_dependency_id": execution_isolation_dependency_id,
         "execution_isolation_profile": execution_isolation_profile,
-        "external_tcb_material": external_tcb_material,
+        "external_tcb_material": all_external_tcb_material,
         "deterministic_evidence": {"record_id": evidence_id, "sha256": sha256(evidence)},
         "manifest_sha256": sha256(manifest_raw),
         "resource_sha256": [{"resource_id": key, "sha256": sha256(value)}
@@ -657,7 +667,18 @@ def write_package(package: CandidatePackage, output: Path) -> None:
 
 if __name__ == "__main__":
     destination = Path(os.environ.get("GENESIS_OUTPUT", "build/genesis-candidate"))
-    assembled = assemble_candidate()
+    host_profile_path = os.environ.get("GENESIS_HOST_PROFILE")
+    if not host_profile_path:
+        raise SystemExit("GENESIS_HOST_PROFILE must identify the external, secret-free host profile")
+    host_profile = json.loads(Path(host_profile_path).read_text(encoding="utf-8"))
+    expected_fields = {"root_fence_profile", "fixture_substrate_profile", "root_anchor_id"}
+    if type(host_profile) is not dict or set(host_profile) != expected_fields:
+        raise SystemExit("external host profile has an open or incomplete field set")
+    assembled = assemble_candidate(
+        root_fence_profile=host_profile["root_fence_profile"],
+        fixture_substrate_profile=host_profile["fixture_substrate_profile"],
+        root_anchor_id=host_profile["root_anchor_id"],
+    )
     write_package(assembled, destination)
     print(json.dumps({
         "candidate_package_id": assembled.candidate_package_id,

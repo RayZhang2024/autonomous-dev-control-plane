@@ -23,6 +23,7 @@ from assemble_candidate import (
     _manifest_external_tcb_dependencies,
     assemble_candidate,
 )
+from external_profiles import build_external_profiles
 from build_definition import (
     APPLICATION_BASE, AUTHORIZED_BASE, R2_EXECUTABLE_BASE, RUNTIME_MEMBERS, SOURCE_MEMBERS,
     canonical_json_bytes,
@@ -62,9 +63,31 @@ EXPECTED_MODULES = frozenset({
 })
 
 
+def _test_external_profiles():
+    return build_external_profiles(
+        str(REPOSITORY),
+        root_admin_principal={
+            "account": r"TEST\human-root-admin", "sid": "S-1-5-21-711519901-190585334-3846127459-2010",
+            "administrator": True,
+        },
+        substrate_principal={
+            "account": r"TEST\fixture-substrate", "sid": "S-1-5-21-711519901-190585334-3846127459-2020",
+            "token_type": "PRIMARY", "administrator": False,
+        },
+        python_runtime={
+            "identity": "CPython", "version": "3.13.14",
+            "path": r"C:\AutodevG9\shared\python313\python.exe", "sha256": "8" * 64,
+        },
+    )
+
+
 @pytest.fixture(scope="module")
 def package():
-    return assemble_candidate(git_cwd=str(REPOSITORY))
+    root_profile, substrate_profile, anchor_id, _ = _test_external_profiles()
+    return assemble_candidate(
+        git_cwd=str(REPOSITORY), root_fence_profile=root_profile,
+        fixture_substrate_profile=substrate_profile, root_anchor_id=anchor_id,
+    )
 
 
 def test_execution_isolation_dependency_id_is_exactly_derived_from_closed_profile(package):
@@ -88,6 +111,9 @@ def test_execution_isolation_dependency_id_is_exactly_derived_from_closed_profil
     "tools/genesis/role_worker.py",
     "tools/genesis/windows_role_launcher.py",
     "tools/genesis/windows_role_runner.py",
+    "tools/genesis/role_adapter.py",
+    "tools/genesis/substrate_client.py",
+    "tools/genesis/canonical_state_channel.py",
 ))
 def test_external_isolation_code_digest_changes_dependency_assumption_manifest_and_contexts(package, path):
     profile = json.loads(package.build_definition)["execution_isolation_profile"]
@@ -144,7 +170,7 @@ def test_module_loading_policy_allowlists_exact_external_role_modules_outside_ca
     profile = build["execution_isolation_profile"]
     policy = json.loads(package.raw_resources["module-policy"])
     assert policy["third_party_runtime_policy"]["third_party_module_allowlist"] == [
-        "ipc", "role_worker",
+        "canonical_state_channel", "ipc", "role_adapter", "role_worker", "substrate_client",
     ]
     assert not set(policy["third_party_runtime_policy"]["third_party_module_allowlist"]) & set(
         policy["allowed_candidate_modules"]
@@ -156,10 +182,22 @@ def test_module_loading_policy_allowlists_exact_external_role_modules_outside_ca
         {"module_name": "role_worker", "execution": "SCRIPT", "path": "tools/genesis/role_worker.py",
          "sha256": next(item["sha256"] for item in build["external_tcb_material"]
                         if item["path"] == "tools/genesis/role_worker.py")},
+        {"module_name": "role_adapter", "execution": "IMPORTED", "path": "tools/genesis/role_adapter.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/role_adapter.py")},
+        {"module_name": "substrate_client", "execution": "IMPORTED",
+         "path": "tools/genesis/substrate_client.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/substrate_client.py")},
+        {"module_name": "canonical_state_channel", "execution": "IMPORTED",
+         "path": "tools/genesis/canonical_state_channel.py",
+         "sha256": next(item["sha256"] for item in build["external_tcb_material"]
+                        if item["path"] == "tools/genesis/canonical_state_channel.py")},
     ]
     with zipfile.ZipFile(__import__("io").BytesIO(package.runtime_artifact)) as archive:
         names = set(archive.namelist())
-    assert "ipc.py" not in names and "role_worker.py" not in names
+    assert not {"ipc.py", "role_worker.py", "role_adapter.py", "fixture_substrate.py"} & names
+    assert "fixture_substrate" not in policy["third_party_runtime_policy"]["third_party_module_allowlist"]
     assert all(item not in RUNTIME_MEMBERS for item in policy["third_party_runtime_policy"]["third_party_module_allowlist"])
 
 
@@ -181,7 +219,11 @@ def test_exact_26_source_runtime_bijection_and_deterministic_repeat_builds(packa
         assert {name for name in archive.namelist() if name.endswith("/")} == {
             "autodev_control/", "autodev_control/trusted/"
         }
-    repeated = assemble_candidate(git_cwd=str(REPOSITORY))
+    root_profile, substrate_profile, anchor_id, _ = _test_external_profiles()
+    repeated = assemble_candidate(
+        git_cwd=str(REPOSITORY), root_fence_profile=root_profile,
+        fixture_substrate_profile=substrate_profile, root_anchor_id=anchor_id,
+    )
     assert package.source_bundle == repeated.source_bundle
     assert package.runtime_artifact == repeated.runtime_artifact
     assert package.build_definition == repeated.build_definition
@@ -287,9 +329,12 @@ def test_role_specific_entrypoints_credentials_and_capability_wiring(package):
     raw = package.raw_resources
     role_names = {"T": "TrustedControllerRuntime", "C": "ControlStateGateRuntime",
                   "P": "PublicationGateRuntime", "M": "MergeGateRuntime"}
+    substrate_profile = json.loads(package.build_definition)["fixture_substrate_profile"]
     wiring = {"T": ("READ", "NONE", "NONE"), "C": ("READ_WRITE", "NONE", "NONE"),
-              "P": ("READ", "endpoint-p-fence", "endpoint-publication"),
-              "M": ("READ", "endpoint-m-fence", "endpoint-merge")}
+              "P": ("READ", substrate_profile["p_target_fence"]["endpoint_id"],
+                    substrate_profile["publication_authority_endpoint"]["endpoint_id"]),
+              "M": ("READ", substrate_profile["m_target_fence"]["endpoint_id"],
+                    substrate_profile["merge_authority_endpoint"]["endpoint_id"])}
     for member in graph["members"]:
         role = member["role"]
         entry = json.loads(raw[member["entry_point_config_resource"]])

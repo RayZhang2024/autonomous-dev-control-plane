@@ -18,7 +18,9 @@ from windows_role_launcher import (
     _TOKEN_TYPE,
     _TOKEN_USER,
     _primary_token_evidence,
+    _profile_environment_arguments,
     _validate_role_token,
+    launch_role,
 )
 
 
@@ -124,6 +126,28 @@ def test_exact_actual_role_sid_is_required_and_missing_evidence_never_falls_back
 def test_administrator_child_token_is_rejected():
     with pytest.raises(PermissionError, match="administrator"):
         _validate_role_token("T", ChildTokenEvidence(ROLE_PRINCIPALS["T"][1], _TOKEN_PRIMARY, True))
+
+
+@pytest.mark.parametrize("role", ("T", "C", "P", "M"))
+def test_every_role_uses_profile_environment_and_null_environment_pointer(role):
+    logon_flags, creation_flags, buffer, environment_pointer = _profile_environment_arguments(role)
+    from windows_role_launcher import _LOGON_WITH_PROFILE
+    assert logon_flags == _LOGON_WITH_PROFILE
+    assert creation_flags == 0
+    assert buffer is None
+    assert environment_pointer is None
+
+
+def test_normal_role_launcher_has_no_caller_environment_parameter_or_diagnostic_mode():
+    import inspect
+    parameters = inspect.signature(launch_role).parameters
+    assert "environment" not in parameters
+    assert "target_user_environment" not in parameters
+    source = (Path(__file__).parents[2] / "tools" / "genesis" / "windows_role_launcher.py").read_text()
+    assert "os.environ" not in source
+    assert "create(username, domain, password_buffer, logon_flags," in source
+    assert "str(python_executable), command_buffer, creation_flags," in source
+    assert "environment_pointer, str(working_directory)" in source
 
 
 def test_ctypes_declarations_and_native_path_use_duplicate_membership_token():
