@@ -16,7 +16,6 @@ from external_profiles import canonical_json_bytes
 
 REPOSITORY = "RayZhang2024/autonomous-dev-control-plane"
 ISSUE_NUMBER = 55
-PR_NUMBER = 56
 REVIEW_RECORD_FORMAT = "autodev.genesis-exact-head-review-record/v1"
 POST_MERGE_BINDING_FORMAT = "autodev.genesis-post-merge-binding/v1"
 REVIEW_RECORD_DOMAIN = REVIEW_RECORD_FORMAT.encode("ascii") + b"\0"
@@ -98,8 +97,8 @@ def validate_genesis_exact_head_review_record(record: object) -> dict[str, Any]:
         raise ValueError("Genesis exact-head review preimage is not closed")
     if (preimage["format"] != REVIEW_RECORD_FORMAT or preimage["repository"] != REPOSITORY
             or type(preimage["issue_number"]) is not int or preimage["issue_number"] != ISSUE_NUMBER
-            or type(preimage["pr_number"]) is not int or preimage["pr_number"] != PR_NUMBER):
-        raise ValueError("Genesis review subject is not the exact first-genesis repository/PR")
+            or type(preimage["pr_number"]) is not int or preimage["pr_number"] <= 0):
+        raise ValueError("Genesis review repository, issue, or PR subject is invalid")
     if not _hex(record["review_record_id"], HEX_64) or record["review_record_id"] != review_record_identity(preimage):
         raise ValueError("Genesis review record content identity is invalid")
     for field in ("authorized_base_sha", "reviewed_head_sha", "reviewed_head_tree_sha"):
@@ -134,7 +133,7 @@ def validate_github_state_observation(value: object, review_record: dict[str, An
     review = validate_genesis_exact_head_review_record(review_record)["preimage"]
     if (value["format"] != GITHUB_OBSERVATION_FORMAT
             or value["repository"] != REPOSITORY
-            or type(value["pr_number"]) is not int or value["pr_number"] != PR_NUMBER
+            or type(value["pr_number"]) is not int or value["pr_number"] != review["pr_number"]
             or value["reviewed_head_sha"] != review["reviewed_head_sha"]
             or type(value["merged"]) is not bool or value["merged"] is not True
             or not _hex(value["merge_commit_sha"], HEX_40)
@@ -162,7 +161,9 @@ def validate_post_merge_binding(
     for field in ("authorized_base_sha", "reviewed_head_sha", "reviewed_head_tree_sha"):
         if not _hex(preimage[field], HEX_40):
             raise ValueError(f"Post-Merge Binding {field} is malformed")
-    if (preimage["repository"] != REPOSITORY or preimage["pr_number"] != PR_NUMBER
+    if (preimage["repository"] != REPOSITORY
+            or type(preimage["pr_number"]) is not int
+            or preimage["pr_number"] != review["pr_number"]
             or preimage["genesis_review_record_id"] != review_record["review_record_id"]
             or preimage["authorized_base_sha"] != review["authorized_base_sha"]
             or preimage["reviewed_head_sha"] != review["reviewed_head_sha"]
