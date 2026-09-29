@@ -1633,31 +1633,17 @@ def _set_and_verify_root_acl(namespace: Path, expected_sddl: str) -> None:
     # Set and read the exact protected owner/group/DACL only. PROTECTED and
     # UNPROTECTED are opposing inheritance controls and must never be combined.
     flags = _ROOT_ACL_SECURITY_INFORMATION
-    to_sddl = advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW
-    to_sddl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
-                        ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong)]
-    to_sddl.restype = ctypes.c_int
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
     if not convert(expected_sddl, 1, ctypes.byref(descriptor), None):
         raise ctypes.WinError(ctypes.get_last_error())
-    expected_normalized = ctypes.c_wchar_p()
-    expected_chars = ctypes.c_ulong()
     try:
-        if not to_sddl(descriptor, 1, flags, ctypes.byref(expected_normalized),
-                       ctypes.byref(expected_chars)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        normalized_sddl = expected_normalized.value
-        kernel.LocalFree(expected_normalized)
-        expected_normalized = ctypes.c_wchar_p()
         set_security = advapi.SetFileSecurityW
         set_security.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_void_p]
         set_security.restype = ctypes.c_int
         if not set_security(str(namespace), flags, descriptor):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
-        if expected_normalized:
-            kernel.LocalFree(expected_normalized)
         kernel.LocalFree.argtypes = [ctypes.c_void_p]
         kernel.LocalFree.restype = ctypes.c_void_p
         kernel.LocalFree(descriptor)
@@ -1671,15 +1657,153 @@ def _set_and_verify_root_acl(namespace: Path, expected_sddl: str) -> None:
     buffer = ctypes.create_string_buffer(needed.value)
     if not advapi.GetFileSecurityW(str(namespace), flags, buffer, needed.value, ctypes.byref(needed)):
         raise ctypes.WinError(ctypes.get_last_error())
-    actual = ctypes.c_wchar_p()
-    out_chars = ctypes.c_ulong()
-    if not to_sddl(buffer, 1, flags, ctypes.byref(actual), ctypes.byref(out_chars)):
+    if not _filesystem_security_descriptors_equal(descriptor_expected_sddl=expected_sddl,
+                                                   actual_descriptor=buffer):
+        raise PermissionError("canonical root namespace ACL differs from its bound profile")
+
+
+class _GenericMapping(ctypes.Structure):
+    _fields_ = [("generic_read", ctypes.c_ulong), ("generic_write", ctypes.c_ulong),
+                ("generic_execute", ctypes.c_ulong), ("generic_all", ctypes.c_ulong)]
+
+
+class _AclSizeInformation(ctypes.Structure):
+    _fields_ = [("ace_count", ctypes.c_ulong), ("acl_bytes_in_use", ctypes.c_ulong),
+                ("acl_bytes_free", ctypes.c_ulong)]
+
+
+def _filesystem_effective_access_mask(mask: int, advapi: Any) -> int:
+    """Apply Windows' filesystem generic mapping to one ACCESS_ALLOWED_ACE mask."""
+    if type(mask) is not int or not 0 <= mask <= 0xFFFFFFFF:
+        raise PermissionError("root namespace ACL contains a malformed access mask")
+    mapping = _GenericMapping(
+        0x00120089,  # FILE_GENERIC_READ
+        0x00120116,  # FILE_GENERIC_WRITE
+        0x001200A0,  # FILE_GENERIC_EXECUTE
+        0x001F01FF,  # FILE_ALL_ACCESS
+    )
+    mapped = ctypes.c_ulong(mask)
+    map_generic = advapi.MapGenericMask
+    map_generic.argtypes = [ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(_GenericMapping)]
+    map_generic.restype = None
+    map_generic(ctypes.byref(mapped), ctypes.byref(mapping))
+    return int(mapped.value)
+
+
+def _sid_identity(sid: int, advapi: Any, kernel: Any) -> str:
+    advapi.IsValidSid.argtypes = [ctypes.c_void_p]
+    advapi.IsValidSid.restype = ctypes.c_int
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi.ConvertSidToStringSidW.restype = ctypes.c_int
+    if not sid or not advapi.IsValidSid(ctypes.c_void_p(sid)):
+        raise PermissionError("root namespace ACL contains an invalid SID")
+    sid_text = ctypes.c_wchar_p()
+    if not advapi.ConvertSidToStringSidW(ctypes.c_void_p(sid), ctypes.byref(sid_text)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        if actual.value != normalized_sddl:
-            raise PermissionError("canonical root namespace ACL differs from its bound profile")
+        value = sid_text.value
+        if type(value) is not str or not value.startswith("S-"):
+            raise PermissionError("root namespace ACL contains an invalid SID")
+        return value
     finally:
-        kernel.LocalFree(actual)
+        kernel.LocalFree(sid_text)
+
+
+def _filesystem_security_descriptor_binding(descriptor: Any, advapi: Any,
+                                            kernel: Any) -> tuple[Any, ...]:
+    """Read a closed filesystem descriptor shape; unsupported ACEs fail closed."""
+    is_valid = advapi.IsValidSecurityDescriptor
+    is_valid.argtypes = [ctypes.c_void_p]
+    is_valid.restype = ctypes.c_int
+    if not is_valid(descriptor):
+        raise PermissionError("root namespace ACL descriptor is malformed")
+
+    owner, group = ctypes.c_void_p(), ctypes.c_void_p()
+    defaulted = ctypes.c_int()
+    advapi.GetSecurityDescriptorOwner.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                                  ctypes.POINTER(ctypes.c_int)]
+    advapi.GetSecurityDescriptorOwner.restype = ctypes.c_int
+    advapi.GetSecurityDescriptorGroup.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                                  ctypes.POINTER(ctypes.c_int)]
+    advapi.GetSecurityDescriptorGroup.restype = ctypes.c_int
+    if (not advapi.GetSecurityDescriptorOwner(descriptor, ctypes.byref(owner), ctypes.byref(defaulted))
+            or not advapi.GetSecurityDescriptorGroup(descriptor, ctypes.byref(group),
+                                                    ctypes.byref(defaulted))):
+        raise ctypes.WinError(ctypes.get_last_error())
+    control, revision = ctypes.c_ushort(), ctypes.c_ushort()
+    advapi.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort),
+                                                   ctypes.POINTER(ctypes.c_ushort)]
+    advapi.GetSecurityDescriptorControl.restype = ctypes.c_int
+    if not advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    dacl_present, dacl, dacl_defaulted = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_int()
+    advapi.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                                ctypes.POINTER(ctypes.c_void_p),
+                                                ctypes.POINTER(ctypes.c_int)]
+    advapi.GetSecurityDescriptorDacl.restype = ctypes.c_int
+    if not advapi.GetSecurityDescriptorDacl(descriptor, ctypes.byref(dacl_present),
+                                            ctypes.byref(dacl), ctypes.byref(dacl_defaulted)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    # The profile requires concrete owner/group and a present, non-null protected DACL.
+    protected = bool(control.value & 0x1000)  # SE_DACL_PROTECTED
+    if not owner.value or not group.value or not dacl_present.value or not dacl.value or not protected:
+        raise PermissionError("root namespace ACL descriptor shape is unsupported")
+    if not advapi.IsValidAcl(dacl):
+        raise PermissionError("root namespace ACL contains a malformed DACL")
+
+    acl_info = _AclSizeInformation()
+    if not advapi.GetAclInformation(dacl, ctypes.byref(acl_info), ctypes.sizeof(acl_info), 2):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if acl_info.ace_count > 1024:
+        raise PermissionError("root namespace ACL ACE count exceeds its closed bound")
+    ace_values = []
+    advapi.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetAce.restype = ctypes.c_int
+    for index in range(acl_info.ace_count):
+        ace = ctypes.c_void_p()
+        if not advapi.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        header = ctypes.cast(ace, ctypes.POINTER(ctypes.c_ubyte * 4)).contents
+        ace_type, ace_flags = int(header[0]), int(header[1])
+        ace_size = int.from_bytes(bytes(header[2:4]), "little")
+        # This frozen SDDL contains only ordinary access-allowed ACEs. Object,
+        # callback, audit, deny, and compound ACE shapes are deliberately unsupported.
+        if ace_type != 0 or ace_size < 8:
+            raise PermissionError("root namespace ACL contains an unsupported ACE")
+        mask = int(ctypes.cast(ace, ctypes.POINTER(ctypes.c_ulong))[1])
+        advapi.GetLengthSid.argtypes = [ctypes.c_void_p]
+        advapi.GetLengthSid.restype = ctypes.c_ulong
+        sid_length = int(advapi.GetLengthSid(ctypes.c_void_p(ace.value + 8)))
+        if sid_length < 8 or 8 + sid_length > ace_size:
+            raise PermissionError("root namespace ACL contains a malformed ACE SID")
+        sid = _sid_identity(ace.value + 8, advapi, kernel)
+        ace_values.append((ace_type, ace_flags, sid,
+                           _filesystem_effective_access_mask(mask, advapi)))
+    return (_sid_identity(owner.value, advapi, kernel), _sid_identity(group.value, advapi, kernel),
+            True, protected, tuple(ace_values))
+
+
+def _filesystem_security_descriptors_equal(*, descriptor_expected_sddl: str,
+                                           actual_descriptor: Any) -> bool:
+    """Compare the exact bound descriptor after filesystem generic-right mapping."""
+    if sys.platform != "win32" or type(descriptor_expected_sddl) is not str:
+        raise PermissionError("bound Windows root ACL profile is required")
+    advapi, kernel = ctypes.WinDLL("advapi32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
+    expected = ctypes.c_void_p()
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                        ctypes.POINTER(ctypes.c_ulong)]
+    convert.restype = ctypes.c_int
+    if not convert(descriptor_expected_sddl, 1, ctypes.byref(expected), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    try:
+        expected_binding = _filesystem_security_descriptor_binding(expected, advapi, kernel)
+        actual_binding = _filesystem_security_descriptor_binding(actual_descriptor, advapi, kernel)
+        return expected_binding == actual_binding
+    finally:
+        kernel.LocalFree(expected)
 
 
 def _current_token_facts() -> tuple[str, bool, bool, bool]:

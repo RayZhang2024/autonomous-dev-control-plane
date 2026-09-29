@@ -1428,6 +1428,149 @@ def test_native_protected_acl_application_and_readback_use_temporary_directory_o
         assert namespace.is_dir()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows filesystem generic mapping")
+def test_native_filesystem_generic_read_and_file_generic_read_are_effectively_equal():
+    import ctypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    assert root_admin._filesystem_effective_access_mask(0x80000000, advapi) == 0x00120089
+    assert root_admin._filesystem_effective_access_mask(0x00120089, advapi) == 0x00120089
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+def test_native_gr_acl_readback_as_fr_passes_root_acl_verifier():
+    import ctypes
+
+    admin_sid, _ = root_admin._current_token_identity()
+    substrate_sid = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["substrate_sid"]
+    sddl = (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+            f"(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})")
+    with tempfile.TemporaryDirectory(prefix="g9-acl-gr-fr-") as directory:
+        namespace = Path(directory)
+        # This calls the real setter and read-back verifier; it does not replace
+        # or bypass ACL verification and touches only this temporary directory.
+        root_admin._set_and_verify_root_acl(namespace, sddl)
+        advapi, kernel = (ctypes.WinDLL("advapi32", use_last_error=True),
+                          ctypes.WinDLL("kernel32", use_last_error=True))
+        flags = root_admin._ROOT_ACL_SECURITY_INFORMATION
+        needed = ctypes.c_ulong()
+        advapi.GetFileSecurityW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_void_p,
+                                            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+        advapi.GetFileSecurityW.restype = ctypes.c_int
+        advapi.GetFileSecurityW(str(namespace), flags, None, 0, ctypes.byref(needed))
+        assert needed.value
+        descriptor = ctypes.create_string_buffer(needed.value)
+        assert advapi.GetFileSecurityW(str(namespace), flags, descriptor, needed.value,
+                                       ctypes.byref(needed))
+        to_sddl = advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW
+        to_sddl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                            ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong)]
+        to_sddl.restype = ctypes.c_int
+        rendered, chars = ctypes.c_wchar_p(), ctypes.c_ulong()
+        assert to_sddl(descriptor, 1, flags, ctypes.byref(rendered), ctypes.byref(chars))
+        try:
+            assert f"(A;;FR;;;{substrate_sid})" in rendered.value
+            assert f"(A;;GR;;;{substrate_sid})" not in rendered.value
+        finally:
+            kernel.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel.LocalFree.restype = ctypes.c_void_p
+            kernel.LocalFree(rendered)
+
+
+def _native_descriptor_equal(expected_sddl, actual_sddl):
+    import ctypes
+
+    advapi, kernel = ctypes.WinDLL("advapi32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                        ctypes.POINTER(ctypes.c_ulong)]
+    convert.restype = ctypes.c_int
+    if not convert(actual_sddl, 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return root_admin._filesystem_security_descriptors_equal(
+            descriptor_expected_sddl=expected_sddl, actual_descriptor=descriptor,
+        )
+    finally:
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        kernel.LocalFree(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+@pytest.mark.parametrize(("actual_sddl", "expected"), (
+    ("SAME", True),
+    ("FR", True),
+    ("WRITE", False),
+    ("MODIFY", False),
+    ("FULL", False),
+    ("EXTRA_ACE", False),
+    ("MISSING_ACE", False),
+    ("REORDERED_ACE", False),
+    ("WRONG_SID", False),
+    ("INHERITED", False),
+    ("WRONG_OWNER", False),
+    ("WRONG_GROUP", False),
+))
+def test_native_root_acl_structural_comparison_rejects_non_equivalent_profiles(actual_sddl, expected):
+    admin_sid, _ = root_admin._current_token_identity()
+    substrate_sid = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["substrate_sid"]
+    expected_sddl = (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                     f"(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})")
+    actual = {
+        "SAME": expected_sddl,
+        "FR": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+               f"(A;;FA;;;{admin_sid})(A;;FR;;;{substrate_sid})"),
+        "WRITE": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                  f"(A;;FA;;;{admin_sid})(A;;GW;;;{substrate_sid})"),
+        "MODIFY": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                   f"(A;;FA;;;{admin_sid})(A;;0x1301bf;;;{substrate_sid})"),
+        "FULL": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                 f"(A;;FA;;;{admin_sid})(A;;GA;;;{substrate_sid})"),
+        "EXTRA_ACE": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                      f"(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})"
+                      f"(A;;GR;;;{_TEST_ROOT_PROFILE['root_namespace_acl_profile']['root_admin_sid']})"),
+        "MISSING_ACE": f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})",
+        "REORDERED_ACE": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;{admin_sid})"
+                          f"(A;;FA;;;S-1-5-18)(A;;GR;;;{substrate_sid})"),
+        "WRONG_SID": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                      f"(A;;FA;;;{admin_sid})(A;;GR;;;S-1-5-19)"),
+        "INHERITED": (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                      f"(A;;FA;;;{admin_sid})(A;CI;GR;;;{substrate_sid})"),
+        "WRONG_OWNER": f"O:S-1-5-19G:S-1-5-18D:P(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})",
+        "WRONG_GROUP": f"O:{admin_sid}G:S-1-5-19D:P(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})",
+    }[actual_sddl]
+    assert _native_descriptor_equal(expected_sddl, actual) is expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+def test_native_root_acl_structural_comparison_rejects_unsupported_ace_types():
+    admin_sid, _ = root_admin._current_token_identity()
+    substrate_sid = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["substrate_sid"]
+    expected_sddl = (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                     f"(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})")
+    actual_sddl = (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                   f"(A;;FA;;;{admin_sid})(D;;GR;;;{substrate_sid})")
+    with pytest.raises(PermissionError, match="unsupported ACE"):
+        _native_descriptor_equal(expected_sddl, actual_sddl)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+@pytest.mark.parametrize("actual_sddl", (
+    "O:S-1-5-19G:S-1-5-18",  # missing DACL
+    "O:S-1-5-19G:S-1-5-18D:NO_ACCESS_CONTROL",  # null DACL
+    "O:S-1-5-19G:S-1-5-18D:(A;;FA;;;S-1-5-18)",  # unprotected DACL
+))
+def test_native_root_acl_structural_comparison_fails_closed_on_unsupported_dacl_shape(actual_sddl):
+    admin_sid, _ = root_admin._current_token_identity()
+    substrate_sid = _TEST_ROOT_PROFILE["root_namespace_acl_profile"]["substrate_sid"]
+    expected_sddl = (f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+                     f"(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})")
+    with pytest.raises(PermissionError, match="descriptor shape"):
+        _native_descriptor_equal(expected_sddl, actual_sddl)
+
+
 def _authorize_temp_root_mutation(monkeypatch):
     class _FixtureRetainedSession:
         def __init__(self, deployment_session_id, process_instances):
