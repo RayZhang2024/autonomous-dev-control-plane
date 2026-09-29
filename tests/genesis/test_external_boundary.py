@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import inspect
 import json
 from pathlib import Path
@@ -1096,7 +1097,9 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     observation = make_github_observation(
         reviewed, merge_commit_sha=binding["preimage"]["merge_commit_sha"],
     )
-    monkeypatch.setattr(fence_controller, "_confirm_stage_b_subject", lambda digest: None)
+    monkeypatch.setattr(fence_controller.sys, "stdin", _TestInput(
+        f"STAGE_B {stage_b_subject_digest(reviewed, binding)}\n", is_tty=True,
+    ))
     controller = fence_controller.RetainedRootControllerSession.launch(
         genesis_review_record=reviewed, post_merge_binding=binding,
         github_observation=observation,
@@ -1110,6 +1113,76 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     assert attestation["preimage"]["post_merge_binding"] == binding
     assert controller._retained is not None
     controller._retained.assert_live()
+
+
+class _TestInput(io.StringIO):
+    def __init__(self, value: str, *, is_tty: bool):
+        super().__init__(value)
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+
+@pytest.mark.parametrize(("is_tty", "response", "expected_message"), (
+    (False, "STAGE_B " + "d" * 64, "interactive local console"),
+    (True, "STAGE_B " + "0" * 64, "exact Stage-B subject confirmation did not match"),
+))
+def test_controller_rejects_non_tty_or_wrong_stage_b_subject_before_role_launch(
+        monkeypatch, is_tty, response, expected_message):
+    import windows_role_runner
+
+    session_id = "d" * 64
+    fixture_preimage = _fixture_attestation(_test_fence_row(), session_id)["preimage"]
+    reviewed = fixture_preimage["genesis_review_record"]
+    binding = fixture_preimage["post_merge_binding"]
+    observation = make_github_observation(
+        reviewed, merge_commit_sha=binding["preimage"]["merge_commit_sha"],
+    )
+    events = []
+    launches = []
+
+    monkeypatch.setattr(windows_role_runner, "_host_profiles", lambda: (
+        _TEST_ROOT_PROFILE, _TEST_SUBSTRATE_PROFILE, ANCHOR, _TEST_DEPENDENCIES,
+    ))
+    monkeypatch.setattr(root_admin, "_current_token_facts", lambda: (
+        events.append("root_admin_authentication") or (ADMIN_SID, True, True, True)
+    ))
+    monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session_id)
+
+    validate_review = fence_controller.validate_genesis_exact_head_review_record
+    validate_binding = fence_controller.validate_post_merge_binding
+
+    def checked_review(record):
+        events.append("review_record_validation")
+        return validate_review(record)
+
+    def checked_binding(record, review_record):
+        events.append("post_merge_binding_validation")
+        return validate_binding(record, review_record)
+
+    monkeypatch.setattr(fence_controller, "validate_genesis_exact_head_review_record", checked_review)
+    monkeypatch.setattr(fence_controller, "validate_post_merge_binding", checked_binding)
+    monkeypatch.setattr(fence_controller, "revalidate_post_merge_binding",
+                        lambda *_args: events.append("local_subject_revalidation") or {})
+    monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
+                        lambda *_args: launches.append("role_launch"))
+    monkeypatch.setattr(fence_controller.sys, "stdin", _TestInput(response + "\n", is_tty=is_tty))
+
+    with pytest.raises(PermissionError, match=expected_message):
+        fence_controller.RetainedRootControllerSession.launch(
+            genesis_review_record=reviewed,
+            post_merge_binding=binding,
+            github_observation=observation,
+        )
+
+    assert events == [
+        "root_admin_authentication",
+        "review_record_validation",
+        "post_merge_binding_validation",
+        "local_subject_revalidation",
+    ]
+    assert launches == []
 
 
 @pytest.mark.parametrize("token_facts", (

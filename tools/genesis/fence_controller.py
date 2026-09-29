@@ -389,6 +389,8 @@ def _confirm_stage_b_subject(subject_digest: str) -> None:
     if (type(subject_digest) is not str or len(subject_digest) != 64
             or any(char not in "0123456789abcdef" for char in subject_digest)):
         raise ValueError("Stage-B subject digest is malformed")
+    if not sys.stdin.isatty():
+        raise PermissionError("Stage-B confirmation requires an interactive local console")
     expected = f"STAGE_B {subject_digest}"
     response = input(f"Confirm exact authenticated Stage-B subject by typing {expected}: ")
     if response != expected:
