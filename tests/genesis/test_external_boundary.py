@@ -86,6 +86,16 @@ def _substrate_ready_record(port=54321):
     return record
 
 
+def test_canonical_path_accepts_only_the_exact_resolved_path_family(tmp_path, monkeypatch):
+    canonical = tmp_path / "root" / "root.sqlite3"
+    monkeypatch.setattr(root_admin, "ROOT_STORE_PATH", canonical)
+
+    assert root_admin._is_canonical_path(canonical) is True
+    assert root_admin._is_canonical_path(Path(str(canonical))) is True
+    assert root_admin._is_canonical_path(canonical.with_name("sibling.sqlite3")) is False
+    assert root_admin._is_canonical_path(str(canonical)) is False
+
+
 def test_launcher_probes_exact_validated_ready_endpoint_once_without_sending(monkeypatch):
     events = []
 

@@ -178,7 +178,10 @@ def _is_hex_sid(value: object) -> bool:
 
 
 def _is_canonical_path(path: Path) -> bool:
-    return type(path) is Path and str(path.resolve()).casefold() == str(ROOT_STORE_PATH).casefold()
+    return (
+        isinstance(path, Path)
+        and str(path.resolve()).casefold() == str(ROOT_STORE_PATH).casefold()
+    )
 
 
 def fence_identity(binding: Mapping[str, object]) -> str:
