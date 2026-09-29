@@ -147,7 +147,7 @@ class RetainedRootControllerSession:
             "root_store_schema_sha256": self._profile["root_store_schema_sha256"],
             "root_namespace_acl_profile_id": self._profile["root_namespace_acl_profile"]["profile_id"],
             "acceptance_profile_id": self._profile["acceptance_profile"]["profile_id"],
-            "fixture_substrate_dependency_id": build["fixture_effect_substrate_dependency_id"],
+            "fixture_substrate_dependency_id": build["fixture_substrate_dependency_id"],
             "fixture_substrate_profile_sha256": hashlib.sha256(
                 canonical_json_bytes(substrate_profile)).hexdigest(),
             "fixture_substrate_profile": substrate_profile,

@@ -1061,7 +1061,7 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
                 "execution_isolation_dependency_id"],
             "execution_isolation_profile": fixture_preimage["execution_isolation_profile"],
             "root_fence_dependency_id": fixture_preimage["root_fence_dependency_id"],
-            "fixture_effect_substrate_dependency_id": fixture_preimage[
+            "fixture_substrate_dependency_id": fixture_preimage[
                 "fixture_substrate_dependency_id"],
             "external_tcb_material": fixture_preimage["staged_external_material"],
         },
@@ -1072,6 +1072,10 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
         "runtime_sha256": fixture_preimage["runtime_artifact_sha256"],
         "root_anchor_id": fixture_preimage["root_anchor_id"],
     }
+    assert launch_payload["_candidate_build_definition"]["fixture_substrate_dependency_id"] == (
+        fixture_preimage["fixture_substrate_dependency_id"]
+    )
+    assert "fixture_effect_substrate_dependency_id" not in launch_payload["_candidate_build_definition"]
     monkeypatch.setattr(windows_role_runner, "_launch_retained_deployment_processes",
                         lambda value: dict(launch_payload, _deployment_session_id=value))
     monkeypatch.setattr(root_admin, "new_deployment_session_id", lambda: session_id)
@@ -1111,6 +1115,9 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     assert root_admin._is_exact_utc(attestation["preimage"]["observed_at"])
     assert attestation["preimage"]["genesis_review_record"] == reviewed
     assert attestation["preimage"]["post_merge_binding"] == binding
+    assert attestation["preimage"]["fixture_substrate_dependency_id"] == (
+        fixture_preimage["fixture_substrate_dependency_id"]
+    )
     assert controller._retained is not None
     controller._retained.assert_live()
 
