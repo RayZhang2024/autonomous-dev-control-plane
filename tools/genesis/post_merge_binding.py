@@ -158,7 +158,7 @@ def generate_post_merge_binding(
         "format": POST_MERGE_BINDING_FORMAT,
         "genesis_review_record_id": review_record["review_record_id"],
         "repository": REPOSITORY_ID,
-        "pr_number": 56,
+        "pr_number": review["pr_number"],
         "reviewed_head_sha": review["reviewed_head_sha"],
         "reviewed_head_tree_sha": git_subject["reviewed_head_tree_sha"],
         "authorized_base_sha": review["authorized_base_sha"],

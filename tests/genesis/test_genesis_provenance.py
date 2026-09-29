@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -60,7 +61,6 @@ def test_review_record_uses_exact_closed_domain_separated_content_identity():
 @pytest.mark.parametrize("mutate", (
     lambda p: p.update(repository="other/repository"),
     lambda p: p.update(issue_number=54),
-    lambda p: p.update(pr_number=55),
     lambda p: p.update(review_decision="FAIL"),
     lambda p: p.update(review_provenance={"github_pull_request_review_id": 2}),
     lambda p: p.update(reviewed_at="2026-09-29T12:00:00Z"),
@@ -73,9 +73,35 @@ def test_review_record_rejects_wrong_fixed_subject_or_open_or_malformed_fields(m
         provenance.validate_genesis_exact_head_review_record(record)
 
 
+@pytest.mark.parametrize("pr_number", (56, 57, 58, 2**80))
+def test_review_record_accepts_any_positive_exact_pr_and_content_addresses_it(pr_number):
+    record = _valid_review(pr_number=pr_number)
+    assert record["preimage"]["pr_number"] == pr_number
+    assert record["review_record_id"] == provenance.review_record_identity(record["preimage"])
+    assert provenance.validate_genesis_exact_head_review_record(record) == record
+
+
+def test_historical_pr56_review_observation_and_binding_remain_valid():
+    review = _valid_review(pr_number=56)
+    observation = make_github_observation(review)
+    binding = make_post_merge_binding(review)
+    assert provenance.validate_genesis_exact_head_review_record(review) == review
+    assert provenance.validate_github_state_observation(observation, review) == observation
+    assert provenance.validate_post_merge_binding(binding, review) == binding
+
+
+@pytest.mark.parametrize("pr_number", (0, -1, "57", None, True, False))
+def test_review_record_rejects_non_positive_or_non_exact_integer_pr_number(pr_number):
+    record = json.loads(json.dumps(_valid_review()))
+    record["preimage"]["pr_number"] = pr_number
+    _readdress_review(record)
+    with pytest.raises(ValueError):
+        provenance.validate_genesis_exact_head_review_record(record)
+
+
 def test_review_record_may_be_well_formed_for_another_subject_but_local_merge_proof_rejects_it(tmp_path):
     repo, base, head, tree, merge = _git_repo(tmp_path)
-    # Content-addressed review validation checks the record grammar and fixed Issue/PR,
+    # Content-addressed review validation checks the record grammar and fixed Issue,
     # while exact local Git binding is established only by the merge-subject verifier.
     review = _valid_review(base_sha=base, head_sha=base, tree_sha=tree)
     assert provenance.validate_genesis_exact_head_review_record(review) == review
@@ -167,6 +193,23 @@ def test_external_github_observation_is_closed_and_must_match_review_and_merge()
     changed = dict(observation, extra=True)
     with pytest.raises(ValueError, match="not closed"):
         provenance.validate_github_state_observation(changed, review)
+
+
+def test_review_pr_58_rejects_github_observation_pr_57():
+    review = _valid_review(pr_number=58)
+    observation = make_github_observation(review)
+    observation["pr_number"] = 57
+    with pytest.raises(ValueError, match="exact merged review subject"):
+        provenance.validate_github_state_observation(observation, review)
+
+
+def test_review_pr_58_rejects_post_merge_binding_pr_57():
+    review = _valid_review(pr_number=58)
+    binding = make_post_merge_binding(review)
+    binding["preimage"]["pr_number"] = 57
+    _readdress_binding(binding)
+    with pytest.raises(ValueError, match="conflicts with its exact Genesis review record"):
+        provenance.validate_post_merge_binding(binding, review)
 
 
 def test_stage_b_digest_exactly_binds_all_frozen_provenance_subjects():
@@ -271,7 +314,10 @@ def test_git_provenance_rejects_main_moved_after_merge(tmp_path):
         post_merge_binding.verify_local_merge_subject(repo, review, observation)
 
 
-def test_post_merge_regeneration_compares_exact_reviewed_candidate_and_package_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pr_number", (56, 57, 58))
+def test_post_merge_regeneration_copies_review_pr_and_compares_exact_subject(
+    tmp_path, monkeypatch, pr_number,
+):
     repo, base, head, tree, merge = _git_repo(tmp_path)
     package_bytes = b"candidate package bytes"
     manifest = b"manifest bytes"
@@ -303,12 +349,17 @@ def test_post_merge_regeneration_compares_exact_reviewed_candidate_and_package_b
         package_zip_sha256=hashlib.sha256(package_bytes).hexdigest(),
         manifest_sha256=hashlib.sha256(manifest).hexdigest(),
         evidence_sha256=hashlib.sha256(evidence).hexdigest(),
+        pr_number=pr_number,
         base_sha=base, head_sha=head, tree_sha=tree,
     )
     monkeypatch.setattr(post_merge_binding, "_host_bound_candidate", lambda _repo: package)
     binding = post_merge_binding.generate_post_merge_binding(
         repo, review, make_github_observation(review, merge_commit_sha=merge),
     )
+    assert binding["preimage"]["pr_number"] == pr_number
+    assert list(inspect.signature(post_merge_binding.generate_post_merge_binding).parameters) == [
+        "repository", "review_record", "github_observation",
+    ]
     assert binding["preimage"]["post_merge_candidate"]["candidate_package_id"] == package.candidate_package_id
     assert binding["preimage"]["regeneration"]["run_count"] == 2
     assert provenance.validate_post_merge_binding(binding, review) == binding
