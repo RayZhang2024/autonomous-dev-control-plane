@@ -633,6 +633,63 @@ def _test_fence_row(candidate_package_id: str = PACKAGE, manifest_id: str = MANI
     )
 
 
+@pytest.fixture(scope="module")
+def real_candidate_endpoint_bindings():
+    package = assemble_candidate(
+        git_cwd=str(_REPOSITORY), root_fence_profile=_TEST_ROOT_PROFILE,
+        fixture_substrate_profile=_TEST_SUBSTRATE_PROFILE, root_anchor_id=ANCHOR,
+    )
+    build = json.loads(package.build_definition)
+    graph = json.loads(package.graph)
+    members = {item["role"]: item for item in graph["members"]}
+    endpoint_ids = windows_role_runner._prepared_endpoint_identities(package, members)
+    endpoint_state = windows_role_runner._protected_endpoint_state(endpoint_ids)
+    security_context_ids = {
+        role: _sha256(package.raw_resources[members[role]["security_context_config_resource"]])
+        for role in ("T", "C", "P", "M")
+    }
+    fence = root_admin.build_fence_row(
+        root_anchor_id=ANCHOR, candidate_package_id=package.candidate_package_id,
+        manifest_id=package.manifest_id, runtime_artifact_sha256=package.runtime_sha256,
+        runtime_generation=f"g9-generation-{package.runtime_sha256[:24]}",
+        execution_isolation_dependency_id=build["execution_isolation_dependency_id"],
+        fixture_effect_substrate_dependency_id=build["fixture_substrate_dependency_id"],
+        security_context_identities=security_context_ids,
+        prepared_endpoint_identities=endpoint_ids,
+    )
+    return package, build, members, endpoint_ids, endpoint_state, fence
+
+
+def _readiness_preimage_for_real_candidate(bindings) -> dict[str, object]:
+    import copy
+
+    package, build, _, _, endpoint_state, fence = bindings
+    preimage = copy.deepcopy(_readiness_preimage())
+    preimage.update({
+        "candidate_package_id": package.candidate_package_id,
+        "genesis_manifest_id": package.manifest_id,
+        "deterministic_evidence_ids": [package.deterministic_evidence_id],
+        "runtime_artifact_sha256": package.runtime_sha256,
+        "execution_isolation_dependency_id": build["execution_isolation_dependency_id"],
+        "root_fence_dependency_id": build["root_fence_dependency_id"],
+        "fixture_substrate_dependency_id": build["fixture_substrate_dependency_id"],
+        "protected_endpoint_state": endpoint_state,
+    })
+    root_state = preimage["root_state_observation"]
+    root_state.update({
+        "candidate_package_id": package.candidate_package_id,
+        "manifest_id": package.manifest_id,
+        "fence_id": fence["fence_id"],
+        "capability_fence": fence,
+        "fence_state": fence["state"],
+        "fence_revision": fence["revision"],
+    })
+    for role in preimage["roles"].values():
+        role["candidate_package_id"] = package.candidate_package_id
+        role["runtime_sha256"] = package.runtime_sha256
+    return preimage
+
+
 def _root_fixture(path, *, root_rows: bool = False, state: str = "FENCED", revision: int = 0,
                   candidate_package_id: str = PACKAGE) -> dict[str, object]:
     fence = _test_fence_row(candidate_package_id)
@@ -710,7 +767,9 @@ def test_root_store_inspection_fails_closed_on_schema_tampering(tmp_path):
         )
 
 
-def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, object]:
+def _fixture_attestation(fence: dict[str, object], session: str, *,
+                         protected_endpoint_state: dict[str, dict[str, object]] | None = None
+                         ) -> dict[str, object]:
     roles: dict[str, dict[str, object]] = {}
     process_observations: dict[str, dict[str, object]] = {}
     role_types = {"T": "TrustedControllerRuntime", "C": "ControlStateGateRuntime",
@@ -855,7 +914,7 @@ def _fixture_attestation(fence: dict[str, object], session: str) -> dict[str, ob
         "shared_runtime_read_only": True,
         "cross_role_private_write_denial": {role: True for role in ("T", "C", "P", "M")},
         "candidate_root_store_write_denial": {role: True for role in ("T", "C", "P", "M")},
-        "protected_endpoint_state": {
+        "protected_endpoint_state": protected_endpoint_state if protected_endpoint_state is not None else {
             "C_WRITER": {"state": "FENCED", "identity": fence["prepared_endpoint_c_identity"],
                           "credential_withheld": True},
             "P_PUBLICATION": {"state": "FENCED", "identity": fence["prepared_endpoint_p_identity"],
@@ -977,6 +1036,24 @@ def test_s_requires_exact_review_merge_binding_and_has_no_generic_commit_asserti
         root_admin._validate_deployment_attestation(stale_time, fence, session)
 
 
+@pytest.mark.parametrize(("endpoint", "fence_field"), (
+    ("C_WRITER", "prepared_endpoint_c_identity"),
+    ("P_PUBLICATION", "prepared_endpoint_p_identity"),
+    ("M_MERGE", "prepared_endpoint_m_identity"),
+))
+def test_s_validator_still_rejects_mismatched_protected_endpoint_identity(endpoint, fence_field):
+    fence = _test_fence_row()
+    session = "2" * 64
+    attestation = _fixture_attestation(fence, session)
+    attestation["preimage"]["protected_endpoint_state"][endpoint]["identity"] = "0" * 64
+    attestation["record_id"] = hashlib.sha256(
+        canonical_json_bytes(attestation["preimage"])
+    ).hexdigest()
+    assert fence[fence_field] != attestation["preimage"]["protected_endpoint_state"][endpoint]["identity"]
+    with pytest.raises(ValueError, match="protected endpoint binding is stale"):
+        root_admin._validate_deployment_attestation(attestation, fence, session)
+
+
 def test_acceptance_confirmation_binds_exact_stable_subject_not_timestamp():
     preimage = root_admin.acceptance_preimage(
         acceptance_profile_id=_TEST_ACCEPTANCE_ID, approver_account=r"ray\zhang",
@@ -1084,19 +1161,25 @@ def test_root_mutations_require_retained_native_session_not_a_boolean_callback()
         fence_controller.RetainedRootControllerSession()
 
 
-def test_controller_launch_generates_session_id_and_transfers_exact_process_set(monkeypatch):
+def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
+        monkeypatch, real_candidate_endpoint_bindings):
     session_id = "d" * 64
     processes = {role: object() for role in ("S", "T", "C", "P", "M")}
-    fence = _test_fence_row()
-    fixture_s = _fixture_attestation(fence, session_id)
-    fixture_preimage = fixture_s["preimage"]
-    package = assemble_candidate(
-        git_cwd=str(_REPOSITORY),
-        root_fence_profile=_TEST_ROOT_PROFILE,
-        fixture_substrate_profile=_TEST_SUBSTRATE_PROFILE,
-        root_anchor_id=ANCHOR,
+    (package, candidate_build_definition, members, endpoint_ids,
+     protected_endpoint_state, fence) = real_candidate_endpoint_bindings
+    for role, fence_field in (
+        ("C", "prepared_endpoint_c_identity"),
+        ("P", "prepared_endpoint_p_identity"),
+        ("M", "prepared_endpoint_m_identity"),
+    ):
+        resource_id = members[role]["capability_wiring_resource"]
+        resource_sha256 = _sha256(package.raw_resources[resource_id])
+        assert endpoint_ids[role] == resource_sha256 == fence[fence_field]
+    fixture_s = _fixture_attestation(
+        fence, session_id, protected_endpoint_state=protected_endpoint_state,
     )
-    candidate_build_definition = json.loads(package.build_definition)
+    fixture_preimage = fixture_s["preimage"]
+    assert fixture_preimage["protected_endpoint_state"] == protected_endpoint_state
     assert "fixture_substrate_dependency_id" in candidate_build_definition
     assert "fixture_effect_substrate_dependency_id" not in candidate_build_definition
     assert len(candidate_build_definition["external_tcb_material"]) == 14
@@ -1190,6 +1273,7 @@ def test_controller_launch_generates_session_id_and_transfers_exact_process_set(
     assert attestation["preimage"]["staged_external_material"] == (
         candidate_build_definition["external_tcb_material"]
     )
+    assert attestation["preimage"]["protected_endpoint_state"] == protected_endpoint_state
     assert controller._retained is not None
     controller._retained.assert_live()
 
@@ -2108,9 +2192,12 @@ def _readiness_preimage() -> dict[str, object]:
         "cross_role_private_write_denial": {role: True for role in ("T", "C", "P", "M")},
         "candidate_root_store_write_denial": {role: True for role in ("T", "C", "P", "M")},
         "protected_endpoint_state": {
-            "C_WRITER": {"state": "FENCED", "identity": "1" * 64, "credential_withheld": True},
-            "P_PUBLICATION": {"state": "FENCED", "identity": "2" * 64, "credential_withheld": True},
-            "M_MERGE": {"state": "FENCED", "identity": "3" * 64, "credential_withheld": True},
+            "C_WRITER": {"state": "FENCED", "identity": fence["prepared_endpoint_c_identity"],
+                          "credential_withheld": True},
+            "P_PUBLICATION": {"state": "FENCED", "identity": fence["prepared_endpoint_p_identity"],
+                              "credential_withheld": True},
+            "M_MERGE": {"state": "FENCED", "identity": fence["prepared_endpoint_m_identity"],
+                        "credential_withheld": True},
         },
         "recovery_fence_inventory": ["external-start-held-recovery"],
         "production_github_mutation_credentials": "NONE",
@@ -2135,6 +2222,62 @@ def test_deployment_readiness_is_content_addressed_pre_review_and_binds_all_role
     assert "review_record_id" not in record["preimage"]
     assert "merge_commit_sha" not in record["preimage"]
     assert record["preimage"]["candidate_package_id"] == PACKAGE
+
+
+def test_real_candidate_endpoint_identities_bind_fence_and_deployment_readiness(
+        real_candidate_endpoint_bindings):
+    package, _, members, endpoint_ids, endpoint_state, fence = real_candidate_endpoint_bindings
+    for role, fence_field in (
+        ("C", "prepared_endpoint_c_identity"),
+        ("P", "prepared_endpoint_p_identity"),
+        ("M", "prepared_endpoint_m_identity"),
+    ):
+        resource_id = members[role]["capability_wiring_resource"]
+        assert endpoint_ids[role] == _sha256(package.raw_resources[resource_id])
+        assert endpoint_ids[role] == fence[fence_field]
+    preimage = _readiness_preimage_for_real_candidate(real_candidate_endpoint_bindings)
+    record = build_deployment_readiness(preimage)
+    assert verify_deployment_readiness(record)
+    assert record["preimage"]["protected_endpoint_state"] == endpoint_state
+
+
+@pytest.mark.parametrize(("endpoint", "fence_field"), (
+    ("C_WRITER", "prepared_endpoint_c_identity"),
+    ("P_PUBLICATION", "prepared_endpoint_p_identity"),
+    ("M_MERGE", "prepared_endpoint_m_identity"),
+))
+def test_deployment_readiness_rejects_protected_endpoint_fence_mismatch(
+        endpoint, fence_field):
+    import copy
+
+    preimage = copy.deepcopy(_readiness_preimage())
+    assert (preimage["protected_endpoint_state"][endpoint]["identity"]
+            == preimage["root_state_observation"]["capability_fence"][fence_field])
+    preimage["protected_endpoint_state"][endpoint]["identity"] = "0" * 64
+    with pytest.raises(ValueError, match="does not match canonical capability fence"):
+        build_deployment_readiness(preimage)
+
+
+@pytest.mark.parametrize("endpoint", ("C_WRITER", "P_PUBLICATION", "M_MERGE"))
+def test_deployment_readiness_rejects_old_v09_alternate_endpoint_derivations(endpoint):
+    import copy
+
+    preimage = copy.deepcopy(_readiness_preimage())
+    substrate_sha256 = hashlib.sha256(canonical_json_bytes(_TEST_SUBSTRATE_PROFILE)).hexdigest()
+    old_identities = {
+        "C_WRITER": hashlib.sha256(canonical_json_bytes((
+            "C_WRITER", preimage["candidate_package_id"],
+        ))).hexdigest(),
+        "P_PUBLICATION": hashlib.sha256(canonical_json_bytes((
+            "P_PUBLICATION", substrate_sha256,
+        ))).hexdigest(),
+        "M_MERGE": hashlib.sha256(canonical_json_bytes((
+            "M_MERGE", substrate_sha256,
+        ))).hexdigest(),
+    }
+    preimage["protected_endpoint_state"][endpoint]["identity"] = old_identities[endpoint]
+    with pytest.raises(ValueError, match="does not match canonical capability fence"):
+        build_deployment_readiness(preimage)
 
 
 def test_runner_projects_complete_closed_role_evidence_for_deployment_readiness():
@@ -2185,6 +2328,7 @@ def test_runner_projects_complete_closed_role_evidence_for_deployment_readiness(
     lambda p: p["roles"]["M"].update(candidate_package_id="e" * 64),
     lambda p: p["substrate_service"].update(sid=p["roles"]["P"]["sid"]),
     lambda p: p["root_state_observation"].update(fence_state="RELEASED"),
+    lambda p: p["protected_endpoint_state"]["C_WRITER"].update(state="AVAILABLE"),
     lambda p: p["protected_endpoint_state"]["M_MERGE"].update(credential_withheld=False),
     lambda p: p["candidate_root_store_write_denial"].update(C=False),
     lambda p: p.update(execution_isolation_profile_sha256="0" * 64),

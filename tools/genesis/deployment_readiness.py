@@ -227,6 +227,14 @@ def build_deployment_readiness(preimage: dict[str, Any]) -> dict[str, Any]:
                    or value["credential_withheld"] is not True
                    for value in endpoint_state.values())):
         raise ValueError("protected endpoint set is not exactly present and FENCED")
+    endpoint_fence_fields = {
+        "C_WRITER": "prepared_endpoint_c_identity",
+        "P_PUBLICATION": "prepared_endpoint_p_identity",
+        "M_MERGE": "prepared_endpoint_m_identity",
+    }
+    if any(endpoint_state[name]["identity"] != root_state["capability_fence"][field]
+           for name, field in endpoint_fence_fields.items()):
+        raise ValueError("protected endpoint identity does not match canonical capability fence")
     if preimage["production_github_mutation_credentials"] != "NONE":
         raise ValueError("production GitHub mutation credentials are forbidden")
     service = preimage["substrate_service"]
