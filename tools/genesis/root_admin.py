@@ -1730,9 +1730,9 @@ def _filesystem_security_descriptor_binding(descriptor: Any, advapi: Any,
             or not advapi.GetSecurityDescriptorGroup(descriptor, ctypes.byref(group),
                                                     ctypes.byref(defaulted))):
         raise ctypes.WinError(ctypes.get_last_error())
-    control, revision = ctypes.c_ushort(), ctypes.c_ushort()
+    control, revision = ctypes.c_ushort(), ctypes.c_uint32()
     advapi.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort),
-                                                   ctypes.POINTER(ctypes.c_ushort)]
+                                                   ctypes.POINTER(ctypes.c_uint32)]
     advapi.GetSecurityDescriptorControl.restype = ctypes.c_int
     if not advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -1745,6 +1745,9 @@ def _filesystem_security_descriptor_binding(descriptor: Any, advapi: Any,
                                             ctypes.byref(dacl), ctypes.byref(dacl_defaulted)):
         raise ctypes.WinError(ctypes.get_last_error())
     # The profile requires concrete owner/group and a present, non-null protected DACL.
+    # Bind the complete control word and descriptor revision: v0.9 permits only
+    # filesystem generic-mask mapping as normalization. Keep DACL-defaulted
+    # explicit too, matching the state returned by GetSecurityDescriptorDacl.
     protected = bool(control.value & 0x1000)  # SE_DACL_PROTECTED
     if not owner.value or not group.value or not dacl_present.value or not dacl.value or not protected:
         raise PermissionError("root namespace ACL descriptor shape is unsupported")
@@ -1780,6 +1783,7 @@ def _filesystem_security_descriptor_binding(descriptor: Any, advapi: Any,
         ace_values.append((ace_type, ace_flags, sid,
                            _filesystem_effective_access_mask(mask, advapi)))
     return (_sid_identity(owner.value, advapi, kernel), _sid_identity(group.value, advapi, kernel),
+            int(control.value), int(revision.value), bool(dacl_defaulted.value),
             True, protected, tuple(ace_values))
 
 

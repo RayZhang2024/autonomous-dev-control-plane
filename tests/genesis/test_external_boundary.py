@@ -1477,6 +1477,33 @@ def test_native_gr_acl_readback_as_fr_passes_root_acl_verifier():
             kernel.LocalFree(rendered)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+def test_native_security_descriptor_control_uses_word_and_dword_outputs():
+    import ctypes
+
+    admin_sid, _ = root_admin._current_token_identity()
+    sddl = f"O:{admin_sid}G:S-1-5-18D:P(A;;FA;;;S-1-5-18)"
+    advapi, kernel = (ctypes.WinDLL("advapi32", use_last_error=True),
+                      ctypes.WinDLL("kernel32", use_last_error=True))
+    descriptor = ctypes.c_void_p()
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                        ctypes.POINTER(ctypes.c_ulong)]
+    convert.restype = ctypes.c_int
+    assert convert(sddl, 1, ctypes.byref(descriptor), None)
+    try:
+        binding = root_admin._filesystem_security_descriptor_binding(descriptor, advapi, kernel)
+        get_control = advapi.GetSecurityDescriptorControl
+        assert get_control.argtypes[1] == ctypes.POINTER(ctypes.c_ushort)
+        assert get_control.argtypes[2] == ctypes.POINTER(ctypes.c_uint32)
+        assert isinstance(binding[2], int) and 0 <= binding[2] <= 0xFFFF
+        assert isinstance(binding[3], int) and 0 <= binding[3] <= 0xFFFFFFFF
+    finally:
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        kernel.LocalFree(descriptor)
+
+
 def _native_descriptor_equal(expected_sddl, actual_sddl):
     import ctypes
 
@@ -1542,6 +1569,82 @@ def test_native_root_acl_structural_comparison_rejects_non_equivalent_profiles(a
         "WRONG_GROUP": f"O:{admin_sid}G:S-1-5-19D:P(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})(A;;GR;;;{substrate_sid})",
     }[actual_sddl]
     assert _native_descriptor_equal(expected_sddl, actual) is expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
+@pytest.mark.parametrize("control_flag", (
+    0x0100,  # SE_DACL_AUTO_INHERIT_REQ: extra control state with the same DACL.
+    0x0008,  # SE_DACL_DEFAULTED: defaulted DACL state must remain explicit.
+))
+def test_native_root_acl_comparison_rejects_different_descriptor_control_state(control_flag):
+    import ctypes
+
+    admin_sid, _ = root_admin._current_token_identity()
+    expected_sddl = (f"O:{admin_sid}G:S-1-5-18D:P"
+                     f"(A;;FA;;;S-1-5-18)(A;;FA;;;{admin_sid})")
+    advapi, kernel = (ctypes.WinDLL("advapi32", use_last_error=True),
+                      ctypes.WinDLL("kernel32", use_last_error=True))
+    descriptor = ctypes.c_void_p()
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                        ctypes.POINTER(ctypes.c_ulong)]
+    convert.restype = ctypes.c_int
+    assert convert(expected_sddl, 1, ctypes.byref(descriptor), None)
+    try:
+        actual_descriptor = descriptor
+        if control_flag == 0x0008:  # Set DACL-defaulted through its native API output state.
+            owner, group = ctypes.c_void_p(), ctypes.c_void_p()
+            defaulted = ctypes.c_int()
+            get_owner = advapi.GetSecurityDescriptorOwner
+            get_owner.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                  ctypes.POINTER(ctypes.c_int)]
+            get_owner.restype = ctypes.c_int
+            get_group = advapi.GetSecurityDescriptorGroup
+            get_group.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                  ctypes.POINTER(ctypes.c_int)]
+            get_group.restype = ctypes.c_int
+            assert get_owner(descriptor, ctypes.byref(owner), ctypes.byref(defaulted))
+            assert get_group(descriptor, ctypes.byref(group), ctypes.byref(defaulted))
+            dacl_present, dacl, dacl_defaulted = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_int()
+            get_dacl = advapi.GetSecurityDescriptorDacl
+            get_dacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                 ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int)]
+            get_dacl.restype = ctypes.c_int
+            assert get_dacl(descriptor, ctypes.byref(dacl_present), ctypes.byref(dacl),
+                            ctypes.byref(dacl_defaulted))
+            actual_descriptor = ctypes.create_string_buffer(64)
+            initialize = advapi.InitializeSecurityDescriptor
+            initialize.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            initialize.restype = ctypes.c_int
+            assert initialize(actual_descriptor, 1)
+            set_owner = advapi.SetSecurityDescriptorOwner
+            set_owner.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            set_owner.restype = ctypes.c_int
+            set_group = advapi.SetSecurityDescriptorGroup
+            set_group.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            set_group.restype = ctypes.c_int
+            assert set_owner(actual_descriptor, owner, 0)
+            assert set_group(actual_descriptor, group, 0)
+            set_dacl = advapi.SetSecurityDescriptorDacl
+            set_dacl.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            set_dacl.restype = ctypes.c_int
+            assert set_dacl(actual_descriptor, dacl_present.value, dacl, 1)
+            set_control = advapi.SetSecurityDescriptorControl
+            set_control.argtypes = [ctypes.c_void_p, ctypes.c_ushort, ctypes.c_ushort]
+            set_control.restype = ctypes.c_int
+            assert set_control(actual_descriptor, 0x1000, 0x1000)  # Preserve SE_DACL_PROTECTED.
+        else:
+            set_control = advapi.SetSecurityDescriptorControl
+            set_control.argtypes = [ctypes.c_void_p, ctypes.c_ushort, ctypes.c_ushort]
+            set_control.restype = ctypes.c_int
+            assert set_control(descriptor, control_flag, control_flag)
+        assert not root_admin._filesystem_security_descriptors_equal(
+            descriptor_expected_sddl=expected_sddl, actual_descriptor=actual_descriptor,
+        )
+    finally:
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        kernel.LocalFree(descriptor)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows security descriptor APIs")
