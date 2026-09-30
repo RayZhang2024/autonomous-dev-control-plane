@@ -135,6 +135,27 @@ def _deployment_role_evidence(
     }
 
 
+def _prepared_endpoint_identities(package: object,
+                                  members: dict[str, dict[str, object]]) -> dict[str, str]:
+    """Bind prepared protected endpoints to the exact graph capability-wiring resources."""
+    return {
+        role: sha256(package.raw_resources[members[role]["capability_wiring_resource"]])
+        for role in ("C", "P", "M")
+    }
+
+
+def _protected_endpoint_state(endpoint_ids: dict[str, str]) -> dict[str, dict[str, object]]:
+    """Project the canonical prepared endpoint identities into non-authoritative DR state."""
+    return {
+        "C_WRITER": {"state": "FENCED", "identity": endpoint_ids["C"],
+                      "credential_withheld": True},
+        "P_PUBLICATION": {"state": "FENCED", "identity": endpoint_ids["P"],
+                          "credential_withheld": True},
+        "M_MERGE": {"state": "FENCED", "identity": endpoint_ids["M"],
+                    "credential_withheld": True},
+    }
+
+
 def _host_profiles() -> tuple[dict[str, object], dict[str, object], str, tuple[str, str]]:
     if not PYTHON.is_file():
         raise RuntimeError("the frozen staged CPython interpreter is unavailable")
@@ -263,10 +284,7 @@ def _run_realized_roles(*, retained_session_id: str | None) -> dict[str, object]
         role: sha256(package.raw_resources[members[role]["security_context_config_resource"]])
         for role in ROLE_ORDER
     }
-    endpoint_ids = {
-        role: sha256(package.raw_resources[members[role]["capability_wiring_resource"]])
-        for role in ("C", "P", "M")
-    }
+    endpoint_ids = _prepared_endpoint_identities(package, members)
     fence_row = build_fence_row(
         root_anchor_id=root_anchor_id, candidate_package_id=package.candidate_package_id,
         manifest_id=package.manifest_id, runtime_artifact_sha256=package.runtime_sha256,
@@ -543,17 +561,7 @@ def _run_realized_roles(*, retained_session_id: str | None) -> dict[str, object]
             "candidate_root_store_write_denial": {
                 role: reports[role]["access"]["root_store_write_denied"] for role in ROLE_ORDER
             },
-            "protected_endpoint_state": {
-                "C_WRITER": {"state": "FENCED", "identity": sha256(
-                    canonical_json_bytes(("C_WRITER", package.candidate_package_id))),
-                    "credential_withheld": True},
-                "P_PUBLICATION": {"state": "FENCED", "identity": sha256(
-                    canonical_json_bytes(("P_PUBLICATION", substrate_profile_sha))),
-                    "credential_withheld": True},
-                "M_MERGE": {"state": "FENCED", "identity": sha256(
-                    canonical_json_bytes(("M_MERGE", substrate_profile_sha))),
-                    "credential_withheld": True},
-            },
+            "protected_endpoint_state": _protected_endpoint_state(endpoint_ids),
             "recovery_fence_inventory": [substrate_profile["external_recovery_endpoint"]["endpoint_id"]],
             "production_github_mutation_credentials": "NONE",
             "host_profile_id": derive_host_profile_id(
