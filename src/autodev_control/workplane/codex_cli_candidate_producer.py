@@ -8,8 +8,9 @@ no authorization, trusted candidate truth, evidence, lifecycle or authority.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import ctypes
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from .candidate_producer import (
     CandidateProposal,
@@ -47,6 +48,8 @@ MAX_TIMEOUT_SECONDS = 1_800
 MAX_JOB_ACTIVE_PROCESSES = 64
 MAX_JOB_MEMORY_BYTES = 4_294_967_296
 JOB_CPU_HARD_CAP_PERCENT = 80
+MAX_ATTESTATION_VALIDITY_SECONDS = 1_800
+MAX_ATTESTATION_FUTURE_SKEW_SECONDS = 120
 
 SUPPORTED_FILE_MODES = ("100644", "100755")
 RESERVED_TOP_LEVEL_NAMES = frozenset((".git", ".codex", ".agents"))
@@ -85,6 +88,7 @@ FIXED_IMPLEMENTATION_PREFIX = (
     "established. Return control after editing; the runner observes files.\n\n"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ATTESTATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _WINDOWS_ENV_ALLOWLIST = (
     "PATH",
@@ -118,15 +122,26 @@ JOB_OBJECT_RESOURCE_LIMIT_MESSAGES = frozenset((
     JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
     JOB_OBJECT_MSG_NOTIFICATION_LIMIT,
 ))
+JOB_OBJECT_RESOURCE_LIMIT_TYPES = {
+    JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT: "active_process_limit",
+    JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: "process_memory_limit",
+    JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: "job_memory_limit",
+    JOB_OBJECT_MSG_NOTIFICATION_LIMIT: "notification_limit",
+}
 FEATURE_STAGES = frozenset(("stable", "experimental", "under development", "deprecated", "removed"))
 DEPLOYMENT_CHECKS = (
-    "read_isolated_worker", "readable_data_set_minimal", "forbidden_stores_absent_or_inaccessible",
-    "worker_account_non_admin", "worker_account_not_trusted_role", "dedicated_codex_principal",
-    "principal_inference_only", "principal_no_target_control_root_rights",
-    "no_unrelated_private_apps_or_data", "credential_may_be_accessible",
-    "keyring_credentials_store", "forced_login_method", "mcp_configuration_sources_absent",
-    "managed_system_policy_inspected", "managed_system_external_broadening_empty",
-    "exec_policy_rules_absent", "effective_web_search_disabled",
+    "worker_isolation_kind", "worker_read_visible_set_classification",
+    "forbidden_target_repository_stores_absent_or_inaccessible",
+    "forbidden_control_state_stores_absent_or_inaccessible",
+    "forbidden_root_bootstrap_material_absent_or_inaccessible",
+    "forbidden_unrelated_private_stores_absent_or_inaccessible",
+    "worker_os_account_identity", "worker_account_non_admin", "worker_not_trusted_root_role",
+    "dedicated_codex_principal", "codex_principal_inference_only",
+    "target_repository_publication_authority_absent", "control_state_authority_absent", "root_authority_absent",
+    "unrelated_connected_app_private_data_exposure_absent", "codex_credential_access_assumption_disclosed",
+    "managed_system_policy_inspection_completed",
+    "managed_system_capability_broadening_absent", "auth_principal_storage_login_classification",
+    "mcp_configuration_sources_absent", "exec_policy_rules_absent", "effective_web_search_policy_disabled",
 )
 
 
@@ -136,6 +151,10 @@ class O2cPreflightError(ValueError):
 
 def _is_resource_limit_notification(message_id: int) -> bool:
     return type(message_id) is int and message_id in JOB_OBJECT_RESOURCE_LIMIT_MESSAGES
+
+
+def _resource_limit_notification_type(message_id: int) -> str | None:
+    return JOB_OBJECT_RESOURCE_LIMIT_TYPES.get(message_id) if type(message_id) is int else None
 
 
 def _current_worker_identity() -> str:
@@ -154,6 +173,26 @@ def _current_worker_identity() -> str:
     import getpass
 
     return getpass.getuser()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _valid_worker_environment_id(value: object) -> bool:
+    if type(value) is not str or not value or len(value) > 256 or "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _require_exact_utc(value: object, label: str) -> datetime:
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
+        raise O2cPreflightError(f"{label} must be an exact timezone-aware UTC datetime")
+    return value
 
 
 @dataclass(frozen=True)
@@ -201,6 +240,10 @@ class CodexWorkerDeploymentAttestation:
     codex_executable_version: str
     codex_executable_sha256: str
     evidence_items: tuple[CodexDeploymentEvidence, ...]
+    attestation_id: str
+    worker_environment_id: str
+    issued_at_utc: datetime
+    expires_at_utc: datetime
 
 
 @dataclass(frozen=True)
@@ -213,6 +256,7 @@ class CodexCliConfiguration:
     scratch_root: str
     timeout_seconds: int
     expected_source_head_sha: str
+    expected_worker_environment_id: str
 
 
 @dataclass(frozen=True)
@@ -226,8 +270,16 @@ class CodexEffectiveState:
 @dataclass(frozen=True)
 class CodexRunDiagnostics:
     runner_version: str
+    worker_identity_measured: str
     codex_version: str
-    codex_executable_sha256: str
+    codex_version_measured_before_task: bool
+    codex_executable_sha256_before: str
+    codex_executable_sha256_after: str
+    worker_home_path: str
+    userprofile_path: str
+    worker_agents_clean: bool
+    codex_home_path: str
+    codex_home_clean: bool
     root_exit_code: int
     elapsed_milliseconds: int
     workspace_file_count: int
@@ -238,9 +290,13 @@ class CodexRunDiagnostics:
     stderr_sha256: str
     process_tree_quiescent: bool
     resource_limit_violation: bool
-    job_limits: tuple[int, int, int]
     measured_features: tuple[tuple[str, bool], ...]
     measured_mcp_server_count: int
+    candidate_workspace_git_present: bool
+    job_assignment_succeeded: bool
+    root_process_resumed_after_assignment: bool
+    active_process_count_before_scan: int
+    resource_violation_types: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -254,6 +310,10 @@ class ContainedExecutionOutcome:
     stderr_byte_count: int
     stderr_sha256: str
     elapsed_milliseconds: int
+    job_assignment_succeeded: bool = True
+    root_process_resumed_after_assignment: bool = True
+    active_process_count_before_scan: int = 0
+    resource_violation_types: tuple[str, ...] = ()
 
 
 class CodexPreflightProbe(Protocol):
@@ -351,6 +411,7 @@ def _validate_deployment(
     configuration: CodexCliConfiguration,
     measured_worker_identity: str,
     measured_executable_sha256: str,
+    now_utc: datetime,
 ) -> None:
     if type(deployment) is not CodexWorkerDeploymentAttestation:
         raise O2cPreflightError("external deployment attestation must have exact type")
@@ -358,8 +419,30 @@ def _validate_deployment(
         raise O2cPreflightError("unsupported deployment attestation format")
     if type(deployment.worker_isolation_kind) is not str or deployment.worker_isolation_kind not in ("dedicated_vm", "dedicated_container", "dedicated_host", "equivalent"):
         raise O2cPreflightError("worker isolation kind is unsupported")
-    if type(deployment.worker_identity) is not str or type(deployment.source_head_sha) is not str:
+    if (type(deployment.worker_identity) is not str or type(deployment.source_head_sha) is not str
+            or type(deployment.codex_executable_path) is not str
+            or type(deployment.codex_executable_version) is not str
+            or type(deployment.codex_executable_sha256) is not str):
         raise O2cPreflightError("deployment identity fields are invalid")
+    if type(deployment.attestation_id) is not str or _ATTESTATION_ID_RE.fullmatch(deployment.attestation_id) is None:
+        raise O2cPreflightError("deployment attestation identifier is invalid")
+    if not _valid_worker_environment_id(deployment.worker_environment_id):
+        raise O2cPreflightError("deployment worker environment identifier is invalid")
+    if not _valid_worker_environment_id(configuration.expected_worker_environment_id):
+        raise O2cPreflightError("configured worker environment identifier is invalid")
+    if deployment.worker_environment_id != configuration.expected_worker_environment_id:
+        raise O2cPreflightError("deployment attestation worker environment does not match invocation environment")
+    issued_at = _require_exact_utc(deployment.issued_at_utc, "attestation issued_at_utc")
+    expires_at = _require_exact_utc(deployment.expires_at_utc, "attestation expires_at_utc")
+    now = _require_exact_utc(now_utc, "validation clock")
+    if expires_at <= issued_at:
+        raise O2cPreflightError("deployment attestation expiry must follow issuance")
+    if (expires_at - issued_at).total_seconds() > MAX_ATTESTATION_VALIDITY_SECONDS:
+        raise O2cPreflightError("deployment attestation validity exceeds the frozen maximum")
+    if expires_at < now:
+        raise O2cPreflightError("deployment attestation is expired")
+    if issued_at > now + timedelta(seconds=MAX_ATTESTATION_FUTURE_SKEW_SECONDS):
+        raise O2cPreflightError("deployment attestation issuance exceeds future clock skew")
     if deployment.worker_identity != measured_worker_identity:
         raise O2cPreflightError("deployment attestation worker identity does not match runtime identity")
     if deployment.source_head_sha != configuration.expected_source_head_sha:
@@ -387,6 +470,13 @@ def _validate_deployment(
                 or type(item.evidence_sha256) is not str or _SHA256_RE.fullmatch(item.evidence_sha256) is None
                 or type(item.reference) is not str or not item.reference):
             raise O2cPreflightError(f"deployment evidence is invalid for {check_id}")
+        for field, value in (("evidence_kind", item.evidence_kind), ("origin", item.origin), ("reference", item.reference)):
+            if len(value) > 512 or "\x00" in value:
+                raise O2cPreflightError(f"deployment evidence {field} is not bounded for {check_id}")
+            try:
+                value.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as error:
+                raise O2cPreflightError(f"deployment evidence {field} is not UTF-8 for {check_id}") from error
 
 
 def _validate_effective_state(state: CodexEffectiveState) -> None:
@@ -457,6 +547,8 @@ def _validate_configuration(configuration: CodexCliConfiguration) -> None:
         raise O2cPreflightError("expected Codex executable SHA-256 is invalid")
     if not _valid_git_id(configuration.expected_source_head_sha):
         raise O2cPreflightError("expected source head SHA is invalid")
+    if not _valid_worker_environment_id(configuration.expected_worker_environment_id):
+        raise O2cPreflightError("expected worker environment identifier is invalid")
     executable = Path(configuration.absolute_codex_executable_path)
     if type(configuration.absolute_codex_executable_path) is not str or not executable.is_absolute():
         raise O2cPreflightError("Codex executable path must be absolute")
@@ -549,13 +641,16 @@ def build_child_environment(
     return child
 
 
-def _check_home_state(worker_home: Path, codex_home: Path) -> None:
-    for relative in (".agents/skills", ".agents/plugins"):
-        if _path_exists_or_link(worker_home / relative):
-            raise O2cPreflightError("worker home contains user skills or plugins")
-    for name in _CODEX_HOME_FORBIDDEN:
-        if _path_exists_or_link(codex_home / name):
-            raise O2cPreflightError(f"dedicated CODEX_HOME contains forbidden state: {name}")
+def _check_home_state(worker_home: Path, codex_home: Path) -> tuple[bool, bool]:
+    worker_agents_clean = not any(
+        _path_exists_or_link(worker_home / relative) for relative in (".agents/skills", ".agents/plugins")
+    )
+    if not worker_agents_clean:
+        raise O2cPreflightError("worker home contains user skills or plugins")
+    codex_home_clean = not any(_path_exists_or_link(codex_home / name) for name in _CODEX_HOME_FORBIDDEN)
+    if not codex_home_clean:
+        raise O2cPreflightError("dedicated CODEX_HOME contains forbidden state")
+    return worker_agents_clean, codex_home_clean
 
 
 def _path_exists_or_link(path: Path) -> bool:
@@ -571,7 +666,7 @@ def _path_exists_or_link(path: Path) -> bool:
 def _validate_effective_homes(
     configuration: CodexCliConfiguration,
     parent_environment: Mapping[str, str],
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, bool, bool]:
     if not isinstance(parent_environment, Mapping):
         raise O2cPreflightError("parent environment must be a mapping")
     worker_home = _ordinary_directory(configuration.worker_home, "worker home")
@@ -587,8 +682,8 @@ def _validate_effective_homes(
         raise O2cPreflightError("scratch root must be separate from worker home")
     if _path_is_within(scratch_root, codex_home) or _path_is_within(codex_home, scratch_root):
         raise O2cPreflightError("scratch root must be separate from CODEX_HOME")
-    _check_home_state(worker_home, codex_home)
-    return worker_home, codex_home, scratch_root
+    worker_agents_clean, codex_home_clean = _check_home_state(worker_home, codex_home)
+    return worker_home, codex_home, scratch_root, worker_agents_clean, codex_home_clean
 
 
 def _seed_workspace(seed: CodexWorkspaceSeed, workspace: Path) -> None:
@@ -705,6 +800,7 @@ class CodexCliCandidateProducer:
         preflight: CodexPreflightProbe | None = None,
         runner: ContainedTaskRunner | None = None,
         parent_environment: Mapping[str, str] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._configuration = configuration
         self._seed = seed
@@ -712,6 +808,7 @@ class CodexCliCandidateProducer:
         self._preflight = preflight if preflight is not None else CodexCliPreflightProbe()
         self._runner = runner if runner is not None else WindowsJobObjectRunner()
         self._parent_environment = os.environ if parent_environment is None else parent_environment
+        self._clock = _utc_now if clock is None else clock
         self.task_attempt_count = 0
 
     def invoke(self, request_bytes: bytes) -> CandidateProducerResult:
@@ -721,13 +818,14 @@ class CodexCliCandidateProducer:
             request_text = request_bytes.decode("utf-8", errors="strict")
             _validate_configuration(self._configuration)
             base_files = _validate_seed(self._seed)
-            worker_home, codex_home, scratch_root = _validate_effective_homes(
+            worker_home, codex_home, scratch_root, worker_agents_clean, codex_home_clean = _validate_effective_homes(
                 self._configuration, self._parent_environment
             )
             initial_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if initial_hash != self._configuration.expected_codex_executable_sha256:
                 return _failure()
-            _validate_deployment(self._deployment, self._configuration, _current_worker_identity(), initial_hash)
+            worker_identity_measured = _current_worker_identity()
+            _validate_deployment(self._deployment, self._configuration, worker_identity_measured, initial_hash, self._clock())
         except (O2cPreflightError, UnicodeDecodeError, OSError, TypeError, ValueError):
             return _failure()
 
@@ -762,6 +860,9 @@ class CodexCliCandidateProducer:
             before_task_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if before_task_hash != self._configuration.expected_codex_executable_sha256:
                 return _failure()
+            _validate_deployment(
+                self._deployment, self._configuration, worker_identity_measured, before_task_hash, self._clock()
+            )
             command = build_codex_arguments(str(workspace))
             prompt_bytes = (FIXED_IMPLEMENTATION_PREFIX + request_text).encode("utf-8")
             started = time.monotonic()
@@ -784,27 +885,44 @@ class CodexCliCandidateProducer:
             if outcome.timed_out:
                 timed_out = True
                 return _failure(ProducerStatus.TIMEOUT)
-            if outcome.root_exit_code != 0 or outcome.resource_limit_violation or not outcome.process_tree_quiescent:
+            if (outcome.root_exit_code != 0 or outcome.resource_limit_violation
+                    or not outcome.process_tree_quiescent or outcome.active_process_count_before_scan != 0
+                    or not outcome.job_assignment_succeeded or not outcome.root_process_resumed_after_assignment):
+                return _failure()
+            candidate_workspace_git_present = _path_exists_or_link(workspace / ".git")
+            if candidate_workspace_git_present:
                 return _failure()
             final_files = _observe_workspace(workspace)
             proposal = _extract_proposal(self._seed, final_files)
             metadata = CodexRunDiagnostics(
-                RUNNER_IMPLEMENTATION_VERSION,
-                self._configuration.expected_codex_version,
-                self._configuration.expected_codex_executable_sha256,
-                outcome.root_exit_code,
-                min(MAX_TIMEOUT_SECONDS * 1000, max(elapsed, outcome.elapsed_milliseconds)),
-                len(final_files),
-                len(proposal.changes),
-                outcome.stdout_byte_count,
-                outcome.stdout_sha256,
-                outcome.stderr_byte_count,
-                outcome.stderr_sha256,
-                outcome.process_tree_quiescent,
-                outcome.resource_limit_violation,
-                (MAX_JOB_ACTIVE_PROCESSES, MAX_JOB_MEMORY_BYTES, JOB_CPU_HARD_CAP_PERCENT),
-                state.features,
-                state.mcp_server_count,
+                runner_version=RUNNER_IMPLEMENTATION_VERSION,
+                worker_identity_measured=worker_identity_measured,
+                codex_version=self._configuration.expected_codex_version,
+                codex_version_measured_before_task=True,
+                codex_executable_sha256_before=before_task_hash,
+                codex_executable_sha256_after=after_task_hash,
+                worker_home_path=str(worker_home),
+                userprofile_path=str(self._parent_environment.get("USERPROFILE", "")),
+                worker_agents_clean=worker_agents_clean,
+                codex_home_path=str(codex_home),
+                codex_home_clean=codex_home_clean,
+                root_exit_code=outcome.root_exit_code,
+                elapsed_milliseconds=min(MAX_TIMEOUT_SECONDS * 1000, max(elapsed, outcome.elapsed_milliseconds)),
+                workspace_file_count=len(final_files),
+                proposal_change_count=len(proposal.changes),
+                stdout_byte_count=outcome.stdout_byte_count,
+                stdout_sha256=outcome.stdout_sha256,
+                stderr_byte_count=outcome.stderr_byte_count,
+                stderr_sha256=outcome.stderr_sha256,
+                process_tree_quiescent=outcome.process_tree_quiescent,
+                resource_limit_violation=outcome.resource_limit_violation,
+                measured_features=state.features,
+                measured_mcp_server_count=state.mcp_server_count,
+                candidate_workspace_git_present=candidate_workspace_git_present,
+                job_assignment_succeeded=outcome.job_assignment_succeeded,
+                root_process_resumed_after_assignment=outcome.root_process_resumed_after_assignment,
+                active_process_count_before_scan=outcome.active_process_count_before_scan,
+                resource_violation_types=outcome.resource_violation_types,
             )
             successful_result = CandidateProducerResult(
                 ProducerStatus.SUCCESS,
@@ -836,6 +954,15 @@ def _validate_execution_outcome(outcome: ContainedExecutionOutcome) -> None:
     for count in (outcome.stdout_byte_count, outcome.stderr_byte_count, outcome.elapsed_milliseconds):
         if type(count) is not int or count < 0:
             raise O2cPreflightError("contained runner returned invalid diagnostic count")
+    if type(outcome.job_assignment_succeeded) is not bool or type(outcome.root_process_resumed_after_assignment) is not bool:
+        raise O2cPreflightError("contained runner returned invalid assignment/resume state")
+    if type(outcome.active_process_count_before_scan) is not int or outcome.active_process_count_before_scan < 0:
+        raise O2cPreflightError("contained runner returned invalid active-process count")
+    if type(outcome.resource_violation_types) is not tuple or any(
+        type(item) is not str or item not in set(JOB_OBJECT_RESOURCE_LIMIT_TYPES.values())
+        for item in outcome.resource_violation_types
+    ):
+        raise O2cPreflightError("contained runner returned invalid resource violation classification")
     for digest in (outcome.stdout_sha256, outcome.stderr_sha256):
         if type(digest) is not str or _SHA256_RE.fullmatch(digest) is None:
             raise O2cPreflightError("contained runner returned invalid diagnostic digest")
@@ -1008,6 +1135,30 @@ class JobObjectLimits:
     cpu_hard_cap_percent: int = JOB_CPU_HARD_CAP_PERCENT
 
 
+@dataclass(frozen=True)
+class CodexConfiguredExecutionProfile:
+    sandbox_profile: str
+    approval_policy: str
+    shell_network: bool
+    web_search_requested: str
+    extra_writable_roots: tuple[str, ...]
+    sandbox_tmp_writability_exclusions_enabled: bool
+    auth_credential_store_requested: str
+    login_method_requested: str
+    ephemeral: bool
+    ignore_user_config: bool
+    ignore_rules: bool
+    job_object_limits: JobObjectLimits
+
+
+def configured_execution_profile() -> CodexConfiguredExecutionProfile:
+    """Return the frozen requested profile, not a claim of runtime observation."""
+    return CodexConfiguredExecutionProfile(
+        "workspace-write", "never", False, "disabled", (), True, "keyring", "chatgpt",
+        True, True, True, JobObjectLimits(),
+    )
+
+
 class WindowsJobObjectApi(Protocol):
     def create_suspended_process(
         self,
@@ -1063,7 +1214,11 @@ class WindowsJobObjectRunner:
                 job, process, timeout_seconds, limits
             )
             _validate_execution_outcome(outcome)
-            return outcome
+            return replace(
+                outcome,
+                job_assignment_succeeded=True,
+                root_process_resumed_after_assignment=True,
+            )
         except BaseException:
             if process is not None:
                 try:
@@ -1333,7 +1488,13 @@ class _NativeWindowsJobObjectApi:
         if active:
             self._check(self._kernel.TerminateJobObject(job.handle, 1), "descendant Job Object termination")
         quiescent = self._wait_job_empty(job.handle, 10.0)
-        resource_violation = self._consume_job_notifications(job) or self._peak_job_memory(job.handle) > limits.max_job_memory_bytes
+        active_before_scan = self._active_processes(job.handle)
+        if not quiescent or active_before_scan != 0:
+            raise O2cPreflightError("contained process tree is not quiescent before workspace scan")
+        resource_violation_types = set(self._consume_job_notifications(job))
+        if self._peak_job_memory(job.handle) > limits.max_job_memory_bytes:
+            resource_violation_types.add("job_memory_limit")
+        resource_violation = bool(resource_violation_types)
         writer.join(timeout=10)
         for reader in readers:
             reader.join(timeout=10)
@@ -1349,6 +1510,7 @@ class _NativeWindowsJobObjectApi:
             int(output.get("stdout_count", 0)), str(output.get("stdout_hash", hashlib.sha256(b"").hexdigest())),
             int(output.get("stderr_count", 0)), str(output.get("stderr_hash", hashlib.sha256(b"").hexdigest())),
             max(0, int((time.monotonic() - started) * 1000)),
+            True, True, active_before_scan, tuple(sorted(resource_violation_types)),
         )
 
     def _read(self, handle: int) -> bytes:
@@ -1410,9 +1572,9 @@ class _NativeWindowsJobObjectApi:
             time.sleep(0.01)
         return self._active_processes(job_handle) == 0
 
-    def _consume_job_notifications(self, job: object) -> bool:
+    def _consume_job_notifications(self, job: object) -> tuple[str, ...]:
         from ctypes import wintypes
-        violation = False
+        violation_types: set[str] = set()
         while True:
             message = wintypes.DWORD()
             key = ctypes.c_size_t()
@@ -1422,8 +1584,10 @@ class _NativeWindowsJobObjectApi:
                 if ctypes.get_last_error() == 258:  # WAIT_TIMEOUT: queue drained
                     break
                 self._check(okay, "Job Object completion query")
-            violation = violation or _is_resource_limit_notification(message.value)
-        return violation
+            violation_type = _resource_limit_notification_type(message.value)
+            if violation_type is not None:
+                violation_types.add(violation_type)
+        return tuple(sorted(violation_types))
 
     def _peak_job_memory(self, job_handle: int) -> int:
         from ctypes import wintypes

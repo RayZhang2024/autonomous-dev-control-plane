@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,6 +20,9 @@ from autodev_control.workplane.fixture_candidate_materializer import (
     MaterializationStatus,
 )
 from tests.integration import test_o2b_fixture_candidate_materialization as o2b_test
+
+
+FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
 
 class FakePreflight:
@@ -48,9 +53,18 @@ def _fixture_attestation(configuration: o2c.CodexCliConfiguration) -> o2c.CodexW
         ) for check_id in o2c.DEPLOYMENT_CHECKS
     )
     return o2c.CodexWorkerDeploymentAttestation(
-        "o2c-deployment-attestation/1", "dedicated_vm", o2c._current_worker_identity(),
-        configuration.expected_source_head_sha, configuration.absolute_codex_executable_path,
-        configuration.expected_codex_version, configuration.expected_codex_executable_sha256, evidence,
+        format_version="o2c-deployment-attestation/1",
+        worker_isolation_kind="dedicated_vm",
+        worker_identity=o2c._current_worker_identity(),
+        source_head_sha=configuration.expected_source_head_sha,
+        codex_executable_path=configuration.absolute_codex_executable_path,
+        codex_executable_version=configuration.expected_codex_version,
+        codex_executable_sha256=configuration.expected_codex_executable_sha256,
+        evidence_items=evidence,
+        attestation_id="b" * 64,
+        worker_environment_id=configuration.expected_worker_environment_id,
+        issued_at_utc=FIXED_NOW - timedelta(minutes=1),
+        expires_at_utc=FIXED_NOW + timedelta(minutes=1),
     )
 
 
@@ -70,7 +84,7 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     runner = FakeContainedRunner()
     configuration = o2c.CodexCliConfiguration(
             str(executable), "fixture-codex 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
-            str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value,
+            str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value, "fixture-environment-id",
         )
     producer = o2c.CodexCliCandidateProducer(
         configuration,
@@ -79,6 +93,7 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
         preflight=FakePreflight(),
         runner=runner,
         parent_environment=environment,
+        clock=lambda: FIXED_NOW,
     )
     produced = producer.invoke(b"add the requested fixture file")
     assert produced.status is ProducerStatus.SUCCESS
@@ -94,6 +109,26 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     )
     assert admitted.candidate_commit.value == materialized.candidate.candidate_commit_id
     assert admitted.mutation_inventory.mutations == o2b_test._independent_mutation_facts(base_snapshot, proposal)
+    record = _build_smoke_record(
+        producer._deployment, produced.untrusted_metadata, proposal,
+        materialized.candidate.candidate_commit_id, admitted.mutation_inventory.mutations,
+        source_head_before=o2b_test.BASE.value, source_head_after=o2b_test.BASE.value,
+        source_clean_before=True, source_clean_after=True,
+    )
+    assert set(record) == {
+        "deployment_attestation", "measured_runtime", "configured_requested_execution_profile",
+        "containment_result", "candidate_and_admission",
+    }
+    assert record["deployment_attestation"]["attestation_id"] == "b" * 64
+    assert record["deployment_attestation"]["worker_environment_id"] == "fixture-environment-id"
+    assert record["deployment_attestation"]["evidence_items"]
+    assert record["measured_runtime"]["codex_executable_sha256_before"] == record["measured_runtime"]["codex_executable_sha256_after"]
+    assert record["measured_runtime"]["candidate_workspace_git_present"] is False
+    assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
+    assert record["configured_requested_execution_profile"]["job_object_limits"]["kill_on_job_close"] is True
+    assert record["containment_result"]["job_assignment_succeeded"] is True
+    assert record["candidate_and_admission"]["o2b_candidate_commit_id"] == materialized.candidate.candidate_commit_id
+    assert "safe" not in record
 
 
 def _real_smoke_context() -> tuple[dict[str, object], Path]:
@@ -122,9 +157,113 @@ def _real_smoke_attestation(context: dict[str, object]) -> o2c.CodexWorkerDeploy
         if type(evidence) is not list:
             raise TypeError("evidence_items must be a JSON array")
         values["evidence_items"] = tuple(o2c.CodexDeploymentEvidence(**item) for item in evidence)
+        for key in ("issued_at_utc", "expires_at_utc"):
+            timestamp = values.get(key)
+            if type(timestamp) is not str or not timestamp.endswith("Z"):
+                raise ValueError(f"{key} must be an explicit UTC timestamp ending in Z")
+            values[key] = datetime.fromisoformat(timestamp[:-1] + "+00:00")
+            if values[key].tzinfo is not timezone.utc:
+                raise ValueError(f"{key} did not parse as UTC")
         return o2c.CodexWorkerDeploymentAttestation(**values)
     except (TypeError, ValueError) as error:
         pytest.fail(f"real-smoke deployment attestation is malformed: {error}")
+
+
+@pytest.mark.parametrize("missing_field", ("worker_environment_id", "issued_at_utc", "expires_at_utc"))
+def test_real_smoke_context_rejects_missing_attestation_freshness_fields(missing_field):
+    evidence = tuple(
+        o2c.CodexDeploymentEvidence(
+            check_id, "pass", "fixture", "offline-test",
+            hashlib.sha256(check_id.encode()).hexdigest(), f"fixture://{check_id}"
+        ) for check_id in o2c.DEPLOYMENT_CHECKS
+    )
+    valid = {
+        "format_version": "o2c-deployment-attestation/1",
+        "worker_isolation_kind": "dedicated_vm",
+        "worker_identity": o2c._current_worker_identity(),
+        "source_head_sha": "a" * 40,
+        "codex_executable_path": "C:\\fixture\\codex.exe",
+        "codex_executable_version": "fixture-codex",
+        "codex_executable_sha256": "b" * 64,
+        "evidence_items": [asdict(item) for item in evidence],
+        "attestation_id": "c" * 64,
+        "worker_environment_id": "fixture-environment",
+        "issued_at_utc": "2030-01-01T00:00:00Z",
+        "expires_at_utc": "2030-01-01T00:10:00Z",
+    }
+    valid.pop(missing_field)
+    with pytest.raises(pytest.fail.Exception):
+        _real_smoke_attestation({"deployment_attestation": valid})
+
+
+def _build_smoke_record(
+    attestation: o2c.CodexWorkerDeploymentAttestation,
+    metadata: o2c.CodexRunDiagnostics,
+    proposal: object,
+    candidate_commit_id: str,
+    mutation_inventory: tuple[object, ...],
+    *,
+    source_head_before: str,
+    source_head_after: str,
+    source_clean_before: bool,
+    source_clean_after: bool,
+) -> dict[str, object]:
+    evidence_items = [asdict(item) for item in attestation.evidence_items]
+    return {
+        "deployment_attestation": {
+            "attestation_id": attestation.attestation_id,
+            "worker_environment_id": attestation.worker_environment_id,
+            "issued_at_utc": attestation.issued_at_utc.isoformat().replace("+00:00", "Z"),
+            "expires_at_utc": attestation.expires_at_utc.isoformat().replace("+00:00", "Z"),
+            "worker_isolation_kind": attestation.worker_isolation_kind,
+            "worker_identity": attestation.worker_identity,
+            "source_head_sha": attestation.source_head_sha,
+            "codex_executable_path": attestation.codex_executable_path,
+            "codex_executable_version": attestation.codex_executable_version,
+            "codex_executable_sha256": attestation.codex_executable_sha256,
+            "evidence_items": evidence_items,
+            "trust_status": "untrusted work-plane evidence",
+        },
+        "measured_runtime": {
+            "source_head_before_and_after": {"before": source_head_before, "after": source_head_after},
+            "source_checkout_clean_before_and_after": {"before": source_clean_before, "after": source_clean_after},
+            "worker_identity": metadata.worker_identity_measured,
+            "worker_HOME_path": metadata.worker_home_path,
+            "worker_USERPROFILE_path": metadata.userprofile_path,
+            "worker_agents_clean_preflight": metadata.worker_agents_clean,
+            "CODEX_HOME_path": metadata.codex_home_path,
+            "CODEX_HOME_clean_preflight": metadata.codex_home_clean,
+            "codex_executable_absolute_path": attestation.codex_executable_path,
+            "codex_version": {"value": metadata.codex_version, "measured_before_task": metadata.codex_version_measured_before_task},
+            "codex_executable_sha256_before": metadata.codex_executable_sha256_before,
+            "codex_executable_sha256_after": metadata.codex_executable_sha256_after,
+            "effective_denied_feature_map": dict(metadata.measured_features),
+            "configured_mcp_server_count": metadata.measured_mcp_server_count,
+            "stdout": {"byte_count": metadata.stdout_byte_count, "sha256": metadata.stdout_sha256},
+            "stderr": {"byte_count": metadata.stderr_byte_count, "sha256": metadata.stderr_sha256},
+            "workspace_final_regular_file_count": metadata.workspace_file_count,
+            "proposal_change_count": metadata.proposal_change_count,
+            "candidate_workspace_git_present": metadata.candidate_workspace_git_present,
+        },
+        "configured_requested_execution_profile": asdict(o2c.configured_execution_profile()),
+        "containment_result": {
+            "job_assignment_succeeded": metadata.job_assignment_succeeded,
+            "root_process_resumed_after_assignment": metadata.root_process_resumed_after_assignment,
+            "root_exit_code": metadata.root_exit_code,
+            "descendant_quiescence_before_scan": metadata.process_tree_quiescent,
+            "active_process_count_before_scan": metadata.active_process_count_before_scan,
+            "resource_limit_violation": metadata.resource_limit_violation,
+            "resource_violation_types": list(metadata.resource_violation_types),
+        },
+        "candidate_and_admission": {
+            "proposal_base_revision": proposal.claimed_base_revision,
+            "proposal_changed_paths": [change.path for change in proposal.changes],
+            "o2b_candidate_commit_id": candidate_commit_id,
+            "trusted_admitted_mutation_inventory": [
+                {"path": fact.path.value, "kind": fact.kind.value} for fact in mutation_inventory
+            ],
+        },
+    }
 
 
 @pytest.mark.skipif(os.environ.get("O2C_REAL_SMOKE") != "1", reason="dedicated-worker Codex smoke is explicitly opt-in")
@@ -155,15 +294,19 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
     base_snapshot = o2b_test.project_exact_base(base_store, o2b_test.REPOSITORY, o2b_test.BASE)
     worker_home = os.environ.get("O2C_WORKER_HOME", "")
     codex_home = os.environ.get("CODEX_HOME", "")
+    worker_environment_id = os.environ.get("O2C_WORKER_ENVIRONMENT_ID", "")
     scratch_root = os.environ.get("O2C_SCRATCH_ROOT", "")
     executable = os.environ.get("O2C_CODEX_EXECUTABLE", "")
     version = os.environ.get("O2C_CODEX_VERSION", "")
     executable_hash = os.environ.get("O2C_CODEX_SHA256", "")
-    for value in (worker_home, codex_home, scratch_root, executable, version, executable_hash):
+    for value in (worker_home, codex_home, worker_environment_id, scratch_root, executable, version, executable_hash):
         if not value:
             pytest.fail("real-smoke Codex identity/home/scratch configuration is incomplete")
     environment = dict(os.environ)
-    configuration = o2c.CodexCliConfiguration(executable, version, executable_hash, worker_home, codex_home, scratch_root, 1800, expected_head)
+    configuration = o2c.CodexCliConfiguration(
+        executable, version, executable_hash, worker_home, codex_home, scratch_root, 1800,
+        expected_head, worker_environment_id,
+    )
     producer = o2c.CodexCliCandidateProducer(
         configuration,
         o2c.CodexWorkspaceSeed(o2b_test.BASE.value, (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"fixture input", "100644"),)),
@@ -191,47 +334,14 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
     if not source_clean_after:
         pytest.fail("real smoke modified the source checkout")
     metadata = result.untrusted_metadata
-    evidence_record = [
-        {
-            "check_id": item.check_id, "result": item.result, "evidence_kind": item.evidence_kind,
-            "origin": item.origin, "evidence_sha256": item.evidence_sha256, "reference": item.reference,
-        } for item in attestation.evidence_items
-    ]
-    record = {
-        "external_deployment_attestation": {
-            "format_version": attestation.format_version,
-            "worker_isolation_kind": attestation.worker_isolation_kind,
-            "worker_identity": attestation.worker_identity,
-            "source_head_sha": attestation.source_head_sha,
-            "codex_executable_path": attestation.codex_executable_path,
-            "codex_executable_version": attestation.codex_executable_version,
-            "codex_executable_sha256": attestation.codex_executable_sha256,
-            "evidence_items": evidence_record,
-            "trust_status": "untrusted work-plane evidence",
-        },
-        "measured_runtime": {
-            "source_head_before_and_after": {"before": started_head, "after": source_head_after},
-            "source_checkout_clean_before_and_after": {"before": source_clean_before, "after": source_clean_after},
-            "codex_executable_path": executable,
-            "codex_version": metadata.codex_version,
-            "codex_executable_sha256": metadata.codex_executable_sha256,
-            "effective_denied_capabilities": [name for name, enabled in metadata.measured_features if name in o2c.CAPABILITY_DENY_SET and not enabled],
-            "measured_features": [{"name": name, "enabled": enabled} for name, enabled in metadata.measured_features],
-            "mcp_server_count": metadata.measured_mcp_server_count,
-            "job_limits": {"max_active_processes": metadata.job_limits[0], "max_job_memory_bytes": metadata.job_limits[1], "cpu_hard_cap_percent": metadata.job_limits[2]},
-            "process_tree_quiescent": metadata.process_tree_quiescent,
-            "resource_limit_violation": metadata.resource_limit_violation,
-            "task_output": {"stdout_byte_count": metadata.stdout_byte_count, "stdout_sha256": metadata.stdout_sha256,
-                            "stderr_byte_count": metadata.stderr_byte_count, "stderr_sha256": metadata.stderr_sha256},
-        },
-        "candidate_and_admission": {
-            "producer_status": result.status.value,
-            "proposal_base_revision": result.candidate_proposal.base_revision,
-            "proposal": [{"kind": change.kind.value, "path": change.path} for change in result.candidate_proposal.changes],
-            "o2b_candidate_commit_id": materialized.candidate.candidate_commit_id,
-            "trusted_mutation_inventory": [{"path": fact.path.value, "kind": fact.kind.value} for fact in admitted.mutation_inventory.mutations],
-        },
-        "real_smoke": "completed; no publication or merge performed",
-    }
+    record = _build_smoke_record(
+        attestation, metadata, result.candidate_proposal,
+        materialized.candidate.candidate_commit_id,
+        admitted.mutation_inventory.mutations,
+        source_head_before=started_head,
+        source_head_after=source_head_after,
+        source_clean_before=source_clean_before,
+        source_clean_after=source_clean_after,
+    )
     output_file.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     assert output_file.is_file()

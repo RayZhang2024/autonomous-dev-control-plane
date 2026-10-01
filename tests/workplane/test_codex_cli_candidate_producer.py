@@ -5,11 +5,16 @@ import os
 from pathlib import Path
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import autodev_control.workplane.codex_cli_candidate_producer as o2c
 from autodev_control.workplane.candidate_producer import ProducerStatus, ProposedChangeKind
+
+
+FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
+WORKER_ENVIRONMENT_ID = "fixture-vm-instance-01"
 
 
 class FakePreflight:
@@ -53,6 +58,10 @@ class FakeRunner:
             return outcome(root_exit_code=7)
         if self.status == "violation":
             return outcome(resource_limit_violation=True)
+        if self.status == "no-assignment":
+            return outcome(job_assignment_succeeded=False)
+        if self.status == "not-resumed":
+            return outcome(root_process_resumed_after_assignment=False)
         if self.status == "large-output":
             data = b"x" * 100_000
             return outcome(stdout_byte_count=len(data), stdout_sha256=hashlib.sha256(data).hexdigest(),
@@ -76,11 +85,15 @@ def outcome(**overrides):
     return o2c.ContainedExecutionOutcome(**values)
 
 
-def deployment(configuration, **overrides):
+def deployment(configuration, *, now=FIXED_NOW, **overrides):
     values = dict(
         format_version="o2c-deployment-attestation/1",
         worker_isolation_kind="dedicated_vm",
         worker_identity=o2c._current_worker_identity(),
+        attestation_id="a" * 64,
+        worker_environment_id=configuration.expected_worker_environment_id,
+        issued_at_utc=now - timedelta(minutes=1),
+        expires_at_utc=now + timedelta(minutes=1),
         source_head_sha=configuration.expected_source_head_sha,
         codex_executable_path=configuration.absolute_codex_executable_path,
         codex_executable_version=configuration.expected_codex_version,
@@ -96,7 +109,7 @@ def deployment(configuration, **overrides):
     return o2c.CodexWorkerDeploymentAttestation(**values)
 
 
-def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_facts=None):
+def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_facts=None, clock=None):
     worker_home = tmp_path / "worker-home"
     codex_home = worker_home / ".codex-worker"
     scratch_root = tmp_path / "scratch"
@@ -106,7 +119,7 @@ def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_f
     executable.write_bytes(b"pinned codex executable fixture")
     config = o2c.CodexCliConfiguration(
         str(executable), "codex 1.2.3", hashlib.sha256(executable.read_bytes()).hexdigest(),
-        str(worker_home), str(codex_home), str(scratch_root), 30, "a" * 40,
+        str(worker_home), str(codex_home), str(scratch_root), 30, "a" * 40, WORKER_ENVIRONMENT_ID,
     )
     environment = {"HOME": str(worker_home), "USERPROFILE": str(worker_home), "CODEX_HOME": str(codex_home), "PATH": "safe-path", "OPENAI_API_KEY": "must-not-leak", "GH_TOKEN": "must-not-leak", "TEMP": "operator-temp", "TMP": "operator-tmp"}
     producer = o2c.CodexCliCandidateProducer(
@@ -116,6 +129,7 @@ def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_f
         preflight=preflight or FakePreflight(),
         runner=runner or FakeRunner(),
         parent_environment=environment,
+        clock=clock or (lambda: FIXED_NOW),
     )
     return producer, executable, environment
 
@@ -169,6 +183,8 @@ def test_invalid_or_oversized_request_fails_before_one_task_attempt(tmp_path, re
     ("timeout", ProducerStatus.TIMEOUT),
     ("nonzero", ProducerStatus.PRODUCER_ERROR),
     ("violation", ProducerStatus.PRODUCER_ERROR),
+    ("no-assignment", ProducerStatus.PRODUCER_ERROR),
+    ("not-resumed", ProducerStatus.PRODUCER_ERROR),
 ])
 def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, expected):
     runner = FakeRunner(status=status, mutate=lambda root: (root / "partial.py").write_text("partial"))
@@ -302,7 +318,7 @@ def test_executable_must_be_absolute_exact_exe_with_configured_hash(tmp_path):
         o2c._validate_configuration(o2c.CodexCliConfiguration(
             "codex.exe", configuration.expected_codex_version, configuration.expected_codex_executable_sha256,
             configuration.worker_home, configuration.codex_home, configuration.scratch_root, configuration.timeout_seconds,
-            configuration.expected_source_head_sha,
+            configuration.expected_source_head_sha, configuration.expected_worker_environment_id,
         ))
 
 
@@ -315,6 +331,14 @@ def test_frozen_command_profile_and_environment_allowlist():
     assert child["TEMP"] == child["TMP"] == "runtime"
     assert child["PATH"] == "p"
     assert not ({"OPENAI_API_KEY", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY"} & child.keys())
+    profile = o2c.configured_execution_profile()
+    assert profile.sandbox_profile == "workspace-write"
+    assert profile.approval_policy == "never" and profile.shell_network is False
+    assert profile.web_search_requested == "disabled" and profile.extra_writable_roots == ()
+    assert profile.sandbox_tmp_writability_exclusions_enabled
+    assert profile.auth_credential_store_requested == "keyring" and profile.login_method_requested == "chatgpt"
+    assert profile.ephemeral and profile.ignore_user_config and profile.ignore_rules
+    assert profile.job_object_limits == o2c.JobObjectLimits(True, False, False, 64, 4_294_967_296, 80)
 
 
 def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_path):
@@ -392,17 +416,117 @@ def test_deployment_attestation_requires_complete_consistent_bound_evidence(tmp_
 
     producer, executable, _ = configured(tmp_path)
     attestation = deployment(producer._configuration)
-    o2c._validate_deployment(attestation, producer._configuration, o2c._current_worker_identity(), hashlib.sha256(executable.read_bytes()).hexdigest())
+    o2c._validate_deployment(attestation, producer._configuration, o2c._current_worker_identity(), hashlib.sha256(executable.read_bytes()).hexdigest(), FIXED_NOW)
     bad_items = attestation.evidence_items[:-1]
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_deployment(replace(attestation, evidence_items=bad_items), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+        o2c._validate_deployment(replace(attestation, evidence_items=bad_items), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256, FIXED_NOW)
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_deployment(replace(attestation, source_head_sha="b" * 40), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+        o2c._validate_deployment(replace(attestation, source_head_sha="b" * 40), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256, FIXED_NOW)
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_deployment(replace(attestation, codex_executable_sha256="0" * 64), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+        o2c._validate_deployment(replace(attestation, codex_executable_sha256="0" * 64), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256, FIXED_NOW)
     conflicting = replace(attestation.evidence_items[0], result="fail")
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_deployment(replace(attestation, evidence_items=(conflicting, *attestation.evidence_items[1:])), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+        o2c._validate_deployment(replace(attestation, evidence_items=(conflicting, *attestation.evidence_items[1:])), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256, FIXED_NOW)
+
+
+@pytest.mark.parametrize("mutation", [
+    {"expires_at_utc": FIXED_NOW - timedelta(seconds=1)},
+    {"issued_at_utc": FIXED_NOW + timedelta(seconds=o2c.MAX_ATTESTATION_FUTURE_SKEW_SECONDS + 1)},
+    {"expires_at_utc": FIXED_NOW + timedelta(seconds=o2c.MAX_ATTESTATION_VALIDITY_SECONDS + 1)},
+    {"expires_at_utc": FIXED_NOW - timedelta(minutes=1), "issued_at_utc": FIXED_NOW - timedelta(minutes=1)},
+    {"worker_environment_id": ""},
+    {"worker_environment_id": "wrong-environment"},
+    {"source_head_sha": "b" * 40},
+    {"codex_executable_path": "C:\\different\\codex.exe"},
+    {"codex_executable_version": "codex 9.9"},
+    {"codex_executable_sha256": "0" * 64},
+    {"issued_at_utc": datetime(2030, 1, 1)},
+    {"issued_at_utc": datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=1)))},
+    {"attestation_id": "not-an-immutable-id"},
+])
+def test_deployment_attestation_freshness_and_binding_rejects_invalid_values(tmp_path, mutation):
+    from dataclasses import replace
+
+    producer, executable, _ = configured(tmp_path)
+    attestation = replace(deployment(producer._configuration), **mutation)
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(
+            attestation, producer._configuration, o2c._current_worker_identity(),
+            hashlib.sha256(executable.read_bytes()).hexdigest(), FIXED_NOW,
+        )
+
+
+def test_deployment_attestation_accepts_maximum_window_and_future_skew_boundary(tmp_path):
+    from dataclasses import replace
+
+    producer, executable, _ = configured(tmp_path)
+    issued = FIXED_NOW + timedelta(seconds=o2c.MAX_ATTESTATION_FUTURE_SKEW_SECONDS)
+    attestation = replace(
+        deployment(producer._configuration),
+        issued_at_utc=issued,
+        expires_at_utc=issued + timedelta(seconds=o2c.MAX_ATTESTATION_VALIDITY_SECONDS),
+    )
+    o2c._validate_deployment(
+        attestation, producer._configuration, o2c._current_worker_identity(),
+        hashlib.sha256(executable.read_bytes()).hexdigest(), FIXED_NOW,
+    )
+
+
+def test_deployment_attestation_rejects_issue_beyond_future_skew(tmp_path):
+    from dataclasses import replace
+
+    producer, executable, _ = configured(tmp_path)
+    issued = FIXED_NOW + timedelta(seconds=o2c.MAX_ATTESTATION_FUTURE_SKEW_SECONDS + 1)
+    attestation = replace(
+        deployment(producer._configuration), issued_at_utc=issued,
+        expires_at_utc=issued + timedelta(seconds=60),
+    )
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(
+            attestation, producer._configuration, o2c._current_worker_identity(),
+            hashlib.sha256(executable.read_bytes()).hexdigest(), FIXED_NOW,
+        )
+
+
+def test_expired_attestation_fails_before_provider_attempt(tmp_path):
+    from dataclasses import replace
+
+    producer, _, _ = configured(tmp_path)
+    producer._deployment = replace(
+        producer._deployment,
+        issued_at_utc=FIXED_NOW - timedelta(hours=1),
+        expires_at_utc=FIXED_NOW - timedelta(seconds=1),
+    )
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert producer.task_attempt_count == 0
+
+
+def test_attestation_expiring_during_preflight_fails_before_task_attempt(tmp_path):
+    times = iter((FIXED_NOW, FIXED_NOW + timedelta(minutes=2)))
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, runner=runner, clock=lambda: next(times))
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 0
+
+
+def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
+    class DuplicateFeaturePreflight(FakePreflight):
+        def inspect(self, *args):
+            self.calls += 1
+            duplicate_rows = o2c._feature_rows(b"apps stable false\napps stable true\n")
+            remaining = tuple((name, False) for name in o2c.CAPABILITY_DENY_SET if name != "apps")
+            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0)
+
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, preflight=DuplicateFeaturePreflight(), runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 0
 
 
 class FakeJobApi:
