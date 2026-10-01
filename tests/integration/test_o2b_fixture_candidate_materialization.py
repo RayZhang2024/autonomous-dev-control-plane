@@ -16,11 +16,13 @@ from autodev_control.trusted.materialization import (
     FixtureGitObjectStore,
     FixtureGitTree,
     FixtureGitTreeEntry,
+    GitBlobMode,
     GitObjectKind,
+    MutationFact,
     MutationKind,
 )
 from autodev_control.trusted.operation import CandidateId
-from autodev_control.trusted.scope import GitHubRepositoryId
+from autodev_control.trusted.scope import CanonicalGitPath, GitHubRepositoryId
 from autodev_control.workplane.candidate_producer import (
     CandidateProposal,
     ProposedChangeKind,
@@ -30,6 +32,7 @@ from autodev_control.workplane.fixture_candidate_materializer import (
     DeterministicFixtureCandidateMaterializer,
     FixtureBaseLeaf,
     FixtureBaseSnapshot,
+    FixtureObjectKind,
     FixtureMaterializedBlob,
     FixtureMaterializedCandidate,
     FixtureMaterializedTree,
@@ -59,6 +62,7 @@ NESTED_TREE_ID = GitSha("e" * 40)
 BASE_KEEP_BLOB = GitSha("1" * 40)
 BASE_OLD_BLOB = GitSha("2" * 40)
 UNAVAILABLE = GitSha("f" * 40)
+_FIXTURE_GIT_OBJECT_STORE_TYPE = FixtureGitObjectStore
 
 
 def base_only_store() -> FixtureGitObjectStore:
@@ -99,7 +103,7 @@ def project_exact_base(
     expected_base: GitSha,
 ) -> FixtureBaseSnapshot:
     """Project only reachable leaves from the exact base-only trusted fixture."""
-    assert type(store) is FixtureGitObjectStore
+    assert type(store) is _FIXTURE_GIT_OBJECT_STORE_TYPE
     assert store.repository_id == expected_repository_id
     assert len(store.commits) == 1
     commit = store.commit(expected_base)
@@ -277,6 +281,53 @@ def _expected_materialization(
     return final_files, created, expected_trees
 
 
+def _independent_mutation_facts(
+    base_snapshot: FixtureBaseSnapshot,
+    proposal: CandidateProposal,
+) -> tuple[MutationFact, ...]:
+    """Build complete expected facts from fixture inputs without trusted derivation."""
+    base_files = {
+        leaf.path: (leaf.mode, leaf.object_id)
+        for leaf in base_snapshot.leaves
+    }
+    final_files, _, _ = _expected_materialization(base_snapshot, proposal)
+    facts: list[MutationFact] = []
+    for path in sorted(base_files.keys() | final_files.keys()):
+        before = base_files.get(path)
+        after = final_files.get(path)
+        if before == after:
+            continue
+        if before is None:
+            assert after is not None
+            facts.append(MutationFact(
+                CanonicalGitPath(path),
+                MutationKind.ADDED,
+                None,
+                GitSha(after[1]),
+                None,
+                GitBlobMode(after[0]),
+            ))
+        elif after is None:
+            facts.append(MutationFact(
+                CanonicalGitPath(path),
+                MutationKind.DELETED,
+                GitSha(before[1]),
+                None,
+                GitBlobMode(before[0]),
+                None,
+            ))
+        else:
+            facts.append(MutationFact(
+                CanonicalGitPath(path),
+                MutationKind.MODIFIED,
+                GitSha(before[1]),
+                GitSha(after[1]),
+                GitBlobMode(before[0]),
+                GitBlobMode(after[0]),
+            ))
+    return tuple(facts)
+
+
 def independently_verify_and_combine(
     base_store: FixtureGitObjectStore,
     base_snapshot: FixtureBaseSnapshot,
@@ -285,9 +336,34 @@ def independently_verify_and_combine(
 ) -> FixtureGitObjectStore:
     """Verify content, reachable trees, identities and closure before conversion."""
     assert type(result) is MaterializationResult
+    assert type(result.status) is MaterializationStatus
     assert result.status is MaterializationStatus.MATERIALIZED
     assert type(result.candidate) is FixtureMaterializedCandidate
     candidate = result.candidate
+    assert type(candidate.repository_id) is str
+    assert type(candidate.base_revision) is str
+    assert type(candidate.candidate_commit_id) is str
+    assert type(candidate.result_tree_id) is str
+    assert type(candidate.candidate_trees) is tuple
+    assert type(candidate.created_blobs) is tuple
+    for tree in candidate.candidate_trees:
+        assert type(tree) is FixtureMaterializedTree
+        assert type(tree.directory_path) is str
+        assert type(tree.tree_id) is str
+        assert type(tree.entries) is tuple
+        for entry in tree.entries:
+            assert type(entry) is FixtureMaterializedTreeEntry
+            assert type(entry.name) is str
+            assert type(entry.mode) is str
+            assert type(entry.object_id) is str
+            if type(entry.object_kind) is not FixtureObjectKind:
+                raise AssertionError("entry object kind must be exact FixtureObjectKind")
+            if entry.object_kind is not FixtureObjectKind.BLOB and entry.object_kind is not FixtureObjectKind.TREE:
+                raise AssertionError("entry object kind is outside the frozen O2b enum")
+    for blob in candidate.created_blobs:
+        assert type(blob) is FixtureMaterializedBlob
+        assert type(blob.object_id) is str
+        assert type(blob.content_bytes) is bytes
     assert base_store.repository_id.value == base_snapshot.repository_id
     assert candidate.repository_id == base_snapshot.repository_id
     assert candidate.base_revision == base_snapshot.expected_base_revision
@@ -326,12 +402,15 @@ def independently_verify_and_combine(
         prior_name_bytes: bytes | None = None
         entry_hashes: list[bytes] = []
         for entry in tree.entries:
-            assert type(entry) is FixtureMaterializedTreeEntry
             name_bytes = entry.name.encode("utf-8")
             assert prior_name_bytes is None or prior_name_bytes < name_bytes
             prior_name_bytes = name_bytes
-            kind = "BLOB" if entry.object_kind.name == "BLOB" else "TREE"
-            assert kind in ("BLOB", "TREE")
+            if entry.object_kind is FixtureObjectKind.BLOB:
+                kind = "BLOB"
+            elif entry.object_kind is FixtureObjectKind.TREE:
+                kind = "TREE"
+            else:
+                raise AssertionError("entry object kind is outside the frozen O2b enum")
             actual_specs.append((entry.name, kind, entry.mode, entry.object_id))
             entry_hashes.append(_independent_digest(
                 TEST_TREE_ENTRY_DOMAIN,
@@ -363,14 +442,15 @@ def independently_verify_and_combine(
         for entry in tree.entries:
             path = entry.name if not directory else directory + "/" + entry.name
             _independent_path(path)
-            if entry.object_kind.name == "TREE":
+            if entry.object_kind is FixtureObjectKind.TREE:
                 assert entry.mode == "040000"
                 visit_tree(entry.object_id, path)
-            else:
-                assert entry.object_kind.name == "BLOB"
+            elif entry.object_kind is FixtureObjectKind.BLOB:
                 assert entry.mode in ("100644", "100755")
                 assert path not in actual_leaves
                 actual_leaves[path] = (entry.mode, entry.object_id)
+            else:
+                raise AssertionError("entry object kind is outside the frozen O2b enum")
 
     visit_tree(candidate.result_tree_id, "")
     assert reachable_ids == set(actual_trees_by_id)
@@ -383,8 +463,6 @@ def independently_verify_and_combine(
     assert len(blob_ids) == len(set(blob_ids))
     assert set(blob_ids) == set(expected_created)
     for blob in candidate.created_blobs:
-        assert type(blob) is FixtureMaterializedBlob
-        assert type(blob.content_bytes) is bytes
         assert _independent_digest(TEST_BLOB_DOMAIN, blob.content_bytes) == blob.object_id
         assert blob.content_bytes == expected_created[blob.object_id]
         assert blob.object_id in referenced_blob_ids
@@ -404,17 +482,25 @@ def independently_verify_and_combine(
 
     trees_by_id = {item.tree_id: item for item in base_store.trees}
     for materialized in candidate.candidate_trees:
+        converted_entries = []
+        for entry in materialized.entries:
+            if type(entry.object_kind) is not FixtureObjectKind:
+                raise AssertionError("entry object kind must be exact FixtureObjectKind")
+            if entry.object_kind is FixtureObjectKind.BLOB:
+                trusted_kind = GitObjectKind.BLOB
+            elif entry.object_kind is FixtureObjectKind.TREE:
+                trusted_kind = GitObjectKind.TREE
+            else:
+                raise AssertionError("entry object kind is outside the frozen O2b enum")
+            converted_entries.append(FixtureGitTreeEntry(
+                entry.name,
+                trusted_kind,
+                entry.mode,
+                GitSha(entry.object_id),
+            ))
         converted = FixtureGitTree(
             tree_id=GitSha(materialized.tree_id),
-            entries=tuple(
-                FixtureGitTreeEntry(
-                    entry.name,
-                    GitObjectKind.BLOB if entry.object_kind.name == "BLOB" else GitObjectKind.TREE,
-                    entry.mode,
-                    GitSha(entry.object_id),
-                )
-                for entry in materialized.entries
-            ),
+            entries=tuple(converted_entries),
         )
         existing = trees_by_id.get(converted.tree_id)
         assert existing is None or existing == converted
@@ -465,7 +551,7 @@ def proposal_for_integration() -> CandidateProposal:
         BASE.value,
         (
             ProposedFileChange(ProposedChangeKind.ADD, "new.txt", b"new bytes", "100644"),
-            ProposedFileChange(ProposedChangeKind.REPLACE, "src/old.txt", b"updated", None),
+            ProposedFileChange(ProposedChangeKind.REPLACE, "src/old.txt", b"updated", "100644"),
             ProposedFileChange(ProposedChangeKind.DELETE, "keep.txt", None, None),
             ProposedFileChange(ProposedChangeKind.ADD, "src/new.txt", b"new bytes", "100755"),
         ),
@@ -525,7 +611,7 @@ def tamper_blob_entry_id(result: MaterializationResult) -> MaterializationResult
     for tree in result.candidate.candidate_trees:
         entries = tuple(
             replace(entry, object_id="f" * 64)
-            if entry.object_kind.name == "BLOB" and entry.name == "new.txt"
+            if entry.object_kind is FixtureObjectKind.BLOB and entry.name == "new.txt"
             else entry
             for entry in tree.entries
         )
@@ -538,7 +624,7 @@ def tamper_blob_entry_mode(result: MaterializationResult) -> MaterializationResu
     for tree in result.candidate.candidate_trees:
         entries = tuple(
             replace(entry, mode="100755")
-            if entry.object_kind.name == "BLOB" and entry.name == "new.txt"
+            if entry.object_kind is FixtureObjectKind.BLOB and entry.name == "new.txt"
             else entry
             for entry in tree.entries
         )
@@ -551,7 +637,7 @@ def tamper_tree_child_id(result: MaterializationResult) -> MaterializationResult
     for tree in result.candidate.candidate_trees:
         entries = tuple(
             replace(entry, object_id="f" * 64)
-            if entry.object_kind.name == "TREE"
+            if entry.object_kind is FixtureObjectKind.TREE
             else entry
             for entry in tree.entries
         )
@@ -589,6 +675,22 @@ def tamper_extra_blob(result: MaterializationResult) -> MaterializationResult:
     return _replace_candidate(result, blobs=result.candidate.created_blobs + (extra,))
 
 
+def tamper_lookalike_object_kind(result: MaterializationResult) -> MaterializationResult:
+    class LookalikeBlobKind:
+        name = "BLOB"
+
+    trees = []
+    for tree in result.candidate.candidate_trees:
+        entries = tuple(
+            replace(entry, object_kind=LookalikeBlobKind())
+            if entry.object_kind is FixtureObjectKind.BLOB and entry.name == "new.txt"
+            else entry
+            for entry in tree.entries
+        )
+        trees.append(replace(tree, entries=entries))
+    return _replace_candidate(result, trees=tuple(trees))
+
+
 @pytest.mark.parametrize(
     "tamper",
     [
@@ -613,6 +715,55 @@ def test_independent_installation_rejects_each_tampered_result_category(tamper) 
         independently_verify_and_combine(store, projected, proposal, tampered)
 
 
+def test_independent_installation_rejects_lookalike_object_kind_before_store_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, projected, proposal, result = successful_fixture()
+    tampered = tamper_lookalike_object_kind(result)
+
+    def unexpected_store_construction(**kwargs):
+        raise RuntimeError("unverified graph reached combined-store construction")
+
+    monkeypatch.setitem(globals(), "FixtureGitObjectStore", unexpected_store_construction)
+    with pytest.raises(AssertionError, match="exact FixtureObjectKind"):
+        independently_verify_and_combine(store, projected, proposal, tampered)
+
+
+def _trusted_admit_candidate(
+    base_store: FixtureGitObjectStore,
+    combined_store: FixtureGitObjectStore,
+    candidate_commit_id: str,
+    candidate_id_value: str,
+):
+    runtime = gates_fixture.runtime(object_store=base_store)
+    gates_fixture.initialize_task(runtime)
+    with runtime.registry.lock:
+        assert not runtime.registry._live
+        runtime._object_store = combined_store
+        restarted_runtime = runtime.restart()
+    assert restarted_runtime is not None
+    runtime = restarted_runtime
+
+    candidate_id = CandidateId(candidate_id_value)
+    request = runtime.boundary.record_candidate_truth(
+        task_id=gates_fixture.TASK,
+        candidate_id=candidate_id,
+        candidate_commit_id=GitSha(candidate_commit_id),
+    )
+    commit_result = ControlStateGate(runtime.control_state_client).commit(
+        request, gates_fixture.independent_lease(runtime)
+    )
+    assert commit_result.code is GateResultCode.COMMITTED
+
+    recorded_candidate = runtime.backend.read_candidate(candidate_id)
+    assert recorded_candidate is not None
+    admitted = runtime.backend.read_candidate_materialization(
+        recorded_candidate.materialization_id
+    )
+    assert admitted is not None
+    return admitted
+
+
 def test_o2b_linkage_to_existing_trusted_exhaustive_admission() -> None:
     _assert_independent_golden_vectors()
     base_store = base_only_store()
@@ -627,42 +778,42 @@ def test_o2b_linkage_to_existing_trusted_exhaustive_admission() -> None:
         base_store, base_snapshot, proposal, result
     )
 
-    runtime = gates_fixture.runtime(object_store=base_store)
-    gates_fixture.initialize_task(runtime)
-    with runtime.registry.lock:
-        assert not runtime.registry._live
-        runtime._object_store = combined_store
-        restarted_runtime = runtime.restart()
-    assert restarted_runtime is not None
-    runtime = restarted_runtime
-
-    candidate_id = CandidateId("issue67-o2b-candidate")
-    request = runtime.boundary.record_candidate_truth(
-        task_id=gates_fixture.TASK,
-        candidate_id=candidate_id,
-        candidate_commit_id=GitSha(result.candidate.candidate_commit_id),
+    admitted = _trusted_admit_candidate(
+        base_store,
+        combined_store,
+        result.candidate.candidate_commit_id,
+        "issue67-o2b-candidate",
     )
-    commit_result = ControlStateGate(runtime.control_state_client).commit(
-        request, gates_fixture.independent_lease(runtime)
-    )
-    assert commit_result.code is GateResultCode.COMMITTED
-
-    recorded_candidate = runtime.backend.read_candidate(candidate_id)
-    assert recorded_candidate is not None
-    admitted = runtime.backend.read_candidate_materialization(
-        recorded_candidate.materialization_id
-    )
-    assert admitted is not None
     assert admitted.candidate_commit == GitSha(result.candidate.candidate_commit_id)
-
-    actual_inventory = {
-        fact.path.value: fact.kind
-        for fact in admitted.mutation_inventory.mutations
-    }
-    expected_inventory = {
-        "keep.txt": MutationKind.DELETED,
-        "new.txt": MutationKind.ADDED,
-        "src/new.txt": MutationKind.ADDED,
-        "src/old.txt": MutationKind.MODIFIED,
-    }
+    expected_inventory = _independent_mutation_facts(base_snapshot, proposal)
+    actual_inventory = admitted.mutation_inventory.mutations
+    assert len(actual_inventory) == len(expected_inventory)
+    assert tuple(fact.path.value for fact in actual_inventory) == tuple(
+        fact.path.value for fact in expected_inventory
+    )
     assert actual_inventory == expected_inventory
+
+
+def test_empty_proposal_has_exactly_empty_trusted_inventory() -> None:
+    base_store = base_only_store()
+    base_snapshot = project_exact_base(base_store, REPOSITORY, BASE)
+    proposal = CandidateProposal(BASE.value, ())
+    result = DeterministicFixtureCandidateMaterializer().materialize(
+        proposal, base_snapshot
+    )
+    assert result.status is MaterializationStatus.MATERIALIZED
+    assert result.candidate is not None
+    combined_store = independently_verify_and_combine(
+        base_store, base_snapshot, proposal, result
+    )
+
+    admitted = _trusted_admit_candidate(
+        base_store,
+        combined_store,
+        result.candidate.candidate_commit_id,
+        "issue67-o2b-empty-candidate",
+    )
+
+    assert admitted.candidate_commit == GitSha(result.candidate.candidate_commit_id)
+    # Empty inventory is a fixture observation only; this asserts no completion or success state.
+    assert admitted.mutation_inventory.mutations == ()
