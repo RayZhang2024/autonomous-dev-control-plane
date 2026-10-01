@@ -23,7 +23,7 @@ from tests.integration import test_o2b_fixture_candidate_materialization as o2b_
 class FakePreflight:
     def inspect(self, *args):
         return o2c.CodexEffectiveState(
-            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "disabled", False, True, True, ()
+            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0
         )
 
 
@@ -40,10 +40,17 @@ class FakeContainedRunner:
         )
 
 
-def _deployment() -> o2c.CodexWorkerDeployment:
-    return o2c.CodexWorkerDeployment(
-        "dedicated_vm", True, True, True, True, True, True, True, True, True,
-        "keyring", "chatgpt", True, True, (), True, "disabled",
+def _fixture_attestation(configuration: o2c.CodexCliConfiguration) -> o2c.CodexWorkerDeploymentAttestation:
+    evidence = tuple(
+        o2c.CodexDeploymentEvidence(
+            check_id, "pass", "fixture", "offline-integration-fixture",
+            hashlib.sha256(check_id.encode()).hexdigest(), f"fixture://{check_id}"
+        ) for check_id in o2c.DEPLOYMENT_CHECKS
+    )
+    return o2c.CodexWorkerDeploymentAttestation(
+        "o2c-deployment-attestation/1", "dedicated_vm", o2c._current_worker_identity(),
+        configuration.expected_source_head_sha, configuration.absolute_codex_executable_path,
+        configuration.expected_codex_version, configuration.expected_codex_executable_sha256, evidence,
     )
 
 
@@ -61,13 +68,14 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
         (o2c.CodexWorkspaceFile("o2c-input.txt", b"input", "100644"),),
     )
     runner = FakeContainedRunner()
-    producer = o2c.CodexCliCandidateProducer(
-        o2c.CodexCliConfiguration(
+    configuration = o2c.CodexCliConfiguration(
             str(executable), "fixture-codex 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
-            str(worker_home), str(codex_home), str(scratch_root), 30,
-        ),
+            str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value,
+        )
+    producer = o2c.CodexCliCandidateProducer(
+        configuration,
         seed,
-        _deployment(),
+        _fixture_attestation(configuration),
         preflight=FakePreflight(),
         runner=runner,
         parent_environment=environment,
@@ -104,22 +112,26 @@ def _real_smoke_context() -> tuple[dict[str, object], Path]:
     return context, context_path
 
 
+def _real_smoke_attestation(context: dict[str, object]) -> o2c.CodexWorkerDeploymentAttestation:
+    raw = context.get("deployment_attestation")
+    if type(raw) is not dict:
+        pytest.fail("real-smoke context lacks structured deployment_attestation")
+    try:
+        values = dict(raw)
+        evidence = values.get("evidence_items")
+        if type(evidence) is not list:
+            raise TypeError("evidence_items must be a JSON array")
+        values["evidence_items"] = tuple(o2c.CodexDeploymentEvidence(**item) for item in evidence)
+        return o2c.CodexWorkerDeploymentAttestation(**values)
+    except (TypeError, ValueError) as error:
+        pytest.fail(f"real-smoke deployment attestation is malformed: {error}")
+
+
 @pytest.mark.skipif(os.environ.get("O2C_REAL_SMOKE") != "1", reason="dedicated-worker Codex smoke is explicitly opt-in")
 def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tmp_path):
     """Run only on a manually prepared dedicated worker and write its complete record."""
     context, context_path = _real_smoke_context()
-    required_true = (
-        "read_isolated_worker", "non_admin_worker", "clean_worker_home", "clean_codex_home",
-        "dedicated_codex_principal", "principal_inference_only", "principal_no_target_control_root_rights",
-        "no_unrelated_private_apps_or_data", "credential_may_be_accessible", "mcp_configuration_sources_absent",
-        "managed_system_policy_inspected", "exec_policy_rules_absent",
-    )
-    if any(context.get(name) is not True for name in required_true):
-        pytest.fail("real-smoke context does not establish every frozen dedicated-worker prerequisite")
-    if context.get("managed_system_external_broadening") != [] or context.get("effective_web_search_mode") != "disabled":
-        pytest.fail("real-smoke context reports external capability broadening")
-    if context.get("keyring_credentials_store") != "keyring" or context.get("forced_login_method") != "chatgpt":
-        pytest.fail("real-smoke authentication profile is incompatible")
+    attestation = _real_smoke_attestation(context)
     expected_head = context.get("exact_pr_head_sha")
     if type(expected_head) is not str or len(expected_head) not in (40, 64) or any(char not in "0123456789abcdef" for char in expected_head):
         pytest.fail("real-smoke context is missing exact published PR-head SHA")
@@ -129,7 +141,8 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
     actual_head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
     if actual_head != expected_head:
         pytest.fail("checked-out source does not equal the exact published PR head")
-    if subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip():
+    source_clean_before = not subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
+    if not source_clean_before:
         pytest.fail("real smoke requires a clean source checkout before invocation")
 
     request_file = Path(os.environ.get("O2C_REAL_REQUEST_FILE", ""))
@@ -150,11 +163,11 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
         if not value:
             pytest.fail("real-smoke Codex identity/home/scratch configuration is incomplete")
     environment = dict(os.environ)
-    deployment = _deployment()
+    configuration = o2c.CodexCliConfiguration(executable, version, executable_hash, worker_home, codex_home, scratch_root, 1800, expected_head)
     producer = o2c.CodexCliCandidateProducer(
-        o2c.CodexCliConfiguration(executable, version, executable_hash, worker_home, codex_home, scratch_root, 1800),
+        configuration,
         o2c.CodexWorkspaceSeed(o2b_test.BASE.value, (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"fixture input", "100644"),)),
-        deployment,
+        attestation,
         parent_environment=environment,
     )
     started_head = actual_head
@@ -171,35 +184,53 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
     expected_inventory = o2b_test._independent_mutation_facts(base_snapshot, result.candidate_proposal)
     if admitted.mutation_inventory.mutations != expected_inventory:
         pytest.fail("trusted mutation inventory differs from the independent fixture verifier")
-    if subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip() != started_head:
+    source_head_after = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
+    source_clean_after = not subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
+    if source_head_after != started_head:
         pytest.fail("source identity changed during the real smoke")
-    if subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip():
+    if not source_clean_after:
         pytest.fail("real smoke modified the source checkout")
     metadata = result.untrusted_metadata
+    evidence_record = [
+        {
+            "check_id": item.check_id, "result": item.result, "evidence_kind": item.evidence_kind,
+            "origin": item.origin, "evidence_sha256": item.evidence_sha256, "reference": item.reference,
+        } for item in attestation.evidence_items
+    ]
     record = {
-        "exact_pr_head_sha": expected_head,
-        "source_head_before_and_after": started_head,
-        "worker_classification": {key: context[key] for key in required_true},
-        "clean_worker_home": context["clean_worker_home"],
-        "clean_codex_home": context["clean_codex_home"],
-        "codex_executable_path": executable,
-        "codex_version": metadata.codex_version,
-        "codex_executable_sha256": metadata.codex_executable_sha256,
-        "effective_denied_capabilities": list(o2c.CAPABILITY_DENY_SET),
-        "mcp_server_count": 0,
-        "sandbox_profile": "workspace-write; network_access=false; writable_roots=[]",
-        "job_object_containment": "Windows Job Object; kill-on-close; no breakaway; limits verified by configured runner",
-        "zero_descendants_before_scan": True,
-        "producer_status": result.status.value,
-        "proposal": [{"kind": change.kind.value, "path": change.path} for change in result.candidate_proposal.changes],
-        "o2b_candidate_commit_id": materialized.candidate.candidate_commit_id,
-        "trusted_mutation_inventory": [
-            {"path": fact.path.value, "kind": fact.kind.value} for fact in admitted.mutation_inventory.mutations
-        ],
-        "stdout_byte_count": metadata.stdout_byte_count,
-        "stdout_sha256": metadata.stdout_sha256,
-        "stderr_byte_count": metadata.stderr_byte_count,
-        "stderr_sha256": metadata.stderr_sha256,
+        "external_deployment_attestation": {
+            "format_version": attestation.format_version,
+            "worker_isolation_kind": attestation.worker_isolation_kind,
+            "worker_identity": attestation.worker_identity,
+            "source_head_sha": attestation.source_head_sha,
+            "codex_executable_path": attestation.codex_executable_path,
+            "codex_executable_version": attestation.codex_executable_version,
+            "codex_executable_sha256": attestation.codex_executable_sha256,
+            "evidence_items": evidence_record,
+            "trust_status": "untrusted work-plane evidence",
+        },
+        "measured_runtime": {
+            "source_head_before_and_after": {"before": started_head, "after": source_head_after},
+            "source_checkout_clean_before_and_after": {"before": source_clean_before, "after": source_clean_after},
+            "codex_executable_path": executable,
+            "codex_version": metadata.codex_version,
+            "codex_executable_sha256": metadata.codex_executable_sha256,
+            "effective_denied_capabilities": [name for name, enabled in metadata.measured_features if name in o2c.CAPABILITY_DENY_SET and not enabled],
+            "measured_features": [{"name": name, "enabled": enabled} for name, enabled in metadata.measured_features],
+            "mcp_server_count": metadata.measured_mcp_server_count,
+            "job_limits": {"max_active_processes": metadata.job_limits[0], "max_job_memory_bytes": metadata.job_limits[1], "cpu_hard_cap_percent": metadata.job_limits[2]},
+            "process_tree_quiescent": metadata.process_tree_quiescent,
+            "resource_limit_violation": metadata.resource_limit_violation,
+            "task_output": {"stdout_byte_count": metadata.stdout_byte_count, "stdout_sha256": metadata.stdout_sha256,
+                            "stderr_byte_count": metadata.stderr_byte_count, "stderr_sha256": metadata.stderr_sha256},
+        },
+        "candidate_and_admission": {
+            "producer_status": result.status.value,
+            "proposal_base_revision": result.candidate_proposal.base_revision,
+            "proposal": [{"kind": change.kind.value, "path": change.path} for change in result.candidate_proposal.changes],
+            "o2b_candidate_commit_id": materialized.candidate.candidate_commit_id,
+            "trusted_mutation_inventory": [{"path": fact.path.value, "kind": fact.kind.value} for fact in admitted.mutation_inventory.mutations],
+        },
         "real_smoke": "completed; no publication or merge performed",
     }
     output_file.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")

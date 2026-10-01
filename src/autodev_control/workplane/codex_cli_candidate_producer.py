@@ -108,10 +108,52 @@ _CODEX_HOME_FORBIDDEN = (
     "skills",
     "plugins",
 )
+JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT = 3
+JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT = 9
+JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10
+JOB_OBJECT_MSG_NOTIFICATION_LIMIT = 11
+JOB_OBJECT_RESOURCE_LIMIT_MESSAGES = frozenset((
+    JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT,
+    JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+    JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
+    JOB_OBJECT_MSG_NOTIFICATION_LIMIT,
+))
+FEATURE_STAGES = frozenset(("stable", "experimental", "under development", "deprecated", "removed"))
+DEPLOYMENT_CHECKS = (
+    "read_isolated_worker", "readable_data_set_minimal", "forbidden_stores_absent_or_inaccessible",
+    "worker_account_non_admin", "worker_account_not_trusted_role", "dedicated_codex_principal",
+    "principal_inference_only", "principal_no_target_control_root_rights",
+    "no_unrelated_private_apps_or_data", "credential_may_be_accessible",
+    "keyring_credentials_store", "forced_login_method", "mcp_configuration_sources_absent",
+    "managed_system_policy_inspected", "managed_system_external_broadening_empty",
+    "exec_policy_rules_absent", "effective_web_search_disabled",
+)
 
 
 class O2cPreflightError(ValueError):
     """A fail-closed work-plane preflight rejection."""
+
+
+def _is_resource_limit_notification(message_id: int) -> bool:
+    return type(message_id) is int and message_id in JOB_OBJECT_RESOURCE_LIMIT_MESSAGES
+
+
+def _current_worker_identity() -> str:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        get_user_name = advapi32.GetUserNameW
+        get_user_name.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        get_user_name.restype = wintypes.BOOL
+        buffer = ctypes.create_unicode_buffer(256)
+        size = wintypes.DWORD(len(buffer))
+        if not get_user_name(buffer, ctypes.byref(size)):
+            raise O2cPreflightError("runtime worker identity could not be measured")
+        return buffer.value
+    import getpass
+
+    return getpass.getuser()
 
 
 @dataclass(frozen=True)
@@ -138,31 +180,27 @@ class CodexWorkspaceSeed:
 
 
 @dataclass(frozen=True)
-class CodexWorkerDeployment:
-    """Deployment-supplied preflight facts; they are not trusted authority.
+class CodexDeploymentEvidence:
+    check_id: str
+    result: str
+    evidence_kind: str
+    origin: str
+    evidence_sha256: str
+    reference: str
 
-    A real smoke must independently establish these facts in its dedicated
-    worker. The booleans allow local fake-preflight tests without claiming that
-    this Python process creates read isolation or a least-privilege principal.
-    """
 
-    isolation_kind: str
-    readable_data_set_minimal: bool
-    forbidden_stores_absent_or_inaccessible: bool
-    worker_account_non_admin: bool
-    worker_account_not_trusted_role: bool
-    dedicated_codex_principal: bool
-    principal_inference_only: bool
-    principal_has_no_target_control_root_rights: bool
-    principal_has_no_unrelated_private_apps_or_data: bool
-    codex_credential_may_be_accessible_to_worker: bool
-    keyring_credentials_store: str
-    forced_login_method: str
-    mcp_configuration_sources_absent: bool
-    managed_system_policy_inspected: bool
-    managed_system_external_broadening: tuple[str, ...]
-    exec_policy_rules_absent: bool
-    effective_web_search_mode: str
+@dataclass(frozen=True)
+class CodexWorkerDeploymentAttestation:
+    """Immutable external work-plane claims, retained as untrusted evidence."""
+
+    format_version: str
+    worker_isolation_kind: str
+    worker_identity: str
+    source_head_sha: str
+    codex_executable_path: str
+    codex_executable_version: str
+    codex_executable_sha256: str
+    evidence_items: tuple[CodexDeploymentEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -174,19 +212,15 @@ class CodexCliConfiguration:
     codex_home: str
     scratch_root: str
     timeout_seconds: int
+    expected_source_head_sha: str
 
 
 @dataclass(frozen=True)
 class CodexEffectiveState:
-    """Redacted, freshly queried effective-state facts from the preflight probe."""
+    """Runtime-measured feature and MCP facts from the pinned CLI."""
 
     features: tuple[tuple[str, bool], ...]
     mcp_server_count: int
-    web_search_mode: str
-    exec_policy_rules_loaded: bool
-    browser_computer_effectively_disabled: bool
-    managed_system_policy_inspected: bool
-    managed_system_external_broadening: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -202,6 +236,11 @@ class CodexRunDiagnostics:
     stdout_sha256: str
     stderr_byte_count: int
     stderr_sha256: str
+    process_tree_quiescent: bool
+    resource_limit_violation: bool
+    job_limits: tuple[int, int, int]
+    measured_features: tuple[tuple[str, bool], ...]
+    measured_mcp_server_count: int
 
 
 @dataclass(frozen=True)
@@ -224,7 +263,7 @@ class CodexPreflightProbe(Protocol):
         expected_version: str,
         child_environment: Mapping[str, str],
         timeout_seconds: int,
-        deployment: CodexWorkerDeployment,
+        deployment: CodexWorkerDeploymentAttestation,
     ) -> CodexEffectiveState: ...
 
 
@@ -307,37 +346,47 @@ def _validate_seed(seed: CodexWorkspaceSeed) -> dict[str, CodexWorkspaceFile]:
     return by_path
 
 
-def _require_exact_true(value: object, label: str) -> None:
-    if type(value) is not bool or value is not True:
-        raise O2cPreflightError(f"deployment preflight failed: {label}")
-
-
-def _validate_deployment(deployment: CodexWorkerDeployment) -> None:
-    if type(deployment) is not CodexWorkerDeployment:
-        raise O2cPreflightError("deployment assessment must have exact type")
-    if deployment.isolation_kind not in ("dedicated_vm", "dedicated_container", "dedicated_host", "equivalent"):
-        raise O2cPreflightError("worker is not classified as a dedicated isolated environment")
-    for field, label in (
-        (deployment.readable_data_set_minimal, "read-visible set is not minimal"),
-        (deployment.forbidden_stores_absent_or_inaccessible, "forbidden stores are readable"),
-        (deployment.worker_account_non_admin, "worker account is not non-admin"),
-        (deployment.worker_account_not_trusted_role, "worker account is a trusted role"),
-        (deployment.dedicated_codex_principal, "Codex principal is not dedicated"),
-        (deployment.principal_inference_only, "Codex principal is not inference-only"),
-        (deployment.principal_has_no_target_control_root_rights, "Codex principal has target/control/root rights"),
-        (deployment.principal_has_no_unrelated_private_apps_or_data, "Codex principal has unrelated private data/apps"),
-        (deployment.codex_credential_may_be_accessible_to_worker, "credential exposure assumption was weakened"),
-        (deployment.mcp_configuration_sources_absent, "MCP configuration sources are not absent"),
-        (deployment.managed_system_policy_inspected, "managed/system policy was not inspected"),
-        (deployment.exec_policy_rules_absent, "exec-policy rules are present or unknown"),
-    ):
-        _require_exact_true(field, label)
-    if deployment.keyring_credentials_store != "keyring" or deployment.forced_login_method != "chatgpt":
-        raise O2cPreflightError("authentication profile does not match the frozen Phase-1 profile")
-    if type(deployment.managed_system_external_broadening) is not tuple or deployment.managed_system_external_broadening:
-        raise O2cPreflightError("managed/system policy broadens external capabilities")
-    if deployment.effective_web_search_mode != "disabled":
-        raise O2cPreflightError("effective web search is not disabled")
+def _validate_deployment(
+    deployment: CodexWorkerDeploymentAttestation,
+    configuration: CodexCliConfiguration,
+    measured_worker_identity: str,
+    measured_executable_sha256: str,
+) -> None:
+    if type(deployment) is not CodexWorkerDeploymentAttestation:
+        raise O2cPreflightError("external deployment attestation must have exact type")
+    if type(deployment.format_version) is not str or deployment.format_version != "o2c-deployment-attestation/1":
+        raise O2cPreflightError("unsupported deployment attestation format")
+    if type(deployment.worker_isolation_kind) is not str or deployment.worker_isolation_kind not in ("dedicated_vm", "dedicated_container", "dedicated_host", "equivalent"):
+        raise O2cPreflightError("worker isolation kind is unsupported")
+    if type(deployment.worker_identity) is not str or type(deployment.source_head_sha) is not str:
+        raise O2cPreflightError("deployment identity fields are invalid")
+    if deployment.worker_identity != measured_worker_identity:
+        raise O2cPreflightError("deployment attestation worker identity does not match runtime identity")
+    if deployment.source_head_sha != configuration.expected_source_head_sha:
+        raise O2cPreflightError("deployment attestation source head does not match configured source head")
+    if deployment.codex_executable_path != configuration.absolute_codex_executable_path:
+        raise O2cPreflightError("deployment attestation executable path mismatch")
+    if deployment.codex_executable_version != configuration.expected_codex_version:
+        raise O2cPreflightError("deployment attestation executable version mismatch")
+    if deployment.codex_executable_sha256 != measured_executable_sha256 or measured_executable_sha256 != configuration.expected_codex_executable_sha256:
+        raise O2cPreflightError("deployment attestation executable digest mismatch")
+    if type(deployment.evidence_items) is not tuple:
+        raise O2cPreflightError("deployment evidence must be an immutable tuple")
+    if any(type(item) is not CodexDeploymentEvidence for item in deployment.evidence_items):
+        raise O2cPreflightError("deployment evidence contains an invalid item")
+    if any(type(item.check_id) is not str for item in deployment.evidence_items):
+        raise O2cPreflightError("deployment evidence check identifier is invalid")
+    ids = [item.check_id for item in deployment.evidence_items]
+    if len(ids) != len(set(ids)) or set(ids) != set(DEPLOYMENT_CHECKS):
+        raise O2cPreflightError("deployment evidence is missing, duplicate, or unknown")
+    by_id = {item.check_id: item for item in deployment.evidence_items}
+    for check_id, item in by_id.items():
+        if (type(item.check_id) is not str or type(item.result) is not str or item.result != "pass"
+                or type(item.evidence_kind) is not str or not item.evidence_kind
+                or type(item.origin) is not str or not item.origin
+                or type(item.evidence_sha256) is not str or _SHA256_RE.fullmatch(item.evidence_sha256) is None
+                or type(item.reference) is not str or not item.reference):
+            raise O2cPreflightError(f"deployment evidence is invalid for {check_id}")
 
 
 def _validate_effective_state(state: CodexEffectiveState) -> None:
@@ -357,16 +406,9 @@ def _validate_effective_state(state: CodexEffectiveState) -> None:
         raise O2cPreflightError("frozen Codex capability deny set is not effectively disabled")
     if type(state.mcp_server_count) is not int or state.mcp_server_count != 0:
         raise O2cPreflightError("effective MCP server count is not zero")
-    if type(state.web_search_mode) is not str or state.web_search_mode != "disabled":
-        raise O2cPreflightError("effective web search is not disabled")
-    if type(state.exec_policy_rules_loaded) is not bool or state.exec_policy_rules_loaded:
-        raise O2cPreflightError("exec-policy rules are loaded")
-    if type(state.browser_computer_effectively_disabled) is not bool or not state.browser_computer_effectively_disabled:
-        raise O2cPreflightError("browser/computer-use effective state is not disabled")
-    if type(state.managed_system_policy_inspected) is not bool or not state.managed_system_policy_inspected:
-        raise O2cPreflightError("managed/system policy state is not verified")
-    if type(state.managed_system_external_broadening) is not tuple or state.managed_system_external_broadening:
-        raise O2cPreflightError("managed/system policy broadens an external capability")
+    for name in ("browser_use", "browser_use_full_cdp_access", "browser_use_external", "computer_use", "in_app_browser", "in_app_local_automation"):
+        if name in feature_map and feature_map[name]:
+            raise O2cPreflightError("runtime-measured browser/computer capability is enabled")
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -413,6 +455,8 @@ def _validate_configuration(configuration: CodexCliConfiguration) -> None:
         raise O2cPreflightError("expected Codex version is required")
     if type(configuration.expected_codex_executable_sha256) is not str or _SHA256_RE.fullmatch(configuration.expected_codex_executable_sha256) is None:
         raise O2cPreflightError("expected Codex executable SHA-256 is invalid")
+    if not _valid_git_id(configuration.expected_source_head_sha):
+        raise O2cPreflightError("expected source head SHA is invalid")
     executable = Path(configuration.absolute_codex_executable_path)
     if type(configuration.absolute_codex_executable_path) is not str or not executable.is_absolute():
         raise O2cPreflightError("Codex executable path must be absolute")
@@ -656,7 +700,7 @@ class CodexCliCandidateProducer:
         self,
         configuration: CodexCliConfiguration,
         seed: CodexWorkspaceSeed,
-        deployment: CodexWorkerDeployment,
+        deployment: CodexWorkerDeploymentAttestation,
         *,
         preflight: CodexPreflightProbe | None = None,
         runner: ContainedTaskRunner | None = None,
@@ -676,7 +720,6 @@ class CodexCliCandidateProducer:
         try:
             request_text = request_bytes.decode("utf-8", errors="strict")
             _validate_configuration(self._configuration)
-            _validate_deployment(self._deployment)
             base_files = _validate_seed(self._seed)
             worker_home, codex_home, scratch_root = _validate_effective_homes(
                 self._configuration, self._parent_environment
@@ -684,6 +727,7 @@ class CodexCliCandidateProducer:
             initial_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if initial_hash != self._configuration.expected_codex_executable_sha256:
                 return _failure()
+            _validate_deployment(self._deployment, self._configuration, _current_worker_identity(), initial_hash)
         except (O2cPreflightError, UnicodeDecodeError, OSError, TypeError, ValueError):
             return _failure()
 
@@ -756,6 +800,11 @@ class CodexCliCandidateProducer:
                 outcome.stdout_sha256,
                 outcome.stderr_byte_count,
                 outcome.stderr_sha256,
+                outcome.process_tree_quiescent,
+                outcome.resource_limit_violation,
+                (MAX_JOB_ACTIVE_PROCESSES, MAX_JOB_MEMORY_BYTES, JOB_CPU_HARD_CAP_PERCENT),
+                state.features,
+                state.mcp_server_count,
             )
             successful_result = CandidateProducerResult(
                 ProducerStatus.SUCCESS,
@@ -787,8 +836,6 @@ def _validate_execution_outcome(outcome: ContainedExecutionOutcome) -> None:
     for count in (outcome.stdout_byte_count, outcome.stderr_byte_count, outcome.elapsed_milliseconds):
         if type(count) is not int or count < 0:
             raise O2cPreflightError("contained runner returned invalid diagnostic count")
-    if outcome.stdout_byte_count > MAX_STDIO_DIAGNOSTIC_BYTES or outcome.stderr_byte_count > MAX_STDIO_DIAGNOSTIC_BYTES:
-        raise O2cPreflightError("contained runner exceeded a bounded diagnostic stream")
     for digest in (outcome.stdout_sha256, outcome.stderr_sha256):
         if type(digest) is not str or _SHA256_RE.fullmatch(digest) is None:
             raise O2cPreflightError("contained runner returned invalid diagnostic digest")
@@ -883,9 +930,12 @@ def _feature_rows(output: bytes) -> tuple[tuple[str, bool], ...]:
         fields = line.split()
         if not fields:
             continue
-        if len(fields) != 3 or fields[2] not in ("true", "false"):
+        if len(fields) < 3 or fields[-1] not in ("true", "false"):
             raise O2cPreflightError("Codex feature diagnostic format is unsupported")
-        rows.append((fields[0], fields[2] == "true"))
+        stage = " ".join(fields[1:-1])
+        if stage not in FEATURE_STAGES:
+            raise O2cPreflightError("Codex feature diagnostic has an unknown lifecycle stage")
+        rows.append((fields[0], fields[-1] == "true"))
     return tuple(rows)
 
 
@@ -903,9 +953,8 @@ class CodexCliPreflightProbe:
         expected_version: str,
         child_environment: Mapping[str, str],
         timeout_seconds: int,
-        deployment: CodexWorkerDeployment,
+        deployment: CodexWorkerDeploymentAttestation,
     ) -> CodexEffectiveState:
-        _validate_deployment(deployment)
         expected_hash = _sha256_file(executable_path)
         version_result = _run_bounded_diagnostic(
             (executable_path, "--version"), child_environment, min(timeout_seconds, 30)
@@ -944,25 +993,7 @@ class CodexCliPreflightProbe:
             raise O2cPreflightError("Codex MCP diagnostic was not valid JSON") from error
         if type(mcp_roster) is not list:
             raise O2cPreflightError("Codex MCP diagnostic has an unsupported shape")
-        state = CodexEffectiveState(
-            features=features,
-            mcp_server_count=len(mcp_roster),
-            web_search_mode=deployment.effective_web_search_mode,
-            exec_policy_rules_loaded=not deployment.exec_policy_rules_absent,
-            browser_computer_effectively_disabled=all(
-                dict(features).get(name) is False
-                for name in (
-                    "browser_use",
-                    "browser_use_full_cdp_access",
-                    "browser_use_external",
-                    "computer_use",
-                    "in_app_browser",
-                    "in_app_local_automation",
-                )
-            ),
-            managed_system_policy_inspected=deployment.managed_system_policy_inspected,
-            managed_system_external_broadening=deployment.managed_system_external_broadening,
-        )
+        state = CodexEffectiveState(features=features, mcp_server_count=len(mcp_roster))
         _validate_effective_state(state)
         return state
 
@@ -1270,6 +1301,7 @@ class _NativeWindowsJobObjectApi:
             threading.Thread(target=self._drain, args=(process.stdout_handle, "stdout", output), daemon=True),
             threading.Thread(target=self._drain, args=(process.stderr_handle, "stderr", output), daemon=True),
         ]
+        process.reader_threads = readers
         for reader in readers:
             reader.start()
         writer_error: list[BaseException] = []
@@ -1279,12 +1311,16 @@ class _NativeWindowsJobObjectApi:
                 self._write_all(process.stdin_handle, process.prompt_bytes)
             except BaseException as error:
                 writer_error.append(error)
-            finally:
-                self._kernel.CloseHandle(process.stdin_handle)
-                process.stdin_handle = 0
 
         writer = threading.Thread(target=write_prompt, daemon=True)
+        process.writer_thread = writer
         writer.start()
+        writer.join(timeout=10)
+        if writer.is_alive():
+            raise O2cPreflightError("prompt pipe writer did not quiesce")
+        self._close_owned_process_handle(process, "stdin_handle")
+        if writer_error:
+            raise O2cPreflightError("task prompt transport failed") from writer_error[0]
         wait_ms = min(0xFFFFFFFE, timeout_seconds * 1000)
         wait_result = self._kernel.WaitForSingleObject(process.process_handle, wait_ms)
         timed_out = wait_result == 0x102  # WAIT_TIMEOUT
@@ -1306,8 +1342,6 @@ class _NativeWindowsJobObjectApi:
         for name in ("stdout", "stderr"):
             if f"{name}_error" in output:
                 raise O2cPreflightError("contained task diagnostic pipe failed") from output[f"{name}_error"]
-            if int(output.get(f"{name}_count", 0)) > MAX_STDIO_DIAGNOSTIC_BYTES:
-                raise O2cPreflightError("contained task diagnostic output exceeded its bound")
         if writer_error:
             raise O2cPreflightError("task prompt transport failed") from writer_error[0]
         return ContainedExecutionOutcome(
@@ -1341,8 +1375,6 @@ class _NativeWindowsJobObjectApi:
             output[f"{name}_hash"] = digest.hexdigest()
         except BaseException as error:
             output[f"{name}_error"] = error
-        finally:
-            self._kernel.CloseHandle(handle)
 
     def _write_all(self, handle: int, content: bytes) -> None:
         offset = 0
@@ -1380,7 +1412,6 @@ class _NativeWindowsJobObjectApi:
 
     def _consume_job_notifications(self, job: object) -> bool:
         from ctypes import wintypes
-        violation_ids = {1, 9, 10, 11}  # end-of-job time, active-process, job-memory, process-memory
         violation = False
         while True:
             message = wintypes.DWORD()
@@ -1391,7 +1422,7 @@ class _NativeWindowsJobObjectApi:
                 if ctypes.get_last_error() == 258:  # WAIT_TIMEOUT: queue drained
                     break
                 self._check(okay, "Job Object completion query")
-            violation = violation or message.value in violation_ids
+            violation = violation or _is_resource_limit_notification(message.value)
         return violation
 
     def _peak_job_memory(self, job_handle: int) -> int:
@@ -1426,11 +1457,27 @@ class _NativeWindowsJobObjectApi:
             job.handle = 0
 
     def close_process(self, process: object) -> None:
+        threads = tuple(getattr(process, "reader_threads", ())) + ((getattr(process, "writer_thread", None),) if getattr(process, "writer_thread", None) is not None else ())
+        alive = False
+        for thread in threads:
+            thread.join(timeout=10)
+            alive = alive or thread.is_alive()
+        close_error: BaseException | None = None
         for attribute in ("stdin_handle", "stdout_handle", "stderr_handle", "thread_handle", "process_handle"):
-            handle = getattr(process, attribute, 0)
-            if handle:
-                self._check(self._kernel.CloseHandle(handle), "process handle close")
-                setattr(process, attribute, 0)
+            try:
+                self._close_owned_process_handle(process, attribute)
+            except BaseException as error:
+                close_error = close_error or error
+        if alive:
+            close_error = close_error or O2cPreflightError("contained process I/O threads did not quiesce")
+        if close_error is not None:
+            raise close_error
+
+    def _close_owned_process_handle(self, process: object, attribute: str) -> None:
+        handle = getattr(process, attribute, 0)
+        if handle:
+            setattr(process, attribute, 0)
+            self._check(self._kernel.CloseHandle(handle), "process handle close")
 
 
 @dataclass
@@ -1441,6 +1488,12 @@ class _NativeProcessState:
     stdout_handle: int
     stderr_handle: int
     prompt_bytes: bytes
+    reader_threads: list[threading.Thread] = None
+    writer_thread: threading.Thread | None = None
+
+    def __post_init__(self) -> None:
+        if self.reader_threads is None:
+            self.reader_threads = []
 
 
 @dataclass

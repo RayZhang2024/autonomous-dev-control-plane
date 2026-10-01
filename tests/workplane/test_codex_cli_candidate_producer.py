@@ -25,11 +25,6 @@ class FakePreflight:
         return o2c.CodexEffectiveState(
             tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
             0,
-            "disabled",
-            False,
-            True,
-            True,
-            (),
         )
 
 
@@ -59,7 +54,9 @@ class FakeRunner:
         if self.status == "violation":
             return outcome(resource_limit_violation=True)
         if self.status == "large-output":
-            return outcome(stderr_byte_count=o2c.MAX_STDIO_DIAGNOSTIC_BYTES + 1)
+            data = b"x" * 100_000
+            return outcome(stdout_byte_count=len(data), stdout_sha256=hashlib.sha256(data).hexdigest(),
+                           stderr_byte_count=len(data), stderr_sha256=hashlib.sha256(data).hexdigest())
         return outcome()
 
 
@@ -79,28 +76,24 @@ def outcome(**overrides):
     return o2c.ContainedExecutionOutcome(**values)
 
 
-def deployment(**overrides):
+def deployment(configuration, **overrides):
     values = dict(
-        isolation_kind="dedicated_vm",
-        readable_data_set_minimal=True,
-        forbidden_stores_absent_or_inaccessible=True,
-        worker_account_non_admin=True,
-        worker_account_not_trusted_role=True,
-        dedicated_codex_principal=True,
-        principal_inference_only=True,
-        principal_has_no_target_control_root_rights=True,
-        principal_has_no_unrelated_private_apps_or_data=True,
-        codex_credential_may_be_accessible_to_worker=True,
-        keyring_credentials_store="keyring",
-        forced_login_method="chatgpt",
-        mcp_configuration_sources_absent=True,
-        managed_system_policy_inspected=True,
-        managed_system_external_broadening=(),
-        exec_policy_rules_absent=True,
-        effective_web_search_mode="disabled",
+        format_version="o2c-deployment-attestation/1",
+        worker_isolation_kind="dedicated_vm",
+        worker_identity=o2c._current_worker_identity(),
+        source_head_sha=configuration.expected_source_head_sha,
+        codex_executable_path=configuration.absolute_codex_executable_path,
+        codex_executable_version=configuration.expected_codex_version,
+        codex_executable_sha256=configuration.expected_codex_executable_sha256,
+        evidence_items=tuple(
+            o2c.CodexDeploymentEvidence(
+                check_id, "pass", "fixture", "offline-test-fixture",
+                hashlib.sha256(check_id.encode()).hexdigest(), f"fixture://{check_id}"
+            ) for check_id in o2c.DEPLOYMENT_CHECKS
+        ),
     )
     values.update(overrides)
-    return o2c.CodexWorkerDeployment(**values)
+    return o2c.CodexWorkerDeploymentAttestation(**values)
 
 
 def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_facts=None):
@@ -113,13 +106,13 @@ def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_f
     executable.write_bytes(b"pinned codex executable fixture")
     config = o2c.CodexCliConfiguration(
         str(executable), "codex 1.2.3", hashlib.sha256(executable.read_bytes()).hexdigest(),
-        str(worker_home), str(codex_home), str(scratch_root), 30,
+        str(worker_home), str(codex_home), str(scratch_root), 30, "a" * 40,
     )
     environment = {"HOME": str(worker_home), "USERPROFILE": str(worker_home), "CODEX_HOME": str(codex_home), "PATH": "safe-path", "OPENAI_API_KEY": "must-not-leak", "GH_TOKEN": "must-not-leak", "TEMP": "operator-temp", "TMP": "operator-tmp"}
     producer = o2c.CodexCliCandidateProducer(
         config,
         seed or o2c.CodexWorkspaceSeed("a" * 40, (o2c.CodexWorkspaceFile("base.txt", b"before", "100755"),)),
-        deployment_facts or deployment(),
+        deployment_facts or deployment(config),
         preflight=preflight or FakePreflight(),
         runner=runner or FakeRunner(),
         parent_environment=environment,
@@ -176,7 +169,6 @@ def test_invalid_or_oversized_request_fails_before_one_task_attempt(tmp_path, re
     ("timeout", ProducerStatus.TIMEOUT),
     ("nonzero", ProducerStatus.PRODUCER_ERROR),
     ("violation", ProducerStatus.PRODUCER_ERROR),
-    ("large-output", ProducerStatus.PRODUCER_ERROR),
 ])
 def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, expected):
     runner = FakeRunner(status=status, mutate=lambda root: (root / "partial.py").write_text("partial"))
@@ -184,6 +176,17 @@ def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, 
     result = producer.invoke(b"request")
     assert result.status is expected and result.candidate_proposal is None
     assert runner.calls == producer.task_attempt_count == 1
+
+
+def test_task_output_above_64kib_is_streamed_as_count_and_digest_only(tmp_path):
+    runner = FakeRunner(status="large-output")
+    producer, _, _ = configured(tmp_path, runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.SUCCESS
+    metadata = result.untrusted_metadata
+    assert metadata.stdout_byte_count == metadata.stderr_byte_count == 100_000
+    assert metadata.stdout_sha256 == metadata.stderr_sha256 == hashlib.sha256(b"x" * 100_000).hexdigest()
+    assert not hasattr(metadata, "stdout") and not hasattr(metadata, "stderr")
 
 
 def test_preflight_fails_closed_before_task_attempt(tmp_path):
@@ -299,6 +302,7 @@ def test_executable_must_be_absolute_exact_exe_with_configured_hash(tmp_path):
         o2c._validate_configuration(o2c.CodexCliConfiguration(
             "codex.exe", configuration.expected_codex_version, configuration.expected_codex_executable_sha256,
             configuration.worker_home, configuration.codex_home, configuration.scratch_root, configuration.timeout_seconds,
+            configuration.expected_source_head_sha,
         ))
 
 
@@ -325,13 +329,80 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
     assert environment["TEMP"] == "operator-temp"
 
 
-def test_effective_state_rejects_unknown_enabled_mcp_and_policy_broadening():
+def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "disabled", False, True, True, ()))
+        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "disabled", False, True, True, ()))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_deployment(deployment(managed_system_external_broadening=("browser",)))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0))
+
+
+@pytest.mark.parametrize("row", [
+    b"browser_use experimental true\n",
+    b"computer_use under development false\n",
+    b"apps stable false\n",
+    b"plugins deprecated false\n",
+    b"mcp removed false\n",
+])
+def test_feature_rows_accept_known_stages_and_final_boolean(row):
+    assert o2c._feature_rows(row)[0][1] is (row.rstrip().endswith(b"true"))
+
+
+@pytest.mark.parametrize("row", [
+    b"feature true\n", b"feature unknown false\n", b"feature stable maybe\n", b"feature stable false extra\n",
+])
+def test_feature_rows_reject_malformed_unknown_stage_or_boolean(row):
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._feature_rows(row)
+
+
+def test_job_notification_ids_classify_only_documented_resource_limit_messages():
+    for message_id in (3, 9, 10, 11):
+        assert o2c._is_resource_limit_notification(message_id)
+    for message_id in (0, 1, 2, 4, 5, 6, 7, 8, 12):
+        assert not o2c._is_resource_limit_notification(message_id)
+
+
+def test_native_process_pipe_handles_have_one_central_close_owner(monkeypatch):
+    class Kernel:
+        def __init__(self):
+            self.closed = []
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle)
+            return True
+
+    api = object.__new__(o2c._NativeWindowsJobObjectApi)
+    api._kernel = Kernel()
+    chunks = iter((b"x" * 100_000, b""))
+    monkeypatch.setattr(api, "_read", lambda _handle: next(chunks))
+    output = {}
+    api._drain(2, "stdout", output)
+    assert output["stdout_count"] == 100_000
+    assert output["stdout_hash"] == hashlib.sha256(b"x" * 100_000).hexdigest()
+    process = o2c._NativeProcessState(5, 4, 1, 2, 3, b"")
+    api.close_process(process)
+    assert api._kernel.closed == [1, 2, 3, 4, 5]
+    assert (process.stdin_handle, process.stdout_handle, process.stderr_handle, process.thread_handle, process.process_handle) == (0, 0, 0, 0, 0)
+
+
+def test_deployment_attestation_requires_complete_consistent_bound_evidence(tmp_path):
+    from dataclasses import replace
+
+    producer, executable, _ = configured(tmp_path)
+    attestation = deployment(producer._configuration)
+    o2c._validate_deployment(attestation, producer._configuration, o2c._current_worker_identity(), hashlib.sha256(executable.read_bytes()).hexdigest())
+    bad_items = attestation.evidence_items[:-1]
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(replace(attestation, evidence_items=bad_items), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(replace(attestation, source_head_sha="b" * 40), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(replace(attestation, codex_executable_sha256="0" * 64), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
+    conflicting = replace(attestation.evidence_items[0], result="fail")
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._validate_deployment(replace(attestation, evidence_items=(conflicting, *attestation.evidence_items[1:])), producer._configuration, o2c._current_worker_identity(), attestation.codex_executable_sha256)
 
 
 class FakeJobApi:
