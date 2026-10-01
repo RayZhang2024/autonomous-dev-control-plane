@@ -46,6 +46,8 @@ MAX_TOTAL_FILE_BYTES = 33_554_432
 MAX_TREE_DEPTH = 32
 MAX_STDIO_DIAGNOSTIC_BYTES = 65_536
 MAX_SANDBOX_IMPLEMENTATION_BYTES = 128
+MAX_CODEX_VERSION_OUTPUT_BYTES = 256
+MAX_CODEX_PACKAGE_VERSION_BYTES = 128
 MAX_TIMEOUT_SECONDS = 1_800
 MAX_JOB_ACTIVE_PROCESSES = 64
 MAX_JOB_MEMORY_BYTES = 4_294_967_296
@@ -251,6 +253,7 @@ class CodexWorkerDeploymentAttestation:
 @dataclass(frozen=True)
 class CodexCliConfiguration:
     absolute_codex_executable_path: str
+    # Exact logical output line from `codex --version`, also bound by attestation.
     expected_codex_version: str
     expected_codex_executable_sha256: str
     worker_home: str
@@ -269,12 +272,15 @@ class CodexEffectiveState:
     mcp_server_count: int
     sandbox_implementation: str
     doctor_exit_code: int
+    codex_cli_version_raw: str
+    codex_package_version: str
 
 
 @dataclass(frozen=True)
 class CodexRunDiagnostics:
     runner_version: str
     worker_identity_measured: str
+    # Existing field remains the raw logical CLI version line bound by attestation.
     codex_version: str
     codex_version_measured_before_task: bool
     codex_executable_sha256_before: str
@@ -298,6 +304,8 @@ class CodexRunDiagnostics:
     measured_mcp_server_count: int
     sandbox_implementation: str
     doctor_exit_code: int
+    codex_cli_version_raw: str
+    codex_package_version: str
     candidate_workspace_git_present: bool
     job_assignment_succeeded: bool
     root_process_resumed_after_assignment: bool
@@ -485,6 +493,34 @@ def _validate_deployment(
                 raise O2cPreflightError(f"deployment evidence {field} is not UTF-8 for {check_id}") from error
 
 
+def _parse_codex_cli_version(output: bytes) -> tuple[str, str]:
+    if type(output) is not bytes or len(output) > MAX_CODEX_VERSION_OUTPUT_BYTES:
+        raise O2cPreflightError("Codex CLI version output is not bounded bytes")
+    try:
+        raw_line = output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise O2cPreflightError("Codex CLI version output is not UTF-8") from error
+    if raw_line.endswith("\r\n"):
+        raw_line = raw_line[:-2]
+    elif raw_line.endswith(("\r", "\n")):
+        raw_line = raw_line[:-1]
+    if not raw_line.startswith("codex-cli "):
+        raise O2cPreflightError("Codex CLI version output has an unsupported prefix")
+    package_version = raw_line[len("codex-cli "):]
+    try:
+        package_bytes = package_version.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise O2cPreflightError("Codex package version is not UTF-8") from error
+    if (
+        not package_version
+        or len(package_bytes) > MAX_CODEX_PACKAGE_VERSION_BYTES
+        or any(character.isspace() or unicodedata.category(character) == "Cc" for character in package_version)
+        or any(unicodedata.category(character) == "Cc" for character in raw_line)
+    ):
+        raise O2cPreflightError("Codex CLI version output has an invalid package version token")
+    return raw_line, package_version
+
+
 def _validate_effective_state(state: CodexEffectiveState) -> None:
     if type(state) is not CodexEffectiveState:
         raise O2cPreflightError("effective Codex state is unverified")
@@ -505,6 +541,15 @@ def _validate_effective_state(state: CodexEffectiveState) -> None:
     _validate_sandbox_implementation(state.sandbox_implementation)
     if type(state.doctor_exit_code) is not int:
         raise O2cPreflightError("Codex doctor exit code is invalid")
+    if type(state.codex_cli_version_raw) is not str or type(state.codex_package_version) is not str:
+        raise O2cPreflightError("Codex version identities are invalid")
+    try:
+        raw_output = state.codex_cli_version_raw.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise O2cPreflightError("Codex CLI version identity is not UTF-8") from error
+    raw_version, package_version = _parse_codex_cli_version(raw_output)
+    if raw_version != state.codex_cli_version_raw or package_version != state.codex_package_version:
+        raise O2cPreflightError("Codex CLI and package version identities disagree")
     for name in ("browser_use", "browser_use_full_cdp_access", "browser_use_external", "computer_use", "in_app_browser", "in_app_local_automation"):
         if name in feature_map and feature_map[name]:
             raise O2cPreflightError("runtime-measured browser/computer capability is enabled")
@@ -880,6 +925,8 @@ class CodexCliCandidateProducer:
                 self._deployment,
             )
             _validate_effective_state(state)
+            if state.codex_cli_version_raw != self._configuration.expected_codex_version:
+                return _failure()
             before_task_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if before_task_hash != self._configuration.expected_codex_executable_sha256:
                 return _failure()
@@ -922,6 +969,8 @@ class CodexCliCandidateProducer:
                 worker_identity_measured=worker_identity_measured,
                 codex_version=self._configuration.expected_codex_version,
                 codex_version_measured_before_task=True,
+                codex_cli_version_raw=state.codex_cli_version_raw,
+                codex_package_version=state.codex_package_version,
                 codex_executable_sha256_before=before_task_hash,
                 codex_executable_sha256_after=after_task_hash,
                 worker_home_path=str(worker_home),
@@ -1104,7 +1153,7 @@ def _reject_json_constant(value: str) -> object:
     raise O2cPreflightError(f"Codex doctor JSON contains unsupported constant: {value}")
 
 
-def _sandbox_implementation(output: bytes, expected_codex_version: str) -> str:
+def _sandbox_implementation(output: bytes, expected_package_version: str) -> str:
     if type(output) is not bytes or len(output) > MAX_STDIO_DIAGNOSTIC_BYTES:
         raise O2cPreflightError("Codex doctor JSON exceeded the bounded parser limit")
     try:
@@ -1121,7 +1170,7 @@ def _sandbox_implementation(output: bytes, expected_codex_version: str) -> str:
     if type(schema_version) is not int or schema_version != 1:
         raise O2cPreflightError("Codex doctor diagnostic schema version is unsupported")
     codex_version = document.get("codexVersion")
-    if type(codex_version) is not str or not codex_version or codex_version != expected_codex_version:
+    if type(codex_version) is not str or not codex_version or codex_version != expected_package_version:
         raise O2cPreflightError("Codex doctor report version does not match the pinned executable")
     checks = document.get("checks")
     if type(checks) is not dict:
@@ -1166,11 +1215,8 @@ class CodexCliPreflightProbe:
         )
         if version_result.exit_code != 0:
             raise O2cPreflightError("Codex version query failed")
-        try:
-            actual_version = version_result.stdout.decode("utf-8", errors="strict").strip()
-        except UnicodeDecodeError as error:
-            raise O2cPreflightError("Codex version output is not UTF-8") from error
-        if actual_version != expected_version or _sha256_file(executable_path) != expected_hash:
+        actual_version_raw, package_version = _parse_codex_cli_version(version_result.stdout)
+        if actual_version_raw != expected_version or _sha256_file(executable_path) != expected_hash:
             raise O2cPreflightError("pinned Codex executable identity mismatch")
 
         common = ["--strict-config", "--ignore-user-config"]
@@ -1206,13 +1252,15 @@ class CodexCliPreflightProbe:
         # The doctor process status aggregates unrelated checks. Preserve it in
         # measured state and gate this measurement on sandbox.helpers itself.
         sandbox_implementation = _sandbox_implementation(
-            sandbox_result.stdout, expected_version
+            sandbox_result.stdout, package_version
         )
         state = CodexEffectiveState(
             features=features,
             mcp_server_count=len(mcp_roster),
             sandbox_implementation=sandbox_implementation,
             doctor_exit_code=sandbox_result.exit_code,
+            codex_cli_version_raw=actual_version_raw,
+            codex_package_version=package_version,
         )
         _validate_effective_state(state)
         return state

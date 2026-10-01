@@ -28,11 +28,14 @@ class FakePreflight:
         assert child_environment["TEMP"].endswith("runtime-tmp")
         if self.reject:
             raise o2c.O2cPreflightError("incompatible fake effective state")
+        raw_version, package_version = o2c._parse_codex_cli_version(expected_version.encode("utf-8"))
         return o2c.CodexEffectiveState(
             tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
             0,
             "fixture-backend",
             0,
+            raw_version,
+            package_version,
         )
 
 
@@ -121,7 +124,7 @@ def configured(tmp_path, *, preflight=None, runner=None, seed=None, deployment_f
         path.mkdir(parents=True)
     executable.write_bytes(b"pinned codex executable fixture")
     config = o2c.CodexCliConfiguration(
-        str(executable), "codex 1.2.3", hashlib.sha256(executable.read_bytes()).hexdigest(),
+        str(executable), "codex-cli 1.2.3", hashlib.sha256(executable.read_bytes()).hexdigest(),
         str(worker_home), str(codex_home), str(scratch_root), 30, "a" * 40, WORKER_ENVIRONMENT_ID,
     )
     environment = {"HOME": str(worker_home), "USERPROFILE": str(worker_home), "CODEX_HOME": str(codex_home), "PATH": "safe-path", "OPENAI_API_KEY": "must-not-leak", "GH_TOKEN": "must-not-leak", "TEMP": "operator-temp", "TMP": "operator-tmp"}
@@ -169,6 +172,9 @@ def test_success_extracts_exact_add_replace_delete_order_and_preserves_modes(tmp
     assert not runner.workspace.parent.exists()
     assert result.untrusted_metadata.stdout_sha256 == hashlib.sha256(b"out").hexdigest()
     assert result.untrusted_metadata.stderr_sha256 == hashlib.sha256(b"").hexdigest()
+    assert result.untrusted_metadata.codex_cli_version_raw == "codex-cli 1.2.3"
+    assert result.untrusted_metadata.codex_package_version == "1.2.3"
+    assert result.untrusted_metadata.codex_version == producer._deployment.codex_executable_version
     assert not hasattr(result.untrusted_metadata, "stdout")
 
 
@@ -362,14 +368,14 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
 
 def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend", 0))
+        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend", 0, "codex-cli fixture", "fixture"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend", 0))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend", 0, "codex-cli fixture", "fixture"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend", 0))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend", 0, "codex-cli fixture", "fixture"))
 
 
-DOCTOR_VERSION = "codex 1.2.3"
+DOCTOR_VERSION = "1.2.3"
 _UNSET = object()
 
 
@@ -395,6 +401,30 @@ def doctor_json_fixture(
 
 def test_sandbox_doctor_json_extracts_exact_backend_value():
     assert o2c._sandbox_implementation(doctor_json_fixture(), DOCTOR_VERSION) == "mxc"
+
+
+def test_codex_cli_version_parser_preserves_raw_line_and_derives_package_version():
+    assert o2c._parse_codex_cli_version(b"codex-cli 0.153.4\r\n") == (
+        "codex-cli 0.153.4", "0.153.4"
+    )
+
+
+@pytest.mark.parametrize("raw", [
+    b"codex 0.153.4\n",
+    b"Codex-cli 0.153.4\n",
+    b"codex-cli\n",
+    b"codex-cli \n",
+    b"codex-cli 0.153.4 extra\n",
+    b" codex-cli 0.153.4\n",
+    b"codex-cli  0.153.4\n",
+    b"codex-cli 0.153.4 \n",
+    b"codex-cli 0.153.4\nextra\n",
+    b"codex-cli 0.153.4\x01\n",
+    b"codex-cli " + b"x" * 129 + b"\n",
+])
+def test_codex_cli_version_parser_rejects_malformed_raw_output(raw):
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._parse_codex_cli_version(raw)
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -425,6 +455,7 @@ def test_sandbox_doctor_json_extracts_exact_backend_value():
     {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "mxc\x00bad"}}},
     {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "mxc\x01bad"}}},
     {"codex_version": "codex 1.2.3-extra"},
+    {"codex_version": "1.2.4"},
     {"codex_version": ""},
     {"codex_version": 1},
 ])
@@ -435,11 +466,11 @@ def test_sandbox_doctor_json_fails_closed_for_unsupported_report(kwargs):
 
 @pytest.mark.parametrize("fixture", [
     b'[]',
-    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}',
-    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{},"checks":{}}',
-    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{},"sandbox.helpers":{}}}',
-    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{},"details":{}}}}',
-    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{"sandbox backend":"mxc","sandbox backend":"elevated"}}}}',
+    b'{"schemaVersion":1,"codexVersion":"1.2.3","sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}',
+    b'{"schemaVersion":1,"codexVersion":"1.2.3","checks":{},"checks":{}}',
+    b'{"schemaVersion":1,"codexVersion":"1.2.3","checks":{"sandbox.helpers":{},"sandbox.helpers":{}}}',
+    b'{"schemaVersion":1,"codexVersion":"1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{},"details":{}}}}',
+    b'{"schemaVersion":1,"codexVersion":"1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{"sandbox backend":"mxc","sandbox backend":"elevated"}}}}',
     b'{not json}',
 ])
 def test_sandbox_doctor_json_rejects_duplicate_keys_and_malformed_json(fixture):
@@ -479,6 +510,26 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
     result = producer.invoke(b"request")
     assert result.status is ProducerStatus.PRODUCER_ERROR
     assert result.candidate_proposal is None
+    assert producer.task_attempt_count == runner.calls == 0
+
+
+def test_cli_raw_version_must_match_attested_raw_version_before_other_diagnostics(tmp_path, monkeypatch):
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, preflight=o2c.CodexCliPreflightProbe(), runner=runner)
+    assert producer._deployment.codex_executable_version == "codex-cli 1.2.3"
+    calls = []
+
+    def diagnostic(command, child_environment, timeout_seconds):
+        calls.append(tuple(command))
+        return o2c._DiagnosticOutput(
+            0, b"codex-cli 9.9.9\n", 0, hashlib.sha256(b"").hexdigest()
+        )
+
+    monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert len(calls) == 1 and calls[0][-1] == "--version"
     assert producer.task_attempt_count == runner.calls == 0
 
 
@@ -639,7 +690,10 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
             self.calls += 1
             duplicate_rows = o2c._feature_rows(b"apps stable false\napps stable true\n")
             remaining = tuple((name, False) for name in o2c.CAPABILITY_DENY_SET if name != "apps")
-            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0, "fixture-backend", 0)
+            raw_version, package_version = o2c._parse_codex_cli_version(args[1].encode("utf-8"))
+            return o2c.CodexEffectiveState(
+                (*duplicate_rows, *remaining), 0, "fixture-backend", 0, raw_version, package_version
+            )
 
     runner = FakeRunner()
     producer, _, _ = configured(tmp_path, preflight=DuplicateFeaturePreflight(), runner=runner)

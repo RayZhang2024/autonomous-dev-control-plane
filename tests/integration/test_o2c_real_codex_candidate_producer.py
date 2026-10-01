@@ -27,8 +27,10 @@ FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
 class FakePreflight:
     def inspect(self, *args):
+        raw_version, package_version = o2c._parse_codex_cli_version(args[1].encode("utf-8"))
         return o2c.CodexEffectiveState(
-            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend", 0
+            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend", 0,
+            raw_version, package_version,
         )
 
 
@@ -83,7 +85,7 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     )
     runner = FakeContainedRunner()
     configuration = o2c.CodexCliConfiguration(
-            str(executable), "fixture-codex 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
+            str(executable), "codex-cli 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
             str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value, "fixture-environment-id",
         )
     producer = o2c.CodexCliCandidateProducer(
@@ -122,6 +124,10 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert record["deployment_attestation"]["attestation_id"] == "b" * 64
     assert record["deployment_attestation"]["worker_environment_id"] == "fixture-environment-id"
     assert record["deployment_attestation"]["evidence_items"]
+    assert record["deployment_attestation"]["codex_executable_version"] == "codex-cli 0"
+    assert record["measured_runtime"]["codex_cli_version_raw"] == "codex-cli 0"
+    assert record["measured_runtime"]["codex_package_version"] == "0"
+    assert record["measured_runtime"]["codex_version"]["value"] == "codex-cli 0"
     assert record["measured_runtime"]["codex_executable_sha256_before"] == record["measured_runtime"]["codex_executable_sha256_after"]
     assert record["measured_runtime"]["candidate_workspace_git_present"] is False
     assert record["measured_runtime"]["sandbox_implementation"] == "fixture-backend"
@@ -150,7 +156,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     executable = tmp_path / "codex.exe"
     executable.write_bytes(b"fake pinned executable")
     configuration = o2c.CodexCliConfiguration(
-        str(executable), "fixture-codex 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
+        str(executable), "codex-cli 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
         str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value, "fixture-environment-id",
     )
     environment = {
@@ -169,7 +175,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         assert child_environment["CODEX_HOME"] == str(codex_home)
         assert child_environment["HOME"] == str(worker_home)
         if command == (str(executable), "--version"):
-            stdout = b"fixture-codex 0\n"
+            stdout = b"codex-cli 0\n"
         elif command[-2:] == ("features", "list"):
             stdout = features
         elif command[-3:] == ("mcp", "list", "--json"):
@@ -187,7 +193,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
             stdout = json.dumps({
                 "schemaVersion": 1, "generatedAt": "fixture",
                 "overallStatus": "fail" if doctor_exit_code != 0 else "ok",
-                "codexVersion": "fixture-codex 0", "checks": report_checks,
+                "codexVersion": "0", "checks": report_checks,
             }).encode("utf-8")
         else:
             raise AssertionError(f"unexpected diagnostic command: {command!r}")
@@ -208,6 +214,8 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     assert result.status is ProducerStatus.SUCCESS
     assert result.untrusted_metadata.sandbox_implementation == "mxc"
     assert result.untrusted_metadata.doctor_exit_code == doctor_exit_code
+    assert result.untrusted_metadata.codex_cli_version_raw == "codex-cli 0"
+    assert result.untrusted_metadata.codex_package_version == "0"
     assert calls[-1] == (str(executable), "doctor", "--json")
     record = _build_smoke_record(
         producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",
@@ -272,7 +280,7 @@ def test_real_smoke_context_rejects_missing_attestation_freshness_fields(missing
         "worker_identity": o2c._current_worker_identity(),
         "source_head_sha": "a" * 40,
         "codex_executable_path": "C:\\fixture\\codex.exe",
-        "codex_executable_version": "fixture-codex",
+        "codex_executable_version": "codex-cli fixture",
         "codex_executable_sha256": "b" * 64,
         "evidence_items": [asdict(item) for item in evidence],
         "attestation_id": "c" * 64,
@@ -330,6 +338,8 @@ def _build_smoke_record(
             "codex_version": {"value": metadata.codex_version, "measured_before_task": metadata.codex_version_measured_before_task},
             "codex_executable_sha256_before": metadata.codex_executable_sha256_before,
             "codex_executable_sha256_after": metadata.codex_executable_sha256_after,
+            "codex_cli_version_raw": metadata.codex_cli_version_raw,
+            "codex_package_version": metadata.codex_package_version,
             "effective_denied_feature_map": dict(metadata.measured_features),
             "configured_mcp_server_count": metadata.measured_mcp_server_count,
             "sandbox_implementation": metadata.sandbox_implementation,
