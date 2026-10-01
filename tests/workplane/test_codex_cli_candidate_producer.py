@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import threading
@@ -31,6 +32,7 @@ class FakePreflight:
             tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
             0,
             "fixture-backend",
+            0,
         )
 
 
@@ -360,37 +362,95 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
 
 def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend", 0))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend", 0))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend", 0))
+
+
+DOCTOR_VERSION = "codex 1.2.3"
+_UNSET = object()
+
+
+def doctor_json_fixture(
+    *, schema_version=1, codex_version=DOCTOR_VERSION, checks=_UNSET, check=_UNSET,
+    include_schema=True, include_checks=True, include_version=True,
+):
+    if check is _UNSET:
+        check = {
+            "id": "sandbox.helpers", "category": "sandbox", "status": "ok",
+            "summary": "fixture", "details": {"sandbox backend": "mxc"},
+            "issues": [], "notes": [], "remediation": None, "durationMs": 0,
+        }
+    report = {"generatedAt": "fixture", "overallStatus": "ok"}
+    if include_schema:
+        report["schemaVersion"] = schema_version
+    if include_version:
+        report["codexVersion"] = codex_version
+    if include_checks:
+        report["checks"] = {"sandbox.helpers": check} if checks is _UNSET else checks
+    return json.dumps(report).encode("utf-8")
 
 
 def test_sandbox_doctor_json_extracts_exact_backend_value():
-    fixture = b'{"sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}'
-    assert o2c._sandbox_implementation(fixture) == "mxc"
+    assert o2c._sandbox_implementation(doctor_json_fixture(), DOCTOR_VERSION) == "mxc"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"include_schema": False},
+    {"schema_version": 2},
+    {"schema_version": True},
+    {"schema_version": "1"},
+    {"include_checks": False},
+    {"checks": []},
+    {"checks": "bad"},
+    {"checks": None},
+    {"checks": False},
+    {"include_version": False},
+    {"checks": {}},
+    {"checks": {"sandbox.helpers": None}},
+    {"checks": {"sandbox.helpers": []}},
+    {"check": {"id": "other", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "mxc"}}},
+    {"check": {"id": "sandbox.helpers", "category": "other", "status": "ok", "details": {"sandbox backend": "mxc"}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "fail", "details": {"sandbox backend": "mxc"}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "unknown", "details": {"sandbox backend": "mxc"}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": 1, "details": {"sandbox backend": "mxc"}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok"}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": []}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": ["mxc", "elevated"]}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": ""}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "x" * 129}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "mxc\x00bad"}}},
+    {"check": {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "mxc\x01bad"}}},
+    {"codex_version": "codex 1.2.3-extra"},
+    {"codex_version": ""},
+    {"codex_version": 1},
+])
+def test_sandbox_doctor_json_fails_closed_for_unsupported_report(kwargs):
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(doctor_json_fixture(**kwargs), DOCTOR_VERSION)
 
 
 @pytest.mark.parametrize("fixture", [
-    b'{"overallStatus":"ok"}',
-    b'{"sandbox.helpers":{"details":{}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc","sandbox backend":"elevated"}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":""}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"   "}}}',
-    b'{not json}',
     b'[]',
-    b'{"sandbox.helpers":"ok"}',
-    b'{"sandbox.helpers":{"details":[]}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":42}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"' + b"x" * 129 + b'"}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc\\u0000bad"}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc\\u0001bad"}}}',
-    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc"}},"sandbox.helpers":{"details":{"sandbox backend":"elevated"}}}',
+    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}',
+    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{},"checks":{}}',
+    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{},"sandbox.helpers":{}}}',
+    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{},"details":{}}}}',
+    b'{"schemaVersion":1,"codexVersion":"codex 1.2.3","checks":{"sandbox.helpers":{"id":"sandbox.helpers","category":"sandbox","status":"ok","details":{"sandbox backend":"mxc","sandbox backend":"elevated"}}}}',
+    b'{not json}',
 ])
-def test_sandbox_doctor_json_fails_closed_for_missing_duplicate_or_malformed_backend(fixture):
+def test_sandbox_doctor_json_rejects_duplicate_keys_and_malformed_json(fixture):
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._sandbox_implementation(fixture)
+        o2c._sandbox_implementation(fixture, DOCTOR_VERSION)
+
+
+@pytest.mark.parametrize("status", ["ok", "warning"])
+def test_sandbox_doctor_json_accepts_nonfailing_check_statuses(status):
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": status, "details": {"sandbox backend": "mxc"}}
+    assert o2c._sandbox_implementation(doctor_json_fixture(check=check), DOCTOR_VERSION) == "mxc"
 
 
 def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_attempt(tmp_path, monkeypatch):
@@ -406,10 +466,14 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
         elif command[-3:] == ("mcp", "list", "--json"):
             stdout = b"[]"
         elif command[-2:] == ("doctor", "--json"):
-            stdout = b'{"sandbox.helpers":{"status":"ok","details":{}}}'
+            stdout = doctor_json_fixture(check={
+                "id": "sandbox.helpers", "category": "sandbox", "status": "fail",
+                "details": {"sandbox backend": "mxc"},
+            })
         else:
             raise AssertionError(f"unexpected diagnostic command: {command!r}")
-        return o2c._DiagnosticOutput(0, stdout, 0, hashlib.sha256(b"").hexdigest())
+        exit_code = 9 if command[-2:] == ("doctor", "--json") else 0
+        return o2c._DiagnosticOutput(exit_code, stdout, 0, hashlib.sha256(b"").hexdigest())
 
     monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
     result = producer.invoke(b"request")
@@ -575,7 +639,7 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
             self.calls += 1
             duplicate_rows = o2c._feature_rows(b"apps stable false\napps stable true\n")
             remaining = tuple((name, False) for name in o2c.CAPABILITY_DENY_SET if name != "apps")
-            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0, "fixture-backend")
+            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0, "fixture-backend", 0)
 
     runner = FakeRunner()
     producer, _, _ = configured(tmp_path, preflight=DuplicateFeaturePreflight(), runner=runner)

@@ -268,6 +268,7 @@ class CodexEffectiveState:
     features: tuple[tuple[str, bool], ...]
     mcp_server_count: int
     sandbox_implementation: str
+    doctor_exit_code: int
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,7 @@ class CodexRunDiagnostics:
     measured_features: tuple[tuple[str, bool], ...]
     measured_mcp_server_count: int
     sandbox_implementation: str
+    doctor_exit_code: int
     candidate_workspace_git_present: bool
     job_assignment_succeeded: bool
     root_process_resumed_after_assignment: bool
@@ -501,6 +503,8 @@ def _validate_effective_state(state: CodexEffectiveState) -> None:
     if type(state.mcp_server_count) is not int or state.mcp_server_count != 0:
         raise O2cPreflightError("effective MCP server count is not zero")
     _validate_sandbox_implementation(state.sandbox_implementation)
+    if type(state.doctor_exit_code) is not int:
+        raise O2cPreflightError("Codex doctor exit code is invalid")
     for name in ("browser_use", "browser_use_full_cdp_access", "browser_use_external", "computer_use", "in_app_browser", "in_app_local_automation"):
         if name in feature_map and feature_map[name]:
             raise O2cPreflightError("runtime-measured browser/computer capability is enabled")
@@ -938,6 +942,7 @@ class CodexCliCandidateProducer:
                 measured_features=state.features,
                 measured_mcp_server_count=state.mcp_server_count,
                 sandbox_implementation=state.sandbox_implementation,
+                doctor_exit_code=state.doctor_exit_code,
                 candidate_workspace_git_present=candidate_workspace_git_present,
                 job_assignment_succeeded=outcome.job_assignment_succeeded,
                 root_process_resumed_after_assignment=outcome.root_process_resumed_after_assignment,
@@ -1099,7 +1104,7 @@ def _reject_json_constant(value: str) -> object:
     raise O2cPreflightError(f"Codex doctor JSON contains unsupported constant: {value}")
 
 
-def _sandbox_implementation(output: bytes) -> str:
+def _sandbox_implementation(output: bytes, expected_codex_version: str) -> str:
     if type(output) is not bytes or len(output) > MAX_STDIO_DIAGNOSTIC_BYTES:
         raise O2cPreflightError("Codex doctor JSON exceeded the bounded parser limit")
     try:
@@ -1112,9 +1117,27 @@ def _sandbox_implementation(output: bytes) -> str:
         raise O2cPreflightError("Codex doctor diagnostic was malformed JSON") from error
     if type(document) is not dict:
         raise O2cPreflightError("Codex doctor diagnostic has an unsupported root shape")
-    sandbox_diagnostic = document.get("sandbox.helpers")
+    schema_version = document.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != 1:
+        raise O2cPreflightError("Codex doctor diagnostic schema version is unsupported")
+    codex_version = document.get("codexVersion")
+    if type(codex_version) is not str or not codex_version or codex_version != expected_codex_version:
+        raise O2cPreflightError("Codex doctor report version does not match the pinned executable")
+    checks = document.get("checks")
+    if type(checks) is not dict:
+        raise O2cPreflightError("Codex doctor diagnostic checks has an unsupported shape")
+    sandbox_diagnostic = checks.get("sandbox.helpers")
     if type(sandbox_diagnostic) is not dict:
-        raise O2cPreflightError("Codex doctor diagnostic lacks one sandbox.helpers object")
+        raise O2cPreflightError("Codex doctor diagnostic lacks checks.sandbox.helpers")
+    if sandbox_diagnostic.get("id") != "sandbox.helpers":
+        raise O2cPreflightError("Codex doctor sandbox check identifier is unsupported")
+    if sandbox_diagnostic.get("category") != "sandbox":
+        raise O2cPreflightError("Codex doctor sandbox check category is unsupported")
+    status = sandbox_diagnostic.get("status")
+    if type(status) is not str or status not in ("ok", "warning", "fail"):
+        raise O2cPreflightError("Codex doctor sandbox check status is unsupported")
+    if status == "fail":
+        raise O2cPreflightError("Codex doctor sandbox check failed")
     details = sandbox_diagnostic.get("details")
     if type(details) is not dict or "sandbox backend" not in details:
         raise O2cPreflightError("Codex doctor diagnostic lacks the sandbox backend value")
@@ -1180,13 +1203,16 @@ class CodexCliPreflightProbe:
             child_environment,
             min(timeout_seconds, 30),
         )
-        if sandbox_result.exit_code != 0:
-            raise O2cPreflightError("Codex sandbox backend diagnostic failed")
-        sandbox_implementation = _sandbox_implementation(sandbox_result.stdout)
+        # The doctor process status aggregates unrelated checks. Preserve it in
+        # measured state and gate this measurement on sandbox.helpers itself.
+        sandbox_implementation = _sandbox_implementation(
+            sandbox_result.stdout, expected_version
+        )
         state = CodexEffectiveState(
             features=features,
             mcp_server_count=len(mcp_roster),
             sandbox_implementation=sandbox_implementation,
+            doctor_exit_code=sandbox_result.exit_code,
         )
         _validate_effective_state(state)
         return state

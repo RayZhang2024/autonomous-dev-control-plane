@@ -28,7 +28,7 @@ FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 class FakePreflight:
     def inspect(self, *args):
         return o2c.CodexEffectiveState(
-            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend"
+            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend", 0
         )
 
 
@@ -142,7 +142,8 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert "safe" not in record
 
 
-def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(tmp_path, monkeypatch):
+@pytest.mark.parametrize("doctor_exit_code", [0, 9])
+def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(tmp_path, monkeypatch, doctor_exit_code):
     worker_home, codex_home, scratch_root = (tmp_path / name for name in ("worker-home", "codex-home", "scratch"))
     for path in (worker_home, codex_home, scratch_root):
         path.mkdir()
@@ -174,10 +175,24 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         elif command[-3:] == ("mcp", "list", "--json"):
             stdout = b"[]"
         elif command == (str(executable), "doctor", "--json"):
-            stdout = b'{"sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}'
+            report_checks = {
+                "sandbox.helpers": {
+                    "id": "sandbox.helpers", "category": "sandbox", "status": "ok",
+                    "summary": "fixture", "details": {"sandbox backend": "mxc"},
+                    "issues": [], "notes": [], "remediation": None, "durationMs": 0,
+                },
+            }
+            if doctor_exit_code != 0:
+                report_checks["unrelated.check"] = {"id": "unrelated.check", "status": "fail"}
+            stdout = json.dumps({
+                "schemaVersion": 1, "generatedAt": "fixture",
+                "overallStatus": "fail" if doctor_exit_code != 0 else "ok",
+                "codexVersion": "fixture-codex 0", "checks": report_checks,
+            }).encode("utf-8")
         else:
             raise AssertionError(f"unexpected diagnostic command: {command!r}")
-        return o2c._DiagnosticOutput(0, stdout, 0, hashlib.sha256(b"").hexdigest())
+        exit_code = doctor_exit_code if command == (str(executable), "doctor", "--json") else 0
+        return o2c._DiagnosticOutput(exit_code, stdout, 0, hashlib.sha256(b"").hexdigest())
 
     monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
     producer = o2c.CodexCliCandidateProducer(
@@ -192,6 +207,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     result = producer.invoke(b"fixture request")
     assert result.status is ProducerStatus.SUCCESS
     assert result.untrusted_metadata.sandbox_implementation == "mxc"
+    assert result.untrusted_metadata.doctor_exit_code == doctor_exit_code
     assert calls[-1] == (str(executable), "doctor", "--json")
     record = _build_smoke_record(
         producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",
@@ -199,6 +215,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         source_clean_before=True, source_clean_after=True,
     )
     assert record["measured_runtime"]["sandbox_implementation"] == "mxc"
+    assert record["measured_runtime"]["doctor_exit_code"] == doctor_exit_code
     assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
     assert record["measured_runtime"]["candidate_workspace_git_present"] is False
 
@@ -316,6 +333,7 @@ def _build_smoke_record(
             "effective_denied_feature_map": dict(metadata.measured_features),
             "configured_mcp_server_count": metadata.measured_mcp_server_count,
             "sandbox_implementation": metadata.sandbox_implementation,
+            "doctor_exit_code": metadata.doctor_exit_code,
             "stdout": {"byte_count": metadata.stdout_byte_count, "sha256": metadata.stdout_sha256},
             "stderr": {"byte_count": metadata.stderr_byte_count, "sha256": metadata.stderr_sha256},
             "workspace_final_regular_file_count": metadata.workspace_file_count,
