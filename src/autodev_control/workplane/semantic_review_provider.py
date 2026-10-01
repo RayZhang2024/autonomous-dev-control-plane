@@ -1,4 +1,15 @@
-"""Fixture-only semantic-review transport with opaque requests and responses."""
+"""Fixture-only transport for opaque request bytes and raw responses.
+
+O1 does not establish CanonicalRequestId, trusted canonical-request
+serialization, correspondence to TrustedReviewEnvelope, trusted
+review-input-manifest binding, disclosure authorization, trusted provider or
+model identity, submission-event identity, trusted invocation provenance,
+Evidence Admission, or lifecycle or authority consequences.
+
+A trusted caller may supply canonical bytes for mechanical forwarding; this
+adapter adds no trust or binding. TIMEOUT is a configured synthetic fixture
+outcome only.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +43,7 @@ class ProviderResult:
 
 
 class SemanticReviewProvider(Protocol):
-    def invoke(self, canonical_request_bytes: bytes) -> ProviderResult: ...
+    def invoke(self, request_bytes: bytes) -> ProviderResult: ...
 
 
 class ScriptedSemanticReviewProvider:
@@ -43,7 +54,7 @@ class ScriptedSemanticReviewProvider:
         self.attempt_count = 0
         self.last_request_bytes: bytes | None = None
 
-    def invoke(self, canonical_request_bytes: bytes) -> ProviderResult:
+    def invoke(self, request_bytes: bytes) -> ProviderResult:
         self.attempt_count += 1
-        self.last_request_bytes = canonical_request_bytes
+        self.last_request_bytes = request_bytes
         return self._scripted_result
