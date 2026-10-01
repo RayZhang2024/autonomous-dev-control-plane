@@ -1,6 +1,7 @@
 """Boundary tests for the fixture-only, untrusted provider adapter."""
 
 import ast
+import inspect
 import builtins
 import os
 from pathlib import Path
@@ -14,8 +15,15 @@ from autodev_control.workplane.semantic_review_provider import (
     ProviderResult,
     ProviderStatus,
     ScriptedSemanticReviewProvider,
+    SemanticReviewProvider,
 )
 
+
+def test_protocol_uses_non_authoritative_request_terminology() -> None:
+    parameters = inspect.signature(SemanticReviewProvider.invoke).parameters
+
+    assert list(parameters) == ["self", "request_bytes"]
+    assert parameters["request_bytes"].annotation in (bytes, "bytes")
 
 def test_exact_request_and_response_bytes_are_unchanged() -> None:
     request = b'\x00\xff\n{"instruction":"opaque"}'
