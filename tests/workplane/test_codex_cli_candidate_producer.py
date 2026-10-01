@@ -30,6 +30,7 @@ class FakePreflight:
         return o2c.CodexEffectiveState(
             tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
             0,
+            "fixture-backend",
         )
 
 
@@ -339,6 +340,10 @@ def test_frozen_command_profile_and_environment_allowlist():
     assert profile.auth_credential_store_requested == "keyring" and profile.login_method_requested == "chatgpt"
     assert profile.ephemeral and profile.ignore_user_config and profile.ignore_rules
     assert profile.job_object_limits == o2c.JobObjectLimits(True, False, False, 64, 4_294_967_296, 80)
+    assert profile.process_containment_kind == "windows_job_object"
+    assert profile.workspace_path_class == "fresh_invocation_plain_non_git_workspace"
+    assert profile.target_repository_credentials_intentionally_present is False
+    assert profile.control_root_credentials_intentionally_present is False
 
 
 def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_path):
@@ -355,11 +360,62 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
 
 def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0))
+        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend"))
+
+
+def test_sandbox_doctor_json_extracts_exact_backend_value():
+    fixture = b'{"sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}'
+    assert o2c._sandbox_implementation(fixture) == "mxc"
+
+
+@pytest.mark.parametrize("fixture", [
+    b'{"overallStatus":"ok"}',
+    b'{"sandbox.helpers":{"details":{}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc","sandbox backend":"elevated"}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":""}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"   "}}}',
+    b'{not json}',
+    b'[]',
+    b'{"sandbox.helpers":"ok"}',
+    b'{"sandbox.helpers":{"details":[]}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":42}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"' + b"x" * 129 + b'"}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc\\u0000bad"}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc\\u0001bad"}}}',
+    b'{"sandbox.helpers":{"details":{"sandbox backend":"mxc"}},"sandbox.helpers":{"details":{"sandbox backend":"elevated"}}}',
+])
+def test_sandbox_doctor_json_fails_closed_for_missing_duplicate_or_malformed_backend(fixture):
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(fixture)
+
+
+def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_attempt(tmp_path, monkeypatch):
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, preflight=o2c.CodexCliPreflightProbe(), runner=runner)
+    features = b"".join(f"{name} stable false\n".encode() for name in o2c.CAPABILITY_DENY_SET)
+
+    def diagnostic(command, child_environment, timeout_seconds):
+        if command[-1:] == ("--version",):
+            stdout = producer._configuration.expected_codex_version.encode() + b"\n"
+        elif command[-2:] == ("features", "list"):
+            stdout = features
+        elif command[-3:] == ("mcp", "list", "--json"):
+            stdout = b"[]"
+        elif command[-2:] == ("doctor", "--json"):
+            stdout = b'{"sandbox.helpers":{"status":"ok","details":{}}}'
+        else:
+            raise AssertionError(f"unexpected diagnostic command: {command!r}")
+        return o2c._DiagnosticOutput(0, stdout, 0, hashlib.sha256(b"").hexdigest())
+
+    monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert producer.task_attempt_count == runner.calls == 0
 
 
 @pytest.mark.parametrize("row", [
@@ -519,7 +575,7 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
             self.calls += 1
             duplicate_rows = o2c._feature_rows(b"apps stable false\napps stable true\n")
             remaining = tuple((name, False) for name in o2c.CAPABILITY_DENY_SET if name != "apps")
-            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0)
+            return o2c.CodexEffectiveState((*duplicate_rows, *remaining), 0, "fixture-backend")
 
     runner = FakeRunner()
     producer, _, _ = configured(tmp_path, preflight=DuplicateFeaturePreflight(), runner=runner)

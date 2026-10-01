@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from typing import Callable, Mapping, Protocol, Sequence
 
 from .candidate_producer import (
@@ -44,6 +45,7 @@ MAX_FILE_BYTES = 4_194_304
 MAX_TOTAL_FILE_BYTES = 33_554_432
 MAX_TREE_DEPTH = 32
 MAX_STDIO_DIAGNOSTIC_BYTES = 65_536
+MAX_SANDBOX_IMPLEMENTATION_BYTES = 128
 MAX_TIMEOUT_SECONDS = 1_800
 MAX_JOB_ACTIVE_PROCESSES = 64
 MAX_JOB_MEMORY_BYTES = 4_294_967_296
@@ -261,10 +263,11 @@ class CodexCliConfiguration:
 
 @dataclass(frozen=True)
 class CodexEffectiveState:
-    """Runtime-measured feature and MCP facts from the pinned CLI."""
+    """Runtime-measured feature, MCP, and sandbox facts from the pinned CLI."""
 
     features: tuple[tuple[str, bool], ...]
     mcp_server_count: int
+    sandbox_implementation: str
 
 
 @dataclass(frozen=True)
@@ -292,6 +295,7 @@ class CodexRunDiagnostics:
     resource_limit_violation: bool
     measured_features: tuple[tuple[str, bool], ...]
     measured_mcp_server_count: int
+    sandbox_implementation: str
     candidate_workspace_git_present: bool
     job_assignment_succeeded: bool
     root_process_resumed_after_assignment: bool
@@ -496,9 +500,24 @@ def _validate_effective_state(state: CodexEffectiveState) -> None:
         raise O2cPreflightError("frozen Codex capability deny set is not effectively disabled")
     if type(state.mcp_server_count) is not int or state.mcp_server_count != 0:
         raise O2cPreflightError("effective MCP server count is not zero")
+    _validate_sandbox_implementation(state.sandbox_implementation)
     for name in ("browser_use", "browser_use_full_cdp_access", "browser_use_external", "computer_use", "in_app_browser", "in_app_local_automation"):
         if name in feature_map and feature_map[name]:
             raise O2cPreflightError("runtime-measured browser/computer capability is enabled")
+
+
+def _validate_sandbox_implementation(value: object) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise O2cPreflightError("sandbox implementation diagnostic is missing or malformed")
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise O2cPreflightError("sandbox implementation diagnostic is not UTF-8") from error
+    if len(encoded) > MAX_SANDBOX_IMPLEMENTATION_BYTES or any(
+        unicodedata.category(character) == "Cc" for character in value
+    ):
+        raise O2cPreflightError("sandbox implementation diagnostic is not bounded plain text")
+    return value
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -918,6 +937,7 @@ class CodexCliCandidateProducer:
                 resource_limit_violation=outcome.resource_limit_violation,
                 measured_features=state.features,
                 measured_mcp_server_count=state.mcp_server_count,
+                sandbox_implementation=state.sandbox_implementation,
                 candidate_workspace_git_present=candidate_workspace_git_present,
                 job_assignment_succeeded=outcome.job_assignment_succeeded,
                 root_process_resumed_after_assignment=outcome.root_process_resumed_after_assignment,
@@ -1066,8 +1086,43 @@ def _feature_rows(output: bytes) -> tuple[tuple[str, bool], ...]:
     return tuple(rows)
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise O2cPreflightError("Codex doctor JSON contains duplicate object keys")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise O2cPreflightError(f"Codex doctor JSON contains unsupported constant: {value}")
+
+
+def _sandbox_implementation(output: bytes) -> str:
+    if type(output) is not bytes or len(output) > MAX_STDIO_DIAGNOSTIC_BYTES:
+        raise O2cPreflightError("Codex doctor JSON exceeded the bounded parser limit")
+    try:
+        document = json.loads(
+            output.decode("utf-8", errors="strict"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise O2cPreflightError("Codex doctor diagnostic was malformed JSON") from error
+    if type(document) is not dict:
+        raise O2cPreflightError("Codex doctor diagnostic has an unsupported root shape")
+    sandbox_diagnostic = document.get("sandbox.helpers")
+    if type(sandbox_diagnostic) is not dict:
+        raise O2cPreflightError("Codex doctor diagnostic lacks one sandbox.helpers object")
+    details = sandbox_diagnostic.get("details")
+    if type(details) is not dict or "sandbox backend" not in details:
+        raise O2cPreflightError("Codex doctor diagnostic lacks the sandbox backend value")
+    return _validate_sandbox_implementation(details["sandbox backend"])
+
+
 class CodexCliPreflightProbe:
-    """Query the pinned CLI's version, effective features and MCP roster.
+    """Query the pinned CLI's version, features, MCP roster and sandbox backend.
 
     The deployment assessment supplies facts that a CLI list cannot establish
     (read isolation, managed-policy provenance and dedicated identity). Those
@@ -1120,7 +1175,19 @@ class CodexCliPreflightProbe:
             raise O2cPreflightError("Codex MCP diagnostic was not valid JSON") from error
         if type(mcp_roster) is not list:
             raise O2cPreflightError("Codex MCP diagnostic has an unsupported shape")
-        state = CodexEffectiveState(features=features, mcp_server_count=len(mcp_roster))
+        sandbox_result = _run_bounded_diagnostic(
+            (executable_path, "doctor", "--json"),
+            child_environment,
+            min(timeout_seconds, 30),
+        )
+        if sandbox_result.exit_code != 0:
+            raise O2cPreflightError("Codex sandbox backend diagnostic failed")
+        sandbox_implementation = _sandbox_implementation(sandbox_result.stdout)
+        state = CodexEffectiveState(
+            features=features,
+            mcp_server_count=len(mcp_roster),
+            sandbox_implementation=sandbox_implementation,
+        )
         _validate_effective_state(state)
         return state
 
@@ -1149,13 +1216,18 @@ class CodexConfiguredExecutionProfile:
     ignore_user_config: bool
     ignore_rules: bool
     job_object_limits: JobObjectLimits
+    process_containment_kind: str
+    workspace_path_class: str
+    target_repository_credentials_intentionally_present: bool
+    control_root_credentials_intentionally_present: bool
 
 
 def configured_execution_profile() -> CodexConfiguredExecutionProfile:
     """Return the frozen requested profile, not a claim of runtime observation."""
     return CodexConfiguredExecutionProfile(
         "workspace-write", "never", False, "disabled", (), True, "keyring", "chatgpt",
-        True, True, True, JobObjectLimits(),
+        True, True, True, JobObjectLimits(), "windows_job_object",
+        "fresh_invocation_plain_non_git_workspace", False, False,
     )
 
 

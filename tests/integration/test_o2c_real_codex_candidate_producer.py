@@ -28,7 +28,7 @@ FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 class FakePreflight:
     def inspect(self, *args):
         return o2c.CodexEffectiveState(
-            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0
+            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend"
         )
 
 
@@ -124,11 +124,83 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert record["deployment_attestation"]["evidence_items"]
     assert record["measured_runtime"]["codex_executable_sha256_before"] == record["measured_runtime"]["codex_executable_sha256_after"]
     assert record["measured_runtime"]["candidate_workspace_git_present"] is False
+    assert record["measured_runtime"]["sandbox_implementation"] == "fixture-backend"
     assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
+    assert record["configured_requested_execution_profile"]["process_containment_kind"] == "windows_job_object"
+    assert record["configured_requested_execution_profile"]["workspace_path_class"] == "fresh_invocation_plain_non_git_workspace"
+    assert record["configured_requested_execution_profile"]["target_github_credentials_intentionally_present"] is False
+    assert record["configured_requested_execution_profile"]["control_root_credentials_intentionally_present"] is False
     assert record["configured_requested_execution_profile"]["job_object_limits"]["kill_on_job_close"] is True
     assert record["containment_result"]["job_assignment_succeeded"] is True
+    external_checks = {item["check_id"] for item in record["deployment_attestation"]["evidence_items"]}
+    assert {
+        "target_repository_publication_authority_absent",
+        "control_state_authority_absent",
+        "root_authority_absent",
+    } <= external_checks
     assert record["candidate_and_admission"]["o2b_candidate_commit_id"] == materialized.candidate.candidate_commit_id
     assert "safe" not in record
+
+
+def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(tmp_path, monkeypatch):
+    worker_home, codex_home, scratch_root = (tmp_path / name for name in ("worker-home", "codex-home", "scratch"))
+    for path in (worker_home, codex_home, scratch_root):
+        path.mkdir()
+    executable = tmp_path / "codex.exe"
+    executable.write_bytes(b"fake pinned executable")
+    configuration = o2c.CodexCliConfiguration(
+        str(executable), "fixture-codex 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
+        str(worker_home), str(codex_home), str(scratch_root), 30, o2b_test.BASE.value, "fixture-environment-id",
+    )
+    environment = {
+        "PATH": "system-path", "HOME": str(worker_home), "USERPROFILE": str(worker_home),
+        "CODEX_HOME": str(codex_home),
+    }
+    seed = o2c.CodexWorkspaceSeed(
+        o2b_test.BASE.value,
+        (o2c.CodexWorkspaceFile("o2c-input.txt", b"input", "100644"),),
+    )
+    features = b"".join(f"{name} stable false\n".encode() for name in o2c.CAPABILITY_DENY_SET)
+    calls = []
+
+    def diagnostic(command, child_environment, timeout_seconds):
+        calls.append(tuple(command))
+        assert child_environment["CODEX_HOME"] == str(codex_home)
+        assert child_environment["HOME"] == str(worker_home)
+        if command == (str(executable), "--version"):
+            stdout = b"fixture-codex 0\n"
+        elif command[-2:] == ("features", "list"):
+            stdout = features
+        elif command[-3:] == ("mcp", "list", "--json"):
+            stdout = b"[]"
+        elif command == (str(executable), "doctor", "--json"):
+            stdout = b'{"sandbox.helpers":{"status":"ok","details":{"sandbox backend":"mxc"}}}'
+        else:
+            raise AssertionError(f"unexpected diagnostic command: {command!r}")
+        return o2c._DiagnosticOutput(0, stdout, 0, hashlib.sha256(b"").hexdigest())
+
+    monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
+    producer = o2c.CodexCliCandidateProducer(
+        configuration,
+        seed,
+        _fixture_attestation(configuration),
+        preflight=o2c.CodexCliPreflightProbe(),
+        runner=FakeContainedRunner(),
+        parent_environment=environment,
+        clock=lambda: FIXED_NOW,
+    )
+    result = producer.invoke(b"fixture request")
+    assert result.status is ProducerStatus.SUCCESS
+    assert result.untrusted_metadata.sandbox_implementation == "mxc"
+    assert calls[-1] == (str(executable), "doctor", "--json")
+    record = _build_smoke_record(
+        producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",
+        (), source_head_before=o2b_test.BASE.value, source_head_after=o2b_test.BASE.value,
+        source_clean_before=True, source_clean_after=True,
+    )
+    assert record["measured_runtime"]["sandbox_implementation"] == "mxc"
+    assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
+    assert record["measured_runtime"]["candidate_workspace_git_present"] is False
 
 
 def _real_smoke_context() -> tuple[dict[str, object], Path]:
@@ -209,6 +281,10 @@ def _build_smoke_record(
     source_clean_after: bool,
 ) -> dict[str, object]:
     evidence_items = [asdict(item) for item in attestation.evidence_items]
+    configured_profile = asdict(o2c.configured_execution_profile())
+    configured_profile["target_github_credentials_intentionally_present"] = configured_profile.pop(
+        "target_repository_credentials_intentionally_present"
+    )
     return {
         "deployment_attestation": {
             "attestation_id": attestation.attestation_id,
@@ -239,13 +315,14 @@ def _build_smoke_record(
             "codex_executable_sha256_after": metadata.codex_executable_sha256_after,
             "effective_denied_feature_map": dict(metadata.measured_features),
             "configured_mcp_server_count": metadata.measured_mcp_server_count,
+            "sandbox_implementation": metadata.sandbox_implementation,
             "stdout": {"byte_count": metadata.stdout_byte_count, "sha256": metadata.stdout_sha256},
             "stderr": {"byte_count": metadata.stderr_byte_count, "sha256": metadata.stderr_sha256},
             "workspace_final_regular_file_count": metadata.workspace_file_count,
             "proposal_change_count": metadata.proposal_change_count,
             "candidate_workspace_git_present": metadata.candidate_workspace_git_present,
         },
-        "configured_requested_execution_profile": asdict(o2c.configured_execution_profile()),
+        "configured_requested_execution_profile": configured_profile,
         "containment_result": {
             "job_assignment_succeeded": metadata.job_assignment_succeeded,
             "root_process_resumed_after_assignment": metadata.root_process_resumed_after_assignment,
