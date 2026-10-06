@@ -406,10 +406,22 @@ def test_sandbox_doctor_json_extracts_exact_backend_value():
     assert o2c._sandbox_implementation(doctor_json_fixture(), DOCTOR_VERSION) == "mxc"
 
 
+def test_codex_01601_doctor_normalizes_only_exact_redacted_backend():
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": "<redacted>"}}
+    report = doctor_json_fixture(codex_version="0.160.1", check=check)
+    assert "<redacted>" not in o2c.SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS
+    assert o2c._sandbox_implementation(report, "0.160.1") == "restricted-token"
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(report, "0.160.2")
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(doctor_json_fixture(codex_version="0.160.2", check=check), "0.160.2")
+
+
 @pytest.mark.parametrize("backend", sorted(o2c.SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS))
-def test_windows_sandbox_doctor_accepts_supported_enabled_backends(backend):
+@pytest.mark.parametrize("version", [DOCTOR_VERSION, "0.160.1"])
+def test_windows_sandbox_doctor_accepts_supported_enabled_backends(backend, version):
     check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": backend}}
-    assert o2c._sandbox_implementation(doctor_json_fixture(check=check), DOCTOR_VERSION) == backend
+    assert o2c._sandbox_implementation(doctor_json_fixture(codex_version=version, check=check), version) == backend
 
 
 @pytest.mark.parametrize("backend", ["disabled", "unknown", "", "fixture-backend"])
@@ -417,6 +429,27 @@ def test_windows_sandbox_doctor_rejects_disabled_and_unknown_backends(backend):
     check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": backend}}
     with pytest.raises(o2c.O2cPreflightError):
         o2c._sandbox_implementation(doctor_json_fixture(check=check), DOCTOR_VERSION)
+
+
+@pytest.mark.parametrize("details", [
+    {},
+    {"sandbox backend": "disabled"},
+    {"sandbox backend": "unknown"},
+    {"sandbox backend": ""},
+    {"sandbox backend": "<redacted> "},
+    {"sandbox backend": ["<redacted>"]},
+    {"sandbox backend": None},
+])
+def test_codex_01601_doctor_rejects_other_backend_values(details):
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": details}
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(doctor_json_fixture(codex_version="0.160.1", check=check), "0.160.1")
+
+
+def test_codex_01601_doctor_rejects_failing_sandbox_check_even_when_backend_is_redacted():
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": "fail", "details": {"sandbox backend": "<redacted>"}}
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(doctor_json_fixture(codex_version="0.160.1", check=check), "0.160.1")
 
 
 def test_codex_cli_version_parser_preserves_raw_line_and_derives_package_version():

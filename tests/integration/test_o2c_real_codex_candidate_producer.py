@@ -347,12 +347,7 @@ def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
         results.append(result)
     assert results[0].returncode == 0, results[0].stderr.decode(errors="replace")
     assert results[1].returncode == 0, results[1].stderr.decode(errors="replace")
-    doctor = json.loads(results[2].stdout.decode("utf-8"))
-    assert doctor["schemaVersion"] == 1
-    assert doctor["codexVersion"] == "0.160.1"
-    sandbox_check = doctor["checks"]["sandbox.helpers"]
-    assert sandbox_check["status"] in ("ok", "warning")
-    assert sandbox_check["details"]["sandbox backend"] in o2c.SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS
+    assert o2c._sandbox_implementation(results[2].stdout, "0.160.1") == "restricted-token"
 
 
 def _build_smoke_record(

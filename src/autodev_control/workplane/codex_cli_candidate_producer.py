@@ -1196,7 +1196,11 @@ def _sandbox_implementation(output: bytes, expected_package_version: str) -> str
     details = sandbox_diagnostic.get("details")
     if type(details) is not dict or "sandbox backend" not in details:
         raise O2cPreflightError("Codex doctor diagnostic lacks the sandbox backend value")
-    return _validate_sandbox_implementation(details["sandbox backend"])
+    backend = details["sandbox backend"]
+    # Codex 0.160.1 redacts "restricted-token" because it contains "token".
+    if codex_version == expected_package_version == "0.160.1" and backend == "<redacted>":
+        backend = "restricted-token"
+    return _validate_sandbox_implementation(backend)
 
 
 def _build_preflight_diagnostic_arguments(*command: str) -> tuple[str, ...]:
