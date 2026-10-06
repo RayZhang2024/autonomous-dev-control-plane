@@ -32,7 +32,7 @@ class FakePreflight:
         return o2c.CodexEffectiveState(
             tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
             0,
-            "fixture-backend",
+            "mxc",
             0,
             raw_version,
             package_version,
@@ -333,7 +333,11 @@ def test_executable_must_be_absolute_exact_exe_with_configured_hash(tmp_path):
 
 def test_frozen_command_profile_and_environment_allowlist():
     args = o2c.build_codex_arguments("C:/scratch/workspace")
-    assert args[:10] == ("exec", "--strict-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--cd", "C:/scratch/workspace")
+    assert args[:12] == (
+        "exec", "--strict-config", "-c", 'windows.sandbox="unelevated"',
+        "--sandbox", "workspace-write", "--skip-git-repo-check", "--ephemeral",
+        "--ignore-user-config", "--ignore-rules", "--cd", "C:/scratch/workspace",
+    )
     assert len([i for i, arg in enumerate(args) if arg == "--disable"]) == len(o2c.CAPABILITY_DENY_SET)
     assert all(args[i + 1] in o2c.CAPABILITY_DENY_SET for i, arg in enumerate(args[:-1]) if arg == "--disable")
     child = o2c.build_child_environment({"PATH": "p", "TEMP": "bad", "TMP": "bad", "OPENAI_API_KEY": "secret", "GH_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "secret"}, worker_home="home", codex_home="codex", runtime_tmp="runtime")
@@ -368,11 +372,11 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
 
 def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "fixture-backend", 0, "codex-cli fixture", "fixture"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState((("unknown_required", True),), 0, "mxc", 0, "codex-cli fixture", "fixture"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "fixture-backend", 0, "codex-cli fixture", "fixture"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 1, "mxc", 0, "codex-cli fixture", "fixture"))
     with pytest.raises(o2c.O2cPreflightError):
-        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "fixture-backend", 0, "codex-cli fixture", "fixture"))
+        o2c._validate_effective_state(o2c.CodexEffectiveState(tuple((name, False) for name in o2c.CAPABILITY_DENY_SET) + (("browser_use", True),), 0, "mxc", 0, "codex-cli fixture", "fixture"))
 
 
 DOCTOR_VERSION = "1.2.3"
@@ -401,6 +405,19 @@ def doctor_json_fixture(
 
 def test_sandbox_doctor_json_extracts_exact_backend_value():
     assert o2c._sandbox_implementation(doctor_json_fixture(), DOCTOR_VERSION) == "mxc"
+
+
+@pytest.mark.parametrize("backend", sorted(o2c.SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS))
+def test_windows_sandbox_doctor_accepts_supported_enabled_backends(backend):
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": backend}}
+    assert o2c._sandbox_implementation(doctor_json_fixture(check=check), DOCTOR_VERSION) == backend
+
+
+@pytest.mark.parametrize("backend", ["disabled", "unknown", "", "fixture-backend"])
+def test_windows_sandbox_doctor_rejects_disabled_and_unknown_backends(backend):
+    check = {"id": "sandbox.helpers", "category": "sandbox", "status": "ok", "details": {"sandbox backend": backend}}
+    with pytest.raises(o2c.O2cPreflightError):
+        o2c._sandbox_implementation(doctor_json_fixture(check=check), DOCTOR_VERSION)
 
 
 def test_codex_cli_version_parser_preserves_raw_line_and_derives_package_version():
@@ -489,7 +506,10 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
     producer, _, _ = configured(tmp_path, preflight=o2c.CodexCliPreflightProbe(), runner=runner)
     features = b"".join(f"{name} stable false\n".encode() for name in o2c.CAPABILITY_DENY_SET)
 
+    calls = []
+
     def diagnostic(command, child_environment, timeout_seconds):
+        calls.append(tuple(command))
         if command[-1:] == ("--version",):
             stdout = producer._configuration.expected_codex_version.encode() + b"\n"
         elif command[-2:] == ("features", "list"):
@@ -511,6 +531,19 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
     assert result.status is ProducerStatus.PRODUCER_ERROR
     assert result.candidate_proposal is None
     assert producer.task_attempt_count == runner.calls == 0
+    disabled_features = tuple(
+        argument
+        for feature in o2c.CAPABILITY_DENY_SET
+        for argument in ("--disable", feature)
+    )
+    diagnostic_prefix = ("--strict-config", "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    assert calls == [
+        (producer._configuration.absolute_codex_executable_path, "--version"),
+        (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "features", "list"),
+        (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "mcp", "list", "--json"),
+        (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "doctor", "--json"),
+    ]
+    assert all("--ignore-user-config" not in command and "--ignore-rules" not in command for command in calls[1:])
 
 
 def test_cli_raw_version_must_match_attested_raw_version_before_other_diagnostics(tmp_path, monkeypatch):
@@ -692,7 +725,7 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
             remaining = tuple((name, False) for name in o2c.CAPABILITY_DENY_SET if name != "apps")
             raw_version, package_version = o2c._parse_codex_cli_version(args[1].encode("utf-8"))
             return o2c.CodexEffectiveState(
-                (*duplicate_rows, *remaining), 0, "fixture-backend", 0, raw_version, package_version
+                (*duplicate_rows, *remaining), 0, "mxc", 0, raw_version, package_version
             )
 
     runner = FakeRunner()

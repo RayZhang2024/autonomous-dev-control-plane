@@ -23,13 +23,15 @@ from tests.integration import test_o2b_fixture_candidate_materialization as o2b_
 
 
 FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
+PINNED_CODEX_01601 = Path(r"C:\O2C\bin\codex-0.160.1\bin\codex.exe")
+PINNED_CODEX_01601_SHA256 = "9e7c59c05cc1ce5677b1f94e835b2ac038ca3be14504e78d558eacdb0ea3f55d"
 
 
 class FakePreflight:
     def inspect(self, *args):
         raw_version, package_version = o2c._parse_codex_cli_version(args[1].encode("utf-8"))
         return o2c.CodexEffectiveState(
-            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "fixture-backend", 0,
+            tuple((name, False) for name in o2c.CAPABILITY_DENY_SET), 0, "mxc", 0,
             raw_version, package_version,
         )
 
@@ -37,9 +39,11 @@ class FakePreflight:
 class FakeContainedRunner:
     def __init__(self):
         self.calls = 0
+        self.arguments = None
 
     def run(self, executable, arguments, workspace, environment, prompt_bytes, timeout_seconds):
         self.calls += 1
+        self.arguments = tuple(arguments)
         (Path(workspace) / "o2c-output.txt").write_bytes(b"proposal from isolated fake worker")
         return o2c.ContainedExecutionOutcome(
             0, False, True, False, 0, hashlib.sha256(b"").hexdigest(),
@@ -130,7 +134,7 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert record["measured_runtime"]["codex_version"]["value"] == "codex-cli 0"
     assert record["measured_runtime"]["codex_executable_sha256_before"] == record["measured_runtime"]["codex_executable_sha256_after"]
     assert record["measured_runtime"]["candidate_workspace_git_present"] is False
-    assert record["measured_runtime"]["sandbox_implementation"] == "fixture-backend"
+    assert record["measured_runtime"]["sandbox_implementation"] == "mxc"
     assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
     assert record["configured_requested_execution_profile"]["process_containment_kind"] == "windows_job_object"
     assert record["configured_requested_execution_profile"]["workspace_path_class"] == "fresh_invocation_plain_non_git_workspace"
@@ -180,7 +184,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
             stdout = features
         elif command[-3:] == ("mcp", "list", "--json"):
             stdout = b"[]"
-        elif command == (str(executable), "doctor", "--json"):
+        elif command[-2:] == ("doctor", "--json"):
             report_checks = {
                 "sandbox.helpers": {
                     "id": "sandbox.helpers", "category": "sandbox", "status": "ok",
@@ -197,16 +201,17 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
             }).encode("utf-8")
         else:
             raise AssertionError(f"unexpected diagnostic command: {command!r}")
-        exit_code = doctor_exit_code if command == (str(executable), "doctor", "--json") else 0
+        exit_code = doctor_exit_code if command[-2:] == ("doctor", "--json") else 0
         return o2c._DiagnosticOutput(exit_code, stdout, 0, hashlib.sha256(b"").hexdigest())
 
     monkeypatch.setattr(o2c, "_run_bounded_diagnostic", diagnostic)
+    runner = FakeContainedRunner()
     producer = o2c.CodexCliCandidateProducer(
         configuration,
         seed,
         _fixture_attestation(configuration),
         preflight=o2c.CodexCliPreflightProbe(),
-        runner=FakeContainedRunner(),
+        runner=runner,
         parent_environment=environment,
         clock=lambda: FIXED_NOW,
     )
@@ -216,7 +221,20 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     assert result.untrusted_metadata.doctor_exit_code == doctor_exit_code
     assert result.untrusted_metadata.codex_cli_version_raw == "codex-cli 0"
     assert result.untrusted_metadata.codex_package_version == "0"
-    assert calls[-1] == (str(executable), "doctor", "--json")
+    disabled_features = tuple(
+        argument
+        for feature in o2c.CAPABILITY_DENY_SET
+        for argument in ("--disable", feature)
+    )
+    diagnostic_prefix = ("--strict-config", "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    assert calls == [
+        (str(executable), "--version"),
+        (str(executable), *diagnostic_prefix, "features", "list"),
+        (str(executable), *diagnostic_prefix, "mcp", "list", "--json"),
+        (str(executable), *diagnostic_prefix, "doctor", "--json"),
+    ]
+    assert runner.arguments is not None
+    assert ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE) == runner.arguments[2:4]
     record = _build_smoke_record(
         producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",
         (), source_head_before=o2b_test.BASE.value, source_head_after=o2b_test.BASE.value,
@@ -291,6 +309,43 @@ def test_real_smoke_context_rejects_missing_attestation_freshness_fields(missing
     valid.pop(missing_field)
     with pytest.raises(pytest.fail.Exception):
         _real_smoke_attestation({"deployment_attestation": valid})
+
+
+@pytest.mark.skipif(not PINNED_CODEX_01601.is_file(), reason="pinned Codex 0.160.1 compatibility CLI is not installed")
+def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
+    executable = str(PINNED_CODEX_01601)
+    assert hashlib.sha256(PINNED_CODEX_01601.read_bytes()).hexdigest() == PINNED_CODEX_01601_SHA256
+    version = subprocess.run((executable, "--version"), check=True, capture_output=True, text=True, timeout=10)
+    assert version.stdout.strip() == "codex-cli 0.160.1"
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    environment = {key: os.environ[key] for key in o2c._WINDOWS_ENV_ALLOWLIST if key in os.environ}
+    environment["CODEX_HOME"] = str(codex_home)
+    commands = (
+        ("features", "list"),
+        ("mcp", "list", "--json"),
+        ("doctor", "--json"),
+    )
+    results = []
+    for tail in commands:
+        result = subprocess.run(
+            (executable, *o2c._build_preflight_diagnostic_arguments(*tail)),
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            timeout=30,
+        )
+        assert b"unexpected argument" not in result.stderr.lower(), result.stderr.decode(errors="replace")
+        results.append(result)
+    assert results[0].returncode == 0, results[0].stderr.decode(errors="replace")
+    assert results[1].returncode == 0, results[1].stderr.decode(errors="replace")
+    doctor = json.loads(results[2].stdout.decode("utf-8"))
+    assert doctor["schemaVersion"] == 1
+    assert doctor["codexVersion"] == "0.160.1"
+    sandbox_check = doctor["checks"]["sandbox.helpers"]
+    assert sandbox_check["status"] in ("ok", "warning")
+    assert sandbox_check["details"]["sandbox backend"] in o2c.SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS
 
 
 def _build_smoke_record(

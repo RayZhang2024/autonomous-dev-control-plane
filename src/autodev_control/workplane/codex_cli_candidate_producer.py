@@ -84,6 +84,8 @@ CAPABILITY_DENY_SET = (
     "in_app_browser",
     "in_app_local_automation",
 )
+WINDOWS_SANDBOX_CONFIG_OVERRIDE = 'windows.sandbox="unelevated"'
+SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS = frozenset(("restricted-token", "elevated", "mxc"))
 RUNNER_IMPLEMENTATION_VERSION = "o2c-fixture-worker/1"
 FIXED_IMPLEMENTATION_PREFIX = (
     "Implement the requested changes only in the supplied workspace. "
@@ -566,6 +568,8 @@ def _validate_sandbox_implementation(value: object) -> str:
         unicodedata.category(character) == "Cc" for character in value
     ):
         raise O2cPreflightError("sandbox implementation diagnostic is not bounded plain text")
+    if value not in SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS:
+        raise O2cPreflightError("Codex Windows sandbox backend is disabled or unsupported")
     return value
 
 
@@ -648,6 +652,8 @@ def build_codex_arguments(workspace: str) -> tuple[str, ...]:
     arguments = [
         "exec",
         "--strict-config",
+        "-c",
+        WINDOWS_SANDBOX_CONFIG_OVERRIDE,
         "--sandbox",
         "workspace-write",
         "--skip-git-repo-check",
@@ -1193,6 +1199,14 @@ def _sandbox_implementation(output: bytes, expected_package_version: str) -> str
     return _validate_sandbox_implementation(details["sandbox backend"])
 
 
+def _build_preflight_diagnostic_arguments(*command: str) -> tuple[str, ...]:
+    arguments = ["--strict-config", "-c", WINDOWS_SANDBOX_CONFIG_OVERRIDE]
+    for feature in CAPABILITY_DENY_SET:
+        arguments.extend(("--disable", feature))
+    arguments.extend(command)
+    return tuple(arguments)
+
+
 class CodexCliPreflightProbe:
     """Query the pinned CLI's version, features, MCP roster and sandbox backend.
 
@@ -1219,11 +1233,8 @@ class CodexCliPreflightProbe:
         if actual_version_raw != expected_version or _sha256_file(executable_path) != expected_hash:
             raise O2cPreflightError("pinned Codex executable identity mismatch")
 
-        common = ["--strict-config", "--ignore-user-config"]
-        for feature in CAPABILITY_DENY_SET:
-            common.extend(("--disable", feature))
         feature_result = _run_bounded_diagnostic(
-            (executable_path, *common, "features", "list"),
+            (executable_path, *_build_preflight_diagnostic_arguments("features", "list")),
             child_environment,
             min(timeout_seconds, 30),
         )
@@ -1232,7 +1243,7 @@ class CodexCliPreflightProbe:
         features = _feature_rows(feature_result.stdout)
 
         mcp_result = _run_bounded_diagnostic(
-            (executable_path, *common, "mcp", "list", "--json"),
+            (executable_path, *_build_preflight_diagnostic_arguments("mcp", "list", "--json")),
             child_environment,
             min(timeout_seconds, 30),
         )
@@ -1245,7 +1256,7 @@ class CodexCliPreflightProbe:
         if type(mcp_roster) is not list:
             raise O2cPreflightError("Codex MCP diagnostic has an unsupported shape")
         sandbox_result = _run_bounded_diagnostic(
-            (executable_path, "doctor", "--json"),
+            (executable_path, *_build_preflight_diagnostic_arguments("doctor", "--json")),
             child_environment,
             min(timeout_seconds, 30),
         )
