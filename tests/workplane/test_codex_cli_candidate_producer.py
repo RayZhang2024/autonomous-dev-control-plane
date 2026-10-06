@@ -338,8 +338,7 @@ def test_frozen_command_profile_and_environment_allowlist():
         "--sandbox", "workspace-write", "--skip-git-repo-check", "--ephemeral",
         "--ignore-user-config", "--ignore-rules", "--cd", "C:/scratch/workspace",
     )
-    assert len([i for i, arg in enumerate(args) if arg == "--disable"]) == len(o2c.CAPABILITY_DENY_SET)
-    assert all(args[i + 1] in o2c.CAPABILITY_DENY_SET for i, arg in enumerate(args[:-1]) if arg == "--disable")
+    assert tuple(args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--disable") == o2c.CAPABILITY_DENY_SET
     child = o2c.build_child_environment({"PATH": "p", "TEMP": "bad", "TMP": "bad", "OPENAI_API_KEY": "secret", "GH_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "secret"}, worker_home="home", codex_home="codex", runtime_tmp="runtime")
     assert child["TEMP"] == child["TMP"] == "runtime"
     assert child["PATH"] == "p"
@@ -536,12 +535,12 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
         for feature in o2c.CAPABILITY_DENY_SET
         for argument in ("--disable", feature)
     )
-    diagnostic_prefix = ("--strict-config", "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
     assert calls == [
         (producer._configuration.absolute_codex_executable_path, "--version"),
         (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "features", "list"),
         (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "mcp", "list", "--json"),
-        (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "doctor", "--json"),
+        (producer._configuration.absolute_codex_executable_path, "--strict-config", *diagnostic_prefix, "doctor", "--json"),
     ]
     assert all("--ignore-user-config" not in command and "--ignore-rules" not in command for command in calls[1:])
 

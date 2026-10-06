@@ -1200,7 +1200,10 @@ def _sandbox_implementation(output: bytes, expected_package_version: str) -> str
 
 
 def _build_preflight_diagnostic_arguments(*command: str) -> tuple[str, ...]:
-    arguments = ["--strict-config", "-c", WINDOWS_SANDBOX_CONFIG_OVERRIDE]
+    if command not in (("features", "list"), ("mcp", "list", "--json"), ("doctor", "--json")):
+        raise ValueError("unsupported Codex preflight diagnostic")
+    arguments = ["--strict-config"] if command == ("doctor", "--json") else []
+    arguments.extend(("-c", WINDOWS_SANDBOX_CONFIG_OVERRIDE))
     for feature in CAPABILITY_DENY_SET:
         arguments.extend(("--disable", feature))
     arguments.extend(command)

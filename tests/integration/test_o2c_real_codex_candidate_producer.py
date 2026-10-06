@@ -226,12 +226,12 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         for feature in o2c.CAPABILITY_DENY_SET
         for argument in ("--disable", feature)
     )
-    diagnostic_prefix = ("--strict-config", "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
     assert calls == [
         (str(executable), "--version"),
         (str(executable), *diagnostic_prefix, "features", "list"),
         (str(executable), *diagnostic_prefix, "mcp", "list", "--json"),
-        (str(executable), *diagnostic_prefix, "doctor", "--json"),
+        (str(executable), "--strict-config", *diagnostic_prefix, "doctor", "--json"),
     ]
     assert runner.arguments is not None
     assert ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE) == runner.arguments[2:4]
@@ -322,15 +322,22 @@ def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
     codex_home.mkdir()
     environment = {key: os.environ[key] for key in o2c._WINDOWS_ENV_ALLOWLIST if key in os.environ}
     environment["CODEX_HOME"] = str(codex_home)
+    disabled_features = tuple(
+        argument
+        for feature in o2c.CAPABILITY_DENY_SET
+        for argument in ("--disable", feature)
+    )
+    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
     commands = (
-        ("features", "list"),
-        ("mcp", "list", "--json"),
-        ("doctor", "--json"),
+        (("features", "list"), (*diagnostic_prefix, "features", "list")),
+        (("mcp", "list", "--json"), (*diagnostic_prefix, "mcp", "list", "--json")),
+        (("doctor", "--json"), ("--strict-config", *diagnostic_prefix, "doctor", "--json")),
     )
     results = []
-    for tail in commands:
+    for tail, arguments in commands:
+        assert o2c._build_preflight_diagnostic_arguments(*tail) == arguments
         result = subprocess.run(
-            (executable, *o2c._build_preflight_diagnostic_arguments(*tail)),
+            (executable, *arguments),
             cwd=tmp_path,
             env=environment,
             capture_output=True,
