@@ -136,6 +136,7 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert record["measured_runtime"]["candidate_workspace_git_present"] is False
     assert record["measured_runtime"]["sandbox_implementation"] == "mxc"
     assert record["configured_requested_execution_profile"]["sandbox_profile"] == "workspace-write"
+    assert record["configured_requested_execution_profile"]["bundled_skills_enabled"] is False
     assert record["configured_requested_execution_profile"]["process_containment_kind"] == "windows_job_object"
     assert record["configured_requested_execution_profile"]["workspace_path_class"] == "fresh_invocation_plain_non_git_workspace"
     assert record["configured_requested_execution_profile"]["target_github_credentials_intentionally_present"] is False
@@ -226,7 +227,11 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         for feature in o2c.CAPABILITY_DENY_SET
         for argument in ("--disable", feature)
     )
-    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    diagnostic_prefix = (
+        "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
+        *disabled_features,
+    )
     assert calls == [
         (str(executable), "--version"),
         (str(executable), *diagnostic_prefix, "features", "list"),
@@ -235,6 +240,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     ]
     assert runner.arguments is not None
     assert ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE) == runner.arguments[2:4]
+    assert runner.arguments.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1
     record = _build_smoke_record(
         producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",
         (), source_head_before=o2b_test.BASE.value, source_head_after=o2b_test.BASE.value,
@@ -320,6 +326,7 @@ def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
+    assert not o2c._path_exists_or_link(codex_home / "skills")
     environment = {key: os.environ[key] for key in o2c._WINDOWS_ENV_ALLOWLIST if key in os.environ}
     environment["CODEX_HOME"] = str(codex_home)
     disabled_features = tuple(
@@ -327,7 +334,11 @@ def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
         for feature in o2c.CAPABILITY_DENY_SET
         for argument in ("--disable", feature)
     )
-    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    diagnostic_prefix = (
+        "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
+        *disabled_features,
+    )
     commands = (
         (("features", "list"), (*diagnostic_prefix, "features", "list")),
         (("mcp", "list", "--json"), (*diagnostic_prefix, "mcp", "list", "--json")),
@@ -348,6 +359,7 @@ def test_codex_01601_accepts_exact_preflight_diagnostic_argv(tmp_path):
     assert results[0].returncode == 0, results[0].stderr.decode(errors="replace")
     assert results[1].returncode == 0, results[1].stderr.decode(errors="replace")
     assert o2c._sandbox_implementation(results[2].stdout, "0.160.1") == "restricted-token"
+    assert not o2c._path_exists_or_link(codex_home / "skills")
 
 
 def _build_smoke_record(

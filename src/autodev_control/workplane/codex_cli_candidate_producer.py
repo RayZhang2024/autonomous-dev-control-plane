@@ -85,6 +85,7 @@ CAPABILITY_DENY_SET = (
     "in_app_local_automation",
 )
 WINDOWS_SANDBOX_CONFIG_OVERRIDE = 'windows.sandbox="unelevated"'
+BUNDLED_SKILLS_CONFIG_OVERRIDE = "skills.bundled.enabled=false"
 SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS = frozenset(("restricted-token", "elevated", "mxc"))
 RUNNER_IMPLEMENTATION_VERSION = "o2c-fixture-worker/1"
 FIXED_IMPLEMENTATION_PREFIX = (
@@ -654,6 +655,8 @@ def build_codex_arguments(workspace: str) -> tuple[str, ...]:
         "--strict-config",
         "-c",
         WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c",
+        BUNDLED_SKILLS_CONFIG_OVERRIDE,
         "--sandbox",
         "workspace-write",
         "--skip-git-repo-check",
@@ -931,6 +934,7 @@ class CodexCliCandidateProducer:
                 self._deployment,
             )
             _validate_effective_state(state)
+            worker_agents_clean, codex_home_clean = _check_home_state(worker_home, codex_home)
             if state.codex_cli_version_raw != self._configuration.expected_codex_version:
                 return _failure()
             before_task_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
@@ -965,6 +969,7 @@ class CodexCliCandidateProducer:
                     or not outcome.process_tree_quiescent or outcome.active_process_count_before_scan != 0
                     or not outcome.job_assignment_succeeded or not outcome.root_process_resumed_after_assignment):
                 return _failure()
+            worker_agents_clean, codex_home_clean = _check_home_state(worker_home, codex_home)
             candidate_workspace_git_present = _path_exists_or_link(workspace / ".git")
             if candidate_workspace_git_present:
                 return _failure()
@@ -1207,7 +1212,10 @@ def _build_preflight_diagnostic_arguments(*command: str) -> tuple[str, ...]:
     if command not in (("features", "list"), ("mcp", "list", "--json"), ("doctor", "--json")):
         raise ValueError("unsupported Codex preflight diagnostic")
     arguments = ["--strict-config"] if command == ("doctor", "--json") else []
-    arguments.extend(("-c", WINDOWS_SANDBOX_CONFIG_OVERRIDE))
+    arguments.extend((
+        "-c", WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c", BUNDLED_SKILLS_CONFIG_OVERRIDE,
+    ))
     for feature in CAPABILITY_DENY_SET:
         arguments.extend(("--disable", feature))
     arguments.extend(command)
@@ -1312,6 +1320,7 @@ class CodexConfiguredExecutionProfile:
     workspace_path_class: str
     target_repository_credentials_intentionally_present: bool
     control_root_credentials_intentionally_present: bool
+    bundled_skills_enabled: bool
 
 
 def configured_execution_profile() -> CodexConfiguredExecutionProfile:
@@ -1319,7 +1328,7 @@ def configured_execution_profile() -> CodexConfiguredExecutionProfile:
     return CodexConfiguredExecutionProfile(
         "workspace-write", "never", False, "disabled", (), True, "keyring", "chatgpt",
         True, True, True, JobObjectLimits(), "windows_job_object",
-        "fresh_invocation_plain_non_git_workspace", False, False,
+        "fresh_invocation_plain_non_git_workspace", False, False, False,
     )
 
 

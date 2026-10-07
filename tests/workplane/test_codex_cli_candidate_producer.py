@@ -222,6 +222,37 @@ def test_preflight_fails_closed_before_task_attempt(tmp_path):
     assert runner.calls == producer.task_attempt_count == 0
 
 
+def test_preflight_created_system_skills_fail_before_task_attempt(tmp_path):
+    class ContaminatingPreflight(FakePreflight):
+        def inspect(self, *args):
+            state = super().inspect(*args)
+            (Path(args[2]["CODEX_HOME"]) / "skills" / ".system").mkdir(parents=True)
+            return state
+
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, preflight=ContaminatingPreflight(), runner=runner)
+    skills = Path(producer._configuration.codex_home) / "skills"
+    assert not o2c._path_exists_or_link(skills)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 0
+    assert (skills / ".system").is_dir()
+
+
+def test_task_created_system_skills_erase_successful_proposal(tmp_path):
+    skills = tmp_path / "worker-home" / ".codex-worker" / "skills"
+    runner = FakeRunner(mutate=lambda _workspace: (skills / ".system").mkdir(parents=True))
+    producer, _, _ = configured(tmp_path, runner=runner)
+    assert not o2c._path_exists_or_link(skills)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 1
+    assert (skills / ".system").is_dir()
+    assert not runner.workspace.parent.exists()
+
+
 def test_noop_is_a_valid_empty_proposal(tmp_path):
     producer, _, _ = configured(tmp_path, runner=FakeRunner())
     result = producer.invoke(b"request")
@@ -333,12 +364,16 @@ def test_executable_must_be_absolute_exact_exe_with_configured_hash(tmp_path):
 
 def test_frozen_command_profile_and_environment_allowlist():
     args = o2c.build_codex_arguments("C:/scratch/workspace")
-    assert args[:12] == (
+    assert args[:14] == (
         "exec", "--strict-config", "-c", 'windows.sandbox="unelevated"',
+        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
         "--sandbox", "workspace-write", "--skip-git-repo-check", "--ephemeral",
         "--ignore-user-config", "--ignore-rules", "--cd", "C:/scratch/workspace",
     )
+    assert o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE == "skills.bundled.enabled=false"
+    assert args.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1
     assert tuple(args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--disable") == o2c.CAPABILITY_DENY_SET
+    assert not {"--yolo", "--full-auto", "--add-dir", "--dangerously-bypass-approvals-and-sandbox"} & set(args)
     child = o2c.build_child_environment({"PATH": "p", "TEMP": "bad", "TMP": "bad", "OPENAI_API_KEY": "secret", "GH_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "secret"}, worker_home="home", codex_home="codex", runtime_tmp="runtime")
     assert child["TEMP"] == child["TMP"] == "runtime"
     assert child["PATH"] == "p"
@@ -350,6 +385,7 @@ def test_frozen_command_profile_and_environment_allowlist():
     assert profile.sandbox_tmp_writability_exclusions_enabled
     assert profile.auth_credential_store_requested == "keyring" and profile.login_method_requested == "chatgpt"
     assert profile.ephemeral and profile.ignore_user_config and profile.ignore_rules
+    assert profile.bundled_skills_enabled is False
     assert profile.job_object_limits == o2c.JobObjectLimits(True, False, False, 64, 4_294_967_296, 80)
     assert profile.process_containment_kind == "windows_job_object"
     assert profile.workspace_path_class == "fresh_invocation_plain_non_git_workspace"
@@ -367,6 +403,18 @@ def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_pa
     (Path(producer._configuration.worker_home) / ".agents" / "skills").mkdir(parents=True)
     assert producer.invoke(b"request").status is ProducerStatus.PRODUCER_ERROR
     assert environment["TEMP"] == "operator-temp"
+
+
+def test_preexisting_codex_home_system_skills_remain_forbidden(tmp_path):
+    runner = FakeRunner()
+    producer, _, _ = configured(tmp_path, runner=runner)
+    skills = Path(producer._configuration.codex_home) / "skills" / ".system"
+    skills.mkdir(parents=True)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 0
+    assert skills.is_dir()
 
 
 def test_effective_state_rejects_unknown_enabled_mcp_and_capabilities():
@@ -568,13 +616,18 @@ def test_unsupported_doctor_diagnostic_fails_producer_preflight_without_task_att
         for feature in o2c.CAPABILITY_DENY_SET
         for argument in ("--disable", feature)
     )
-    diagnostic_prefix = ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE, *disabled_features)
+    diagnostic_prefix = (
+        "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
+        *disabled_features,
+    )
     assert calls == [
         (producer._configuration.absolute_codex_executable_path, "--version"),
         (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "features", "list"),
         (producer._configuration.absolute_codex_executable_path, *diagnostic_prefix, "mcp", "list", "--json"),
         (producer._configuration.absolute_codex_executable_path, "--strict-config", *diagnostic_prefix, "doctor", "--json"),
     ]
+    assert all(command.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1 for command in calls[1:])
     assert all("--ignore-user-config" not in command and "--ignore-rules" not in command for command in calls[1:])
 
 
