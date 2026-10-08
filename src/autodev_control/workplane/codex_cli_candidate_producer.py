@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import ctypes
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import hashlib
 import json
 import os
@@ -154,6 +155,39 @@ DEPLOYMENT_CHECKS = (
 
 class O2cPreflightError(ValueError):
     """A fail-closed work-plane preflight rejection."""
+
+
+class O2cFailureStage(Enum):
+    """Fixed, non-sensitive stage labels for a failed producer invocation."""
+
+    PREFLIGHT = "preflight"
+    PROCESS_LAUNCH = "process_launch"
+    PROCESS_EXIT = "process_exit"
+    CONTAINMENT = "containment"
+    WORKSPACE_INSPECTION = "workspace_inspection"
+    PROPOSAL_EXTRACTION = "proposal_extraction"
+    CLEANUP = "cleanup"
+
+
+@dataclass(frozen=True)
+class O2cFailureDiagnostic:
+    """Bounded stage-only diagnostics; exception text and process output are excluded."""
+
+    stages: tuple[O2cFailureStage, ...]
+
+    def __post_init__(self) -> None:
+        if (type(self.stages) is not tuple or not 1 <= len(self.stages) <= 2
+                or any(type(stage) is not O2cFailureStage for stage in self.stages)
+                or len(set(self.stages)) != len(self.stages)):
+            raise TypeError("failure diagnostic must contain one or two unique fixed stages")
+
+
+class _O2cRunnerFailure(RuntimeError):
+    """Internal runner failure tagged with a fixed stage and no dynamic details."""
+
+    def __init__(self, stage: O2cFailureStage) -> None:
+        self.stage = stage
+        super().__init__("contained task runner failed")
 
 
 def _is_resource_limit_notification(message_id: int) -> bool:
@@ -887,10 +921,33 @@ class CodexCliCandidateProducer:
         self._parent_environment = os.environ if parent_environment is None else parent_environment
         self._clock = _utc_now if clock is None else clock
         self.task_attempt_count = 0
+        self._failure_diagnostic: O2cFailureDiagnostic | None = None
+
+    @property
+    def failure_diagnostic(self) -> O2cFailureDiagnostic | None:
+        """Return the fixed-stage diagnostic for the latest failed invocation."""
+
+        return self._failure_diagnostic
+
+    def _record_failure(self, stage: O2cFailureStage) -> None:
+        previous = () if self._failure_diagnostic is None else self._failure_diagnostic.stages
+        if stage in previous:
+            return
+        stages = (*previous, stage)[:2]
+        self._failure_diagnostic = O2cFailureDiagnostic(stages)
 
     def invoke(self, request_bytes: bytes) -> CandidateProducerResult:
+        self._failure_diagnostic = None
+
+        def fail(
+            stage: O2cFailureStage,
+            status: ProducerStatus = ProducerStatus.PRODUCER_ERROR,
+        ) -> CandidateProducerResult:
+            self._record_failure(stage)
+            return _failure(status)
+
         if type(request_bytes) is not bytes or len(request_bytes) > MAX_REQUEST_BYTES:
-            return _failure()
+            return fail(O2cFailureStage.PREFLIGHT)
         try:
             request_text = request_bytes.decode("utf-8", errors="strict")
             _validate_configuration(self._configuration)
@@ -900,25 +957,26 @@ class CodexCliCandidateProducer:
             )
             initial_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if initial_hash != self._configuration.expected_codex_executable_sha256:
-                return _failure()
+                return fail(O2cFailureStage.PREFLIGHT)
             worker_identity_measured = _current_worker_identity()
             _validate_deployment(self._deployment, self._configuration, worker_identity_measured, initial_hash, self._clock())
         except (O2cPreflightError, UnicodeDecodeError, OSError, TypeError, ValueError):
-            return _failure()
+            return fail(O2cFailureStage.PREFLIGHT)
 
         invocation_directory: Path | None = None
         successful_result: CandidateProducerResult | None = None
         timed_out = False
+        failure_stage = O2cFailureStage.PREFLIGHT
         try:
             invocation_directory = Path(tempfile.mkdtemp(prefix="o2c-", dir=scratch_root))
             if _is_reparse_point(invocation_directory):
-                return _failure()
+                return fail(O2cFailureStage.PREFLIGHT)
             workspace = invocation_directory / "workspace"
             runtime_tmp = invocation_directory / "runtime-tmp"
             workspace.mkdir()
             runtime_tmp.mkdir()
             if any(workspace.iterdir()) or any(runtime_tmp.iterdir()):
-                return _failure()
+                return fail(O2cFailureStage.PREFLIGHT)
             _seed_workspace(self._seed, workspace)
             child_environment = build_child_environment(
                 self._parent_environment,
@@ -936,16 +994,17 @@ class CodexCliCandidateProducer:
             _validate_effective_state(state)
             worker_agents_clean, codex_home_clean = _check_home_state(worker_home, codex_home)
             if state.codex_cli_version_raw != self._configuration.expected_codex_version:
-                return _failure()
+                return fail(O2cFailureStage.PREFLIGHT)
             before_task_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if before_task_hash != self._configuration.expected_codex_executable_sha256:
-                return _failure()
+                return fail(O2cFailureStage.PREFLIGHT)
             _validate_deployment(
                 self._deployment, self._configuration, worker_identity_measured, before_task_hash, self._clock()
             )
             command = build_codex_arguments(str(workspace))
             prompt_bytes = (FIXED_IMPLEMENTATION_PREFIX + request_text).encode("utf-8")
             started = time.monotonic()
+            failure_stage = O2cFailureStage.PROCESS_LAUNCH
             self.task_attempt_count += 1
             outcome = self._runner.run(
                 self._configuration.absolute_codex_executable_path,
@@ -955,25 +1014,31 @@ class CodexCliCandidateProducer:
                 prompt_bytes,
                 self._configuration.timeout_seconds,
             )
+            failure_stage = O2cFailureStage.PROCESS_EXIT
             elapsed = max(0, int((time.monotonic() - started) * 1000))
             after_task_hash = _sha256_file(self._configuration.absolute_codex_executable_path)
             if after_task_hash != self._configuration.expected_codex_executable_sha256:
-                return _failure()
+                return fail(O2cFailureStage.PROCESS_EXIT)
             if type(outcome) is not ContainedExecutionOutcome:
-                return _failure()
+                return fail(O2cFailureStage.CONTAINMENT)
+            failure_stage = O2cFailureStage.CONTAINMENT
             _validate_execution_outcome(outcome)
             if outcome.timed_out:
                 timed_out = True
-                return _failure(ProducerStatus.TIMEOUT)
-            if (outcome.root_exit_code != 0 or outcome.resource_limit_violation
-                    or not outcome.process_tree_quiescent or outcome.active_process_count_before_scan != 0
-                    or not outcome.job_assignment_succeeded or not outcome.root_process_resumed_after_assignment):
-                return _failure()
+                return fail(O2cFailureStage.PROCESS_EXIT, ProducerStatus.TIMEOUT)
+            if outcome.root_exit_code != 0:
+                return fail(O2cFailureStage.PROCESS_EXIT)
+            if (outcome.resource_limit_violation or not outcome.process_tree_quiescent
+                    or outcome.active_process_count_before_scan != 0 or not outcome.job_assignment_succeeded
+                    or not outcome.root_process_resumed_after_assignment):
+                return fail(O2cFailureStage.CONTAINMENT)
+            failure_stage = O2cFailureStage.WORKSPACE_INSPECTION
             worker_agents_clean, codex_home_clean = _check_home_state(worker_home, codex_home)
             candidate_workspace_git_present = _path_exists_or_link(workspace / ".git")
             if candidate_workspace_git_present:
-                return _failure()
+                return fail(O2cFailureStage.WORKSPACE_INSPECTION)
             final_files = _observe_workspace(workspace)
+            failure_stage = O2cFailureStage.PROPOSAL_EXTRACTION
             proposal = _extract_proposal(self._seed, final_files)
             metadata = CodexRunDiagnostics(
                 runner_version=RUNNER_IMPLEMENTATION_VERSION,
@@ -1014,7 +1079,11 @@ class CodexCliCandidateProducer:
                 proposal,
                 metadata,
             )
+        except _O2cRunnerFailure as error:
+            self._record_failure(error.stage)
+            return _failure(ProducerStatus.TIMEOUT if timed_out else ProducerStatus.PRODUCER_ERROR)
         except (O2cPreflightError, OSError, ValueError, TypeError, RuntimeError, subprocess.SubprocessError):
+            self._record_failure(failure_stage)
             return _failure(ProducerStatus.TIMEOUT if timed_out else ProducerStatus.PRODUCER_ERROR)
         finally:
             cleanup_failed = False
@@ -1024,8 +1093,11 @@ class CodexCliCandidateProducer:
                 except OSError:
                     cleanup_failed = True
             if cleanup_failed:
+                self._record_failure(O2cFailureStage.CLEANUP)
                 successful_result = None
         if successful_result is None:
+            if self._failure_diagnostic is None:
+                self._record_failure(failure_stage)
             return _failure(ProducerStatus.TIMEOUT if timed_out else ProducerStatus.PRODUCER_ERROR)
         return successful_result
 
@@ -1370,23 +1442,29 @@ class WindowsJobObjectRunner:
         timeout_seconds: int,
     ) -> ContainedExecutionOutcome:
         if os.name != "nt" or self._api is None:
-            raise O2cPreflightError("native Windows Job Object containment is unavailable")
+            raise _O2cRunnerFailure(O2cFailureStage.CONTAINMENT)
         process = None
         job = None
         cleanup_error: BaseException | None = None
         try:
-            process = self._api.create_suspended_process(
-                executable_path, arguments, workspace, child_environment, prompt_bytes
-            )
-            job = self._api.create_job()
-            limits = JobObjectLimits()
-            self._api.configure_job(job, limits)
-            self._api.assign_process(job, process)
-            self._api.resume_process(process)
-            outcome = self._api.execute_and_quiesce(
-                job, process, timeout_seconds, limits
-            )
-            _validate_execution_outcome(outcome)
+            try:
+                process = self._api.create_suspended_process(
+                    executable_path, arguments, workspace, child_environment, prompt_bytes
+                )
+            except Exception as error:
+                raise _O2cRunnerFailure(O2cFailureStage.PROCESS_LAUNCH) from error
+            try:
+                job = self._api.create_job()
+                limits = JobObjectLimits()
+                self._api.configure_job(job, limits)
+                self._api.assign_process(job, process)
+                self._api.resume_process(process)
+                outcome = self._api.execute_and_quiesce(
+                    job, process, timeout_seconds, limits
+                )
+                _validate_execution_outcome(outcome)
+            except Exception as error:
+                raise _O2cRunnerFailure(O2cFailureStage.CONTAINMENT) from error
             return replace(
                 outcome,
                 job_assignment_succeeded=True,
@@ -1411,7 +1489,7 @@ class WindowsJobObjectRunner:
                 except BaseException as error:
                     cleanup_error = cleanup_error or error
             if cleanup_error is not None:
-                raise O2cPreflightError("contained process cleanup did not complete") from cleanup_error
+                raise _O2cRunnerFailure(O2cFailureStage.CLEANUP) from cleanup_error
 
 
 class _NativeWindowsJobObjectApi:

@@ -58,6 +58,8 @@ class FakeRunner:
         assert "--dangerously-bypass-approvals-and-sandbox" not in arguments
         if self.mutate:
             self.mutate(self.workspace)
+        if self.status == "launch-error":
+            raise OSError("private launch detail must never enter the diagnostic")
         if self.status == "timeout":
             return outcome(root_exit_code=1, timed_out=True)
         if self.status == "nonzero":
@@ -186,6 +188,7 @@ def test_invalid_or_oversized_request_fails_before_one_task_attempt(tmp_path, re
     assert result.status is ProducerStatus.PRODUCER_ERROR
     assert result.candidate_proposal is None
     assert runner.calls == producer.task_attempt_count == 0
+    assert producer.failure_diagnostic.stages == (o2c.O2cFailureStage.PREFLIGHT,)
 
 
 @pytest.mark.parametrize(("status", "expected"), [
@@ -201,6 +204,8 @@ def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, 
     result = producer.invoke(b"request")
     assert result.status is expected and result.candidate_proposal is None
     assert runner.calls == producer.task_attempt_count == 1
+    stage = o2c.O2cFailureStage.PROCESS_EXIT if status in ("timeout", "nonzero") else o2c.O2cFailureStage.CONTAINMENT
+    assert producer.failure_diagnostic.stages == (stage,)
 
 
 def test_task_output_above_64kib_is_streamed_as_count_and_digest_only(tmp_path):
@@ -220,6 +225,7 @@ def test_preflight_fails_closed_before_task_attempt(tmp_path):
     result = producer.invoke(b"request")
     assert result.status is ProducerStatus.PRODUCER_ERROR
     assert runner.calls == producer.task_attempt_count == 0
+    assert producer.failure_diagnostic.stages == (o2c.O2cFailureStage.PREFLIGHT,)
 
 
 def test_preflight_created_system_skills_fail_before_task_attempt(tmp_path):
@@ -238,6 +244,7 @@ def test_preflight_created_system_skills_fail_before_task_attempt(tmp_path):
     assert result.candidate_proposal is None
     assert runner.calls == producer.task_attempt_count == 0
     assert (skills / ".system").is_dir()
+    assert producer.failure_diagnostic.stages == (o2c.O2cFailureStage.PREFLIGHT,)
 
 
 def test_task_created_system_skills_erase_successful_proposal(tmp_path):
@@ -251,6 +258,7 @@ def test_task_created_system_skills_erase_successful_proposal(tmp_path):
     assert runner.calls == producer.task_attempt_count == 1
     assert (skills / ".system").is_dir()
     assert not runner.workspace.parent.exists()
+    assert producer.failure_diagnostic.stages == (o2c.O2cFailureStage.WORKSPACE_INSPECTION,)
 
 
 def test_noop_is_a_valid_empty_proposal(tmp_path):
@@ -297,6 +305,46 @@ def test_cleanup_failure_erases_otherwise_successful_result(tmp_path, monkeypatc
     result = producer.invoke(b"request")
     assert result.status is ProducerStatus.PRODUCER_ERROR
     assert result.candidate_proposal is None
+    assert producer.failure_diagnostic.stages == (o2c.O2cFailureStage.CLEANUP,)
+
+
+def test_cleanup_failure_is_bounded_alongside_process_exit_failure(tmp_path, monkeypatch):
+    producer, _, _ = configured(tmp_path, runner=FakeRunner(status="nonzero"))
+    monkeypatch.setattr(o2c.shutil, "rmtree", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup blocked")))
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert producer.failure_diagnostic.stages == (
+        o2c.O2cFailureStage.PROCESS_EXIT,
+        o2c.O2cFailureStage.CLEANUP,
+    )
+
+
+def test_process_launch_failure_has_bounded_stage_without_exception_text(tmp_path):
+    runner = FakeRunner(status="launch-error")
+    producer, _, _ = configured(tmp_path, runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 1
+    assert producer.failure_diagnostic == o2c.O2cFailureDiagnostic((o2c.O2cFailureStage.PROCESS_LAUNCH,))
+    assert "private launch detail" not in repr(producer.failure_diagnostic)
+
+
+def test_workspace_inspection_and_proposal_extraction_failures_have_distinct_stages(tmp_path, monkeypatch):
+    inspect_producer, _, _ = configured(tmp_path / "inspect", runner=FakeRunner())
+    monkeypatch.setattr(o2c, "_observe_workspace", lambda _workspace: (_ for _ in ()).throw(o2c.O2cPreflightError("private workspace detail")))
+    inspected = inspect_producer.invoke(b"request")
+    assert inspected.status is ProducerStatus.PRODUCER_ERROR
+    assert inspect_producer.failure_diagnostic.stages == (o2c.O2cFailureStage.WORKSPACE_INSPECTION,)
+    assert "private workspace detail" not in repr(inspect_producer.failure_diagnostic)
+
+    monkeypatch.undo()
+    proposal_producer, _, _ = configured(tmp_path / "proposal", runner=FakeRunner())
+    monkeypatch.setattr(o2c, "_extract_proposal", lambda *_args: (_ for _ in ()).throw(o2c.O2cPreflightError("private proposal detail")))
+    proposal = proposal_producer.invoke(b"request")
+    assert proposal.status is ProducerStatus.PRODUCER_ERROR
+    assert proposal_producer.failure_diagnostic.stages == (o2c.O2cFailureStage.PROPOSAL_EXTRACTION,)
+    assert "private proposal detail" not in repr(proposal_producer.failure_diagnostic)
 
 
 @pytest.mark.parametrize("path", ["", "/absolute", "trailing/", "a//b", "a/../b", "a\\b", ".git/config", ".codex", ".agents/skills/x", "a\x00b"])
@@ -822,13 +870,16 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
 
 
 class FakeJobApi:
-    def __init__(self, *, fail_assignment=False):
+    def __init__(self, *, fail_assignment=False, fail_launch=False):
         self.events = []
         self.fail_assignment = fail_assignment
+        self.fail_launch = fail_launch
         self.limits = None
 
     def create_suspended_process(self, *args):
         self.events.append("suspended")
+        if self.fail_launch:
+            raise OSError("launch failure")
         return object()
 
     def create_job(self):
@@ -863,15 +914,26 @@ class FakeJobApi:
 
 def test_job_object_sequence_limits_and_fail_assignment_never_resumes(monkeypatch):
     monkeypatch.setattr(o2c.os, "name", "nt")
+    unavailable = object.__new__(o2c.WindowsJobObjectRunner)
+    unavailable._api = None
+    with pytest.raises(RuntimeError) as error:
+        unavailable.run("codex.exe", ("exec",), "workspace", {}, b"task", 3)
+    assert error.value.stage is o2c.O2cFailureStage.CONTAINMENT
     api = FakeJobApi()
     result = o2c.WindowsJobObjectRunner(api).run("codex.exe", ("exec",), "workspace", {}, b"task", 3)
     assert result.process_tree_quiescent
     assert api.events[:5] == ["suspended", "create_job", "configure", "assign", "resume"]
     assert api.limits == o2c.JobObjectLimits(True, False, False, 64, 4_294_967_296, 80)
     failed = FakeJobApi(fail_assignment=True)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as error:
         o2c.WindowsJobObjectRunner(failed).run("codex.exe", ("exec",), "workspace", {}, b"task", 3)
+    assert error.value.stage is o2c.O2cFailureStage.CONTAINMENT
     assert "terminate" in failed.events and "resume" not in failed.events
+    launch_failed = FakeJobApi(fail_launch=True)
+    with pytest.raises(RuntimeError) as error:
+        o2c.WindowsJobObjectRunner(launch_failed).run("codex.exe", ("exec",), "workspace", {}, b"task", 3)
+    assert error.value.stage is o2c.O2cFailureStage.PROCESS_LAUNCH
+    assert launch_failed.events == ["suspended"]
 
 
 def test_delayed_descendant_is_quiescent_before_workspace_observation(tmp_path, monkeypatch):

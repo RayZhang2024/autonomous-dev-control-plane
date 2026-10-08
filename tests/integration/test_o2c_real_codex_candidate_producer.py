@@ -440,6 +440,63 @@ def _build_smoke_record(
     }
 
 
+def _build_failure_smoke_record(
+    result: object,
+    producer: o2c.CodexCliCandidateProducer,
+) -> dict[str, object]:
+    diagnostic = producer.failure_diagnostic
+    return {
+        "format_version": "o2c-smoke-failure/1",
+        "producer_status": result.status.value,
+        "task_attempt_count": producer.task_attempt_count,
+        "failure_diagnostic": None if diagnostic is None else {
+            "stages": [stage.value for stage in diagnostic.stages],
+        },
+    }
+
+
+def _write_failure_smoke_record(
+    output_file: Path,
+    repo_root: Path,
+    result: object,
+    producer: o2c.CodexCliCandidateProducer,
+) -> None:
+    if not output_file.is_absolute() or output_file.resolve().is_relative_to(repo_root.resolve()):
+        raise ValueError("failure diagnostic output must be absolute and outside the source checkout")
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(
+        json.dumps(_build_failure_smoke_record(result, producer), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_details(tmp_path):
+    repo_root = tmp_path / "source-checkout"
+    repo_root.mkdir()
+    output_file = tmp_path / "external" / "diagnostics" / "failure.json"
+
+    class FailedProducer:
+        task_attempt_count = 1
+        failure_diagnostic = o2c.O2cFailureDiagnostic((o2c.O2cFailureStage.PROCESS_LAUNCH,))
+
+    result = o2c.CandidateProducerResult(ProducerStatus.PRODUCER_ERROR)
+    _write_failure_smoke_record(output_file, repo_root, result, FailedProducer())
+
+    serialized = output_file.read_text(encoding="utf-8")
+    assert json.loads(serialized) == {
+        "format_version": "o2c-smoke-failure/1",
+        "producer_status": "PRODUCER_ERROR",
+        "task_attempt_count": 1,
+        "failure_diagnostic": {"stages": ["process_launch"]},
+    }
+    assert "stdout" not in serialized and "stderr" not in serialized
+    assert "prompt" not in serialized and "credential" not in serialized
+    assert not (repo_root / output_file.name).exists()
+
+    with pytest.raises(ValueError):
+        _write_failure_smoke_record(repo_root / "failure.json", repo_root, result, FailedProducer())
+
+
 @pytest.mark.skipif(os.environ.get("O2C_REAL_SMOKE") != "1", reason="dedicated-worker Codex smoke is explicitly opt-in")
 def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tmp_path):
     """Run only on a manually prepared dedicated worker and write its complete record."""
@@ -490,7 +547,11 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
     started_head = actual_head
     result = producer.invoke(request_file.read_bytes())
     if result.status is not ProducerStatus.SUCCESS or result.candidate_proposal is None:
-        pytest.fail(f"real Codex producer failed with transport status {result.status.value}")
+        try:
+            _write_failure_smoke_record(output_file, repo_root, result, producer)
+        except (OSError, ValueError):
+            pytest.fail("real Codex producer failed and its external stage diagnostic could not be written")
+        pytest.fail("real Codex producer failed; bounded stage diagnostic was written outside the checkout")
     materialized = DeterministicFixtureCandidateMaterializer().materialize(result.candidate_proposal, base_snapshot)
     if materialized.status is not MaterializationStatus.MATERIALIZED or materialized.candidate is None:
         pytest.fail("O2b rejected the real O2c proposal")
