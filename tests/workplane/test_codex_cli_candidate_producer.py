@@ -208,6 +208,66 @@ def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, 
     assert runner.calls == producer.task_attempt_count == 1
     stage = o2c.O2cFailureStage.PROCESS_EXIT if status in ("timeout", "nonzero") else o2c.O2cFailureStage.CONTAINMENT
     assert producer.failure_diagnostic.stages == (stage,)
+    if status == "timeout":
+        assert producer.failure_diagnostic.process_exit_code == 1
+        assert producer.failure_diagnostic.process_exit_category is o2c.O2cProcessExitCategory.UNKNOWN
+
+
+@pytest.mark.parametrize(("stderr", "category"), [
+    (b"error: unexpected argument --mystery", o2c.O2cProcessExitCategory.CLI_CONFIGURATION_REJECTION),
+    (b"Authentication failed: token expired", o2c.O2cProcessExitCategory.AUTHENTICATION),
+    (b"Failed to initialize sandbox", o2c.O2cProcessExitCategory.SANDBOX_INITIALIZATION),
+    (b"Model request failed with status 503", o2c.O2cProcessExitCategory.BACKEND_MODEL_REQUEST_FAILURE),
+    (b"private text with no recognized signature", o2c.O2cProcessExitCategory.UNKNOWN),
+])
+def test_process_exit_classification_has_only_fixed_categories(stderr, category):
+    assert o2c._classify_process_exit_stderr(stderr) is category
+
+
+def test_process_exit_stderr_classification_is_bounded_in_memory(monkeypatch):
+    api = object.__new__(o2c._NativeWindowsJobObjectApi)
+    content = b"x" * o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES + b" authentication failed"
+    chunks = iter((content[:1000], content[1000:], b""))
+    monkeypatch.setattr(api, "_read", lambda _handle: next(chunks))
+    output = {}
+    api._drain(2, "stderr", output)
+    assert len(output["stderr_classifier_prefix"]) == o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES
+    assert o2c._classify_process_exit_stderr(output["stderr_classifier_prefix"]) is o2c.O2cProcessExitCategory.UNKNOWN
+    assert output["stderr_count"] == len(content)
+    assert output["stderr_hash"] == hashlib.sha256(content).hexdigest()
+
+
+def test_nonzero_exit_exposes_only_numeric_code_and_fixed_category(tmp_path):
+    class CategorizedRunner(FakeRunner):
+        def run(self, *args):
+            super().run(*args)
+            stderr = b"Authentication failed: credential=PRIVATE_SENTINEL"
+            return outcome(
+                root_exit_code=73,
+                process_exit_category=o2c._classify_process_exit_stderr(stderr),
+            )
+
+    runner = CategorizedRunner()
+    producer, _, _ = configured(tmp_path, runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    diagnostic = producer.failure_diagnostic
+    assert diagnostic.stages == (o2c.O2cFailureStage.PROCESS_EXIT,)
+    assert diagnostic.process_exit_code == 73
+    assert diagnostic.process_exit_category is o2c.O2cProcessExitCategory.AUTHENTICATION
+    assert "PRIVATE_SENTINEL" not in repr(diagnostic)
+
+
+def test_process_exit_category_is_informational_only(tmp_path):
+    class CategorizedRunner(FakeRunner):
+        def run(self, *args):
+            super().run(*args)
+            return outcome(process_exit_category=o2c.O2cProcessExitCategory.AUTHENTICATION)
+
+    producer, _, _ = configured(tmp_path, runner=CategorizedRunner())
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.SUCCESS
+    assert producer.failure_diagnostic is None
 
 
 def test_task_output_above_64kib_is_streamed_as_count_and_digest_only(tmp_path):

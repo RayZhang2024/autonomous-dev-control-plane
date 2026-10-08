@@ -46,6 +46,7 @@ MAX_FILE_BYTES = 4_194_304
 MAX_TOTAL_FILE_BYTES = 33_554_432
 MAX_TREE_DEPTH = 32
 MAX_STDIO_DIAGNOSTIC_BYTES = 65_536
+MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES = 4_096
 MAX_SANDBOX_IMPLEMENTATION_BYTES = 128
 MAX_CODEX_VERSION_OUTPUT_BYTES = 256
 MAX_CODEX_PACKAGE_VERSION_BYTES = 128
@@ -169,17 +170,66 @@ class O2cFailureStage(Enum):
     CLEANUP = "cleanup"
 
 
+class O2cProcessExitCategory(Enum):
+    """Fixed informational categories derived from bounded child stderr."""
+
+    CLI_CONFIGURATION_REJECTION = "cli_configuration_rejection"
+    AUTHENTICATION = "authentication"
+    SANDBOX_INITIALIZATION = "sandbox_initialization"
+    BACKEND_MODEL_REQUEST_FAILURE = "backend_model_request_failure"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class O2cFailureDiagnostic:
-    """Bounded stage-only diagnostics; exception text and process output are excluded."""
+    """Bounded diagnostics; exception text and process output are excluded."""
 
     stages: tuple[O2cFailureStage, ...]
+    process_exit_code: int | None = None
+    process_exit_category: O2cProcessExitCategory | None = None
 
     def __post_init__(self) -> None:
         if (type(self.stages) is not tuple or not 1 <= len(self.stages) <= 2
                 or any(type(stage) is not O2cFailureStage for stage in self.stages)
-                or len(set(self.stages)) != len(self.stages)):
+                or len(set(self.stages)) != len(self.stages)
+                or (self.process_exit_code is not None and (
+                    type(self.process_exit_code) is not int or not 0 <= self.process_exit_code <= 0xFFFFFFFF
+                ))
+                or (self.process_exit_category is not None
+                    and type(self.process_exit_category) is not O2cProcessExitCategory)
+                or ((self.process_exit_code is None) != (self.process_exit_category is None))
+                or (self.process_exit_code is not None
+                    and O2cFailureStage.PROCESS_EXIT not in self.stages)):
             raise TypeError("failure diagnostic must contain one or two unique fixed stages")
+
+
+def _classify_process_exit_stderr(stderr_prefix: bytes) -> O2cProcessExitCategory:
+    """Classify only precise signatures in a small in-memory stderr prefix."""
+    if type(stderr_prefix) is not bytes:
+        return O2cProcessExitCategory.UNKNOWN
+    sample = stderr_prefix[:MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES].lower()
+    markers = (
+        (O2cProcessExitCategory.CLI_CONFIGURATION_REJECTION, (
+            b"unexpected argument", b"unknown option", b"invalid configuration",
+            b"failed to parse config", b"configuration error",
+        )),
+        (O2cProcessExitCategory.AUTHENTICATION, (
+            b"not logged in", b"authentication failed", b"unauthorized",
+            b"invalid api key", b"token expired",
+        )),
+        (O2cProcessExitCategory.SANDBOX_INITIALIZATION, (
+            b"failed to initialize sandbox", b"sandbox initialization failed",
+            b"failed to create sandbox",
+        )),
+        (O2cProcessExitCategory.BACKEND_MODEL_REQUEST_FAILURE, (
+            b"model request failed", b"failed to send request", b"error sending request",
+            b"backend request failed",
+        )),
+    )
+    for category, signatures in markers:
+        if any(signature in sample for signature in signatures):
+            return category
+    return O2cProcessExitCategory.UNKNOWN
 
 
 class _O2cRunnerFailure(RuntimeError):
@@ -369,6 +419,7 @@ class ContainedExecutionOutcome:
     root_process_resumed_after_assignment: bool = True
     active_process_count_before_scan: int = 0
     resource_violation_types: tuple[str, ...] = ()
+    process_exit_category: O2cProcessExitCategory = O2cProcessExitCategory.UNKNOWN
 
 
 class CodexPreflightProbe(Protocol):
@@ -933,12 +984,25 @@ class CodexCliCandidateProducer:
 
         return self._failure_diagnostic
 
-    def _record_failure(self, stage: O2cFailureStage) -> None:
+    def _record_failure(
+        self,
+        stage: O2cFailureStage,
+        *,
+        process_exit_code: int | None = None,
+        process_exit_category: O2cProcessExitCategory | None = None,
+    ) -> None:
         previous = () if self._failure_diagnostic is None else self._failure_diagnostic.stages
-        if stage in previous:
-            return
-        stages = (*previous, stage)[:2]
-        self._failure_diagnostic = O2cFailureDiagnostic(stages)
+        stages = previous if stage in previous else (*previous, stage)[:2]
+        prior = self._failure_diagnostic
+        self._failure_diagnostic = O2cFailureDiagnostic(
+            stages,
+            process_exit_code if process_exit_code is not None else (
+                None if prior is None else prior.process_exit_code
+            ),
+            process_exit_category if process_exit_category is not None else (
+                None if prior is None else prior.process_exit_category
+            ),
+        )
 
     def invoke(self, request_bytes: bytes) -> CandidateProducerResult:
         self._failure_diagnostic = None
@@ -1029,9 +1093,21 @@ class CodexCliCandidateProducer:
             _validate_execution_outcome(outcome)
             if outcome.timed_out:
                 timed_out = True
+                if outcome.root_exit_code is not None:
+                    self._record_failure(
+                        O2cFailureStage.PROCESS_EXIT,
+                        process_exit_code=outcome.root_exit_code,
+                        process_exit_category=outcome.process_exit_category,
+                    )
+                    return _failure(ProducerStatus.TIMEOUT)
                 return fail(O2cFailureStage.PROCESS_EXIT, ProducerStatus.TIMEOUT)
             if outcome.root_exit_code != 0:
-                return fail(O2cFailureStage.PROCESS_EXIT)
+                self._record_failure(
+                    O2cFailureStage.PROCESS_EXIT,
+                    process_exit_code=outcome.root_exit_code,
+                    process_exit_category=outcome.process_exit_category,
+                )
+                return _failure()
             if (outcome.resource_limit_violation or not outcome.process_tree_quiescent
                     or outcome.active_process_count_before_scan != 0 or not outcome.job_assignment_succeeded
                     or not outcome.root_process_resumed_after_assignment):
@@ -1113,6 +1189,10 @@ def _validate_execution_outcome(outcome: ContainedExecutionOutcome) -> None:
             raise O2cPreflightError("contained runner returned invalid boolean state")
     if outcome.root_exit_code is not None and type(outcome.root_exit_code) is not int:
         raise O2cPreflightError("contained runner returned invalid exit code")
+    if outcome.root_exit_code is not None and not 0 <= outcome.root_exit_code <= 0xFFFFFFFF:
+        raise O2cPreflightError("contained runner returned invalid exit code")
+    if type(outcome.process_exit_category) is not O2cProcessExitCategory:
+        raise O2cPreflightError("contained runner returned invalid process-exit category")
     for count in (outcome.stdout_byte_count, outcome.stderr_byte_count, outcome.elapsed_milliseconds):
         if type(count) is not int or count < 0:
             raise O2cPreflightError("contained runner returned invalid diagnostic count")
@@ -1779,6 +1859,7 @@ class _NativeWindowsJobObjectApi:
             int(output.get("stderr_count", 0)), str(output.get("stderr_hash", hashlib.sha256(b"").hexdigest())),
             max(0, int((time.monotonic() - started) * 1000)),
             True, True, active_before_scan, tuple(sorted(resource_violation_types)),
+            _classify_process_exit_stderr(bytes(output.get("stderr_classifier_prefix", b""))),
         )
 
     def _read(self, handle: int) -> bytes:
@@ -1794,6 +1875,7 @@ class _NativeWindowsJobObjectApi:
     def _drain(self, handle: int, name: str, output: dict[str, object]) -> None:
         digest = hashlib.sha256()
         count = 0
+        classifier_prefix = bytearray()
         try:
             while True:
                 chunk = self._read(handle)
@@ -1801,8 +1883,13 @@ class _NativeWindowsJobObjectApi:
                     break
                 count += len(chunk)
                 digest.update(chunk)
+                if name == "stderr" and len(classifier_prefix) < MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES:
+                    remaining = MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES - len(classifier_prefix)
+                    classifier_prefix.extend(chunk[:remaining])
             output[f"{name}_count"] = count
             output[f"{name}_hash"] = digest.hexdigest()
+            if name == "stderr":
+                output["stderr_classifier_prefix"] = bytes(classifier_prefix)
         except BaseException as error:
             output[f"{name}_error"] = error
 

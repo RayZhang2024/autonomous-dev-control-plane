@@ -451,6 +451,10 @@ def _build_failure_smoke_record(
         "task_attempt_count": producer.task_attempt_count,
         "failure_diagnostic": None if diagnostic is None else {
             "stages": [stage.value for stage in diagnostic.stages],
+            **({} if diagnostic.process_exit_code is None else {
+                "process_exit_code": diagnostic.process_exit_code,
+                "process_exit_category": diagnostic.process_exit_category.value,
+            }),
         },
     }
 
@@ -494,7 +498,9 @@ def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_deta
 
     class FailedProducer:
         task_attempt_count = 1
-        failure_diagnostic = o2c.O2cFailureDiagnostic((o2c.O2cFailureStage.PROCESS_LAUNCH,))
+        failure_diagnostic = o2c.O2cFailureDiagnostic(
+            (o2c.O2cFailureStage.PROCESS_EXIT,), 73, o2c.O2cProcessExitCategory.AUTHENTICATION,
+        )
 
     result = o2c.CandidateProducerResult(ProducerStatus.PRODUCER_ERROR)
     _write_failure_smoke_record(output_file, repo_root, result, FailedProducer())
@@ -504,7 +510,11 @@ def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_deta
         "format_version": "o2c-smoke-failure/1",
         "producer_status": "PRODUCER_ERROR",
         "task_attempt_count": 1,
-        "failure_diagnostic": {"stages": ["process_launch"]},
+        "failure_diagnostic": {
+            "stages": ["process_exit"],
+            "process_exit_code": 73,
+            "process_exit_category": "authentication",
+        },
     }
     assert "stdout" not in serialized and "stderr" not in serialized
     assert "prompt" not in serialized and "credential" not in serialized
