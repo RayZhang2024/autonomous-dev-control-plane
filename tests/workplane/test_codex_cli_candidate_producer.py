@@ -568,6 +568,68 @@ def test_frozen_command_profile_and_environment_allowlist():
     assert profile.control_root_credentials_intentionally_present is False
 
 
+def test_child_environment_matches_windows_allowlist_names_case_insensitively():
+    parent = {
+        "SYSTEMROOT": r"C:\Windows",
+        "pAtH": r"C:\Windows\System32",
+        "wInDiR": r"C:\Windows",
+        "=C:": r"C:\scratch\workspace",
+        "OPENAI_API_KEY": "sensitive-unapproved-value",
+        "EXTRA_WORKER_SETTING": "unapproved-value",
+    }
+
+    child = o2c.build_child_environment(
+        parent,
+        worker_home=r"C:\worker",
+        codex_home=r"C:\worker\codex",
+        runtime_tmp=r"C:\worker\tmp",
+    )
+
+    assert child["SystemRoot"] == r"C:\Windows"
+    assert child["PATH"] == r"C:\Windows\System32"
+    assert child["WINDIR"] == r"C:\Windows"
+    assert not ({"SYSTEMROOT", "OPENAI_API_KEY", "EXTRA_WORKER_SETTING"} & child.keys())
+    assert set(child) == {
+        "SystemRoot", "PATH", "WINDIR", "USERPROFILE", "HOME", "CODEX_HOME",
+        "TEMP", "TMP", "GIT_TERMINAL_PROMPT", "GH_PROMPT_DISABLED",
+    }
+
+
+def test_child_environment_rejects_case_insensitive_duplicate_parent_names():
+    with pytest.raises(o2c.O2cPreflightError, match="duplicate Windows names"):
+        o2c.build_child_environment(
+            {"SystemRoot": r"C:\Windows", "SYSTEMROOT": r"D:\untrusted"},
+            worker_home=r"C:\worker",
+            codex_home=r"C:\worker\codex",
+            runtime_tmp=r"C:\worker\tmp",
+        )
+
+
+def test_child_environment_controlled_overrides_remain_authoritative():
+    parent = {
+        "uSeRpRoFiLe": r"D:\parent-profile",
+        "hOmE": r"D:\parent-home",
+        "cOdEx_HoMe": r"D:\parent-codex",
+        "tEmP": r"D:\parent-temp",
+        "tMp": r"D:\parent-tmp",
+        "gIt_TeRmInAl_PrOmPt": "1",
+        "gH_PrOmPt_DiSaBlEd": "0",
+    }
+
+    child = o2c.build_child_environment(
+        parent,
+        worker_home=r"C:\worker",
+        codex_home=r"C:\worker\codex",
+        runtime_tmp=r"C:\worker\runtime-tmp",
+    )
+
+    assert child["USERPROFILE"] == child["HOME"] == r"C:\worker"
+    assert child["CODEX_HOME"] == r"C:\worker\codex"
+    assert child["TEMP"] == child["TMP"] == r"C:\worker\runtime-tmp"
+    assert child["GIT_TERMINAL_PROMPT"] == "0"
+    assert child["GH_PROMPT_DISABLED"] == "1"
+
+
 def test_home_codex_home_and_deployment_preflight_reject_unsuitable_state(tmp_path):
     producer, _, environment = configured(tmp_path)
     codex_home = Path(producer._configuration.codex_home)

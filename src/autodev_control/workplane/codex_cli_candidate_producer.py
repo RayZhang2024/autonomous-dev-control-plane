@@ -824,9 +824,17 @@ def build_child_environment(
     """Build the child environment from the fixed Windows discovery allowlist."""
     if not isinstance(parent_environment, Mapping):
         raise O2cPreflightError("parent environment must be a mapping")
+    parent_by_windows_name: dict[str, str] = {}
+    for parent_key, value in parent_environment.items():
+        if type(parent_key) is not str or "\x00" in parent_key:
+            raise O2cPreflightError("parent environment names must be exact strings")
+        normalized_key = parent_key.casefold()
+        if normalized_key in parent_by_windows_name:
+            raise O2cPreflightError("parent environment contains duplicate Windows names")
+        parent_by_windows_name[normalized_key] = value
     child: dict[str, str] = {}
     for key in _WINDOWS_ENV_ALLOWLIST:
-        value = parent_environment.get(key)
+        value = parent_by_windows_name.get(key.casefold())
         if value is not None:
             if type(value) is not str or "\x00" in value:
                 raise O2cPreflightError("environment values must be exact strings")
