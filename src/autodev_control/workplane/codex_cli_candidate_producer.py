@@ -89,7 +89,7 @@ CAPABILITY_DENY_SET = (
 )
 WINDOWS_SANDBOX_CONFIG_OVERRIDE = 'windows.sandbox="unelevated"'
 BUNDLED_SKILLS_CONFIG_OVERRIDE = "skills.bundled.enabled=false"
-O2C_EXPERIMENT_MODEL = "gpt-6-luna"
+O2C_EXPERIMENT_MODEL = "gpt-5.6-terra"
 O2C_EXPERIMENT_REASONING_EFFORT = "medium"
 SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS = frozenset(("restricted-token", "elevated", "mxc"))
 RUNNER_IMPLEMENTATION_VERSION = "o2c-fixture-worker/1"

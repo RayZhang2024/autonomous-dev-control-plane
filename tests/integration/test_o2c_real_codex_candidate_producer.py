@@ -240,7 +240,7 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
     ]
     assert runner.arguments is not None
     assert runner.arguments[:10] == (
-        "exec", "--model", "gpt-6-luna", "--strict-config",
+        "exec", "--model", "gpt-5.6-terra", "--strict-config",
         "-c", 'model_reasoning_effort="medium"',
         "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE,
         "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,

@@ -524,7 +524,7 @@ def test_frozen_command_profile_and_environment_allowlist():
     )
     assert o2c.CAPABILITY_DENY_SET == expected_capability_denials
     assert args == (
-        "exec", "--model", "gpt-6-luna", "--strict-config",
+        "exec", "--model", "gpt-5.6-terra", "--strict-config",
         "-c", 'model_reasoning_effort="medium"',
         "-c", 'windows.sandbox="unelevated"',
         "-c", "skills.bundled.enabled=false",
@@ -543,7 +543,7 @@ def test_frozen_command_profile_and_environment_allowlist():
         "-",
     )
     assert args.count("--model") == 1
-    assert args.count("gpt-6-luna") == 1
+    assert args.count("gpt-5.6-terra") == 1
     assert args.count('model_reasoning_effort="medium"') == 1
     assert o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE == "skills.bundled.enabled=false"
     assert args.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1
