@@ -226,10 +226,12 @@ def _classify_process_exit_stderr(stderr_prefix: bytes) -> O2cProcessExitCategor
             b"backend request failed",
         )),
     )
-    for category, signatures in markers:
-        if any(signature in sample for signature in signatures):
-            return category
-    return O2cProcessExitCategory.UNKNOWN
+    matched = {
+        category
+        for category, signatures in markers
+        if any(signature in sample for signature in signatures)
+    }
+    return next(iter(matched)) if len(matched) == 1 else O2cProcessExitCategory.UNKNOWN
 
 
 class _O2cRunnerFailure(RuntimeError):
@@ -1101,6 +1103,8 @@ class CodexCliCandidateProducer:
                     )
                     return _failure(ProducerStatus.TIMEOUT)
                 return fail(O2cFailureStage.PROCESS_EXIT, ProducerStatus.TIMEOUT)
+            if outcome.root_exit_code is None:
+                return fail(O2cFailureStage.PROCESS_EXIT)
             if outcome.root_exit_code != 0:
                 self._record_failure(
                     O2cFailureStage.PROCESS_EXIT,

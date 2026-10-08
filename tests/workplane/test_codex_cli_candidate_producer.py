@@ -66,6 +66,8 @@ class FakeRunner:
             return outcome(root_exit_code=1, timed_out=True)
         if self.status == "nonzero":
             return outcome(root_exit_code=7)
+        if self.status == "missing-exit-code":
+            return outcome(root_exit_code=None, timed_out=False)
         if self.status == "violation":
             return outcome(resource_limit_violation=True)
         if self.status == "no-assignment":
@@ -218,10 +220,20 @@ def test_timeout_nonzero_and_resource_violation_never_propose(tmp_path, status, 
     (b"Authentication failed: token expired", o2c.O2cProcessExitCategory.AUTHENTICATION),
     (b"Failed to initialize sandbox", o2c.O2cProcessExitCategory.SANDBOX_INITIALIZATION),
     (b"Model request failed with status 503", o2c.O2cProcessExitCategory.BACKEND_MODEL_REQUEST_FAILURE),
-    (b"private text with no recognized signature", o2c.O2cProcessExitCategory.UNKNOWN),
 ])
 def test_process_exit_classification_has_only_fixed_categories(stderr, category):
     assert o2c._classify_process_exit_stderr(stderr) is category
+
+
+def test_conflicting_process_exit_signatures_are_unknown():
+    stderr = b"unexpected argument; authentication failed"
+    assert o2c._classify_process_exit_stderr(stderr) is o2c.O2cProcessExitCategory.UNKNOWN
+
+
+def test_unrecognized_process_exit_message_is_unknown():
+    assert o2c._classify_process_exit_stderr(b"private text with no recognized signature") is (
+        o2c.O2cProcessExitCategory.UNKNOWN
+    )
 
 
 def test_process_exit_stderr_classification_is_bounded_in_memory(monkeypatch):
@@ -268,6 +280,19 @@ def test_process_exit_category_is_informational_only(tmp_path):
     result = producer.invoke(b"request")
     assert result.status is ProducerStatus.SUCCESS
     assert producer.failure_diagnostic is None
+
+
+def test_missing_process_exit_code_fails_closed_without_numeric_diagnostic(tmp_path):
+    runner = FakeRunner(status="missing-exit-code")
+    producer, _, _ = configured(tmp_path, runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert runner.calls == producer.task_attempt_count == 1
+    diagnostic = producer.failure_diagnostic
+    assert diagnostic.stages == (o2c.O2cFailureStage.PROCESS_EXIT,)
+    assert diagnostic.process_exit_code is None
+    assert diagnostic.process_exit_category is None
 
 
 def test_task_output_above_64kib_is_streamed_as_count_and_digest_only(tmp_path):
