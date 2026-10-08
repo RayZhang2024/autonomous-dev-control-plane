@@ -239,7 +239,12 @@ def test_doctor_fixture_flows_through_real_preflight_into_measured_smoke_record(
         (str(executable), "--strict-config", *diagnostic_prefix, "doctor", "--json"),
     ]
     assert runner.arguments is not None
-    assert ("-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE) == runner.arguments[2:4]
+    assert runner.arguments[:10] == (
+        "exec", "--model", "gpt-6-luna", "--strict-config",
+        "-c", 'model_reasoning_effort="medium"',
+        "-c", o2c.WINDOWS_SANDBOX_CONFIG_OVERRIDE,
+        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
+    )
     assert runner.arguments.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1
     record = _build_smoke_record(
         producer._deployment, result.untrusted_metadata, result.candidate_proposal, "fixture-candidate",

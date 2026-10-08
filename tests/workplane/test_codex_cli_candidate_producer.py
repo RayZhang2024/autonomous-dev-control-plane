@@ -513,12 +513,38 @@ def test_executable_must_be_absolute_exact_exe_with_configured_hash(tmp_path):
 
 def test_frozen_command_profile_and_environment_allowlist():
     args = o2c.build_codex_arguments("C:/scratch/workspace")
-    assert args[:14] == (
-        "exec", "--strict-config", "-c", 'windows.sandbox="unelevated"',
-        "-c", o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE,
+    expected_capability_denials = (
+        "apps", "plugins", "remote_plugin", "hooks", "multi_agent", "multi_agent_v2",
+        "tool_suggest", "recommended_plugins", "skill_search", "workspace_dependencies",
+        "goals", "image_generation", "realtime_conversation", "enable_mcp_apps",
+        "mcp_2026_07_28", "codex_apps_mcp_2026_07_28", "mcp_oauth_refresh_coordination",
+        "use_xaa", "skill_mcp_dependency_install", "browser_use",
+        "browser_use_full_cdp_access", "browser_use_external", "computer_use",
+        "in_app_browser", "in_app_local_automation",
+    )
+    assert o2c.CAPABILITY_DENY_SET == expected_capability_denials
+    assert args == (
+        "exec", "--model", "gpt-6-luna", "--strict-config",
+        "-c", 'model_reasoning_effort="medium"',
+        "-c", 'windows.sandbox="unelevated"',
+        "-c", "skills.bundled.enabled=false",
         "--sandbox", "workspace-write", "--skip-git-repo-check", "--ephemeral",
         "--ignore-user-config", "--ignore-rules", "--cd", "C:/scratch/workspace",
+        *(argument for feature in expected_capability_denials for argument in ("--disable", feature)),
+        "-c", 'approval_policy="never"',
+        "-c", 'cli_auth_credentials_store="keyring"',
+        "-c", 'forced_login_method="chatgpt"',
+        "-c", "check_for_update_on_startup=false",
+        "-c", "sandbox_workspace_write.network_access=false",
+        "-c", "sandbox_workspace_write.writable_roots=[]",
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", 'web_search="disabled"',
+        "-",
     )
+    assert args.count("--model") == 1
+    assert args.count("gpt-6-luna") == 1
+    assert args.count('model_reasoning_effort="medium"') == 1
     assert o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE == "skills.bundled.enabled=false"
     assert args.count(o2c.BUNDLED_SKILLS_CONFIG_OVERRIDE) == 1
     assert tuple(args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--disable") == o2c.CAPABILITY_DENY_SET

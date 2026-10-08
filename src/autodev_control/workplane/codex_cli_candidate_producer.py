@@ -89,6 +89,8 @@ CAPABILITY_DENY_SET = (
 )
 WINDOWS_SANDBOX_CONFIG_OVERRIDE = 'windows.sandbox="unelevated"'
 BUNDLED_SKILLS_CONFIG_OVERRIDE = "skills.bundled.enabled=false"
+O2C_EXPERIMENT_MODEL = "gpt-6-luna"
+O2C_EXPERIMENT_REASONING_EFFORT = "medium"
 SUPPORTED_WINDOWS_SANDBOX_IMPLEMENTATIONS = frozenset(("restricted-token", "elevated", "mxc"))
 RUNNER_IMPLEMENTATION_VERSION = "o2c-fixture-worker/1"
 FIXED_IMPLEMENTATION_PREFIX = (
@@ -774,7 +776,11 @@ def build_codex_arguments(workspace: str) -> tuple[str, ...]:
     """Return the single frozen exec profile; the prompt is always stdin."""
     arguments = [
         "exec",
+        "--model",
+        O2C_EXPERIMENT_MODEL,
         "--strict-config",
+        "-c",
+        f'model_reasoning_effort="{O2C_EXPERIMENT_REASONING_EFFORT}"',
         "-c",
         WINDOWS_SANDBOX_CONFIG_OVERRIDE,
         "-c",
