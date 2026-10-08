@@ -47,6 +47,7 @@ MAX_TOTAL_FILE_BYTES = 33_554_432
 MAX_TREE_DEPTH = 32
 MAX_STDIO_DIAGNOSTIC_BYTES = 65_536
 MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES = 4_096
+PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES = MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES // 2
 MAX_SANDBOX_IMPLEMENTATION_BYTES = 128
 MAX_CODEX_VERSION_OUTPUT_BYTES = 256
 MAX_CODEX_PACKAGE_VERSION_BYTES = 128
@@ -207,7 +208,20 @@ def _classify_process_exit_stderr(stderr_prefix: bytes) -> O2cProcessExitCategor
     """Classify only precise signatures in a small in-memory stderr prefix."""
     if type(stderr_prefix) is not bytes:
         return O2cProcessExitCategory.UNKNOWN
-    sample = stderr_prefix[:MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES].lower()
+    return _classify_process_exit_stderr_windows(
+        stderr_prefix[:PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES],
+        stderr_prefix[PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES:MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES],
+    )
+
+
+def _classify_process_exit_stderr_windows(
+    initial_window: bytes | bytearray,
+    terminal_window: bytes | bytearray,
+) -> O2cProcessExitCategory:
+    """Classify bounded start/end samples, returning unknown on category conflict."""
+    if (type(initial_window) not in (bytes, bytearray)
+            or type(terminal_window) not in (bytes, bytearray)):
+        return O2cProcessExitCategory.UNKNOWN
     markers = (
         (O2cProcessExitCategory.CLI_CONFIGURATION_REJECTION, (
             b"unexpected argument", b"unknown option", b"invalid configuration",
@@ -226,12 +240,29 @@ def _classify_process_exit_stderr(stderr_prefix: bytes) -> O2cProcessExitCategor
             b"backend request failed",
         )),
     )
+    samples = (initial_window, terminal_window)
     matched = {
-        category
-        for category, signatures in markers
-        if any(signature in sample for signature in signatures)
+        category for category, signatures in markers
+        if any(
+            _contains_ascii_case_insensitive(sample[:PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES], signature)
+            for sample in samples for signature in signatures
+        )
     }
     return next(iter(matched)) if len(matched) == 1 else O2cProcessExitCategory.UNKNOWN
+
+
+def _contains_ascii_case_insensitive(sample: bytes | bytearray, signature: bytes) -> bool:
+    signature_length = len(signature)
+    for start in range(len(sample) - signature_length + 1):
+        for offset, expected in enumerate(signature):
+            observed = sample[start + offset]
+            if 65 <= observed <= 90:
+                observed += 32
+            if observed != expected:
+                break
+        else:
+            return True
+    return False
 
 
 class _O2cRunnerFailure(RuntimeError):
@@ -1863,7 +1894,9 @@ class _NativeWindowsJobObjectApi:
             int(output.get("stderr_count", 0)), str(output.get("stderr_hash", hashlib.sha256(b"").hexdigest())),
             max(0, int((time.monotonic() - started) * 1000)),
             True, True, active_before_scan, tuple(sorted(resource_violation_types)),
-            _classify_process_exit_stderr(bytes(output.get("stderr_classifier_prefix", b""))),
+            _classify_process_exit_stderr_windows(*output.get(
+                "stderr_classifier_windows", (bytearray(), bytearray())
+            )),
         )
 
     def _read(self, handle: int) -> bytes:
@@ -1879,7 +1912,8 @@ class _NativeWindowsJobObjectApi:
     def _drain(self, handle: int, name: str, output: dict[str, object]) -> None:
         digest = hashlib.sha256()
         count = 0
-        classifier_prefix = bytearray()
+        classifier_initial = bytearray()
+        classifier_terminal = bytearray()
         try:
             while True:
                 chunk = self._read(handle)
@@ -1887,13 +1921,24 @@ class _NativeWindowsJobObjectApi:
                     break
                 count += len(chunk)
                 digest.update(chunk)
-                if name == "stderr" and len(classifier_prefix) < MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES:
-                    remaining = MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES - len(classifier_prefix)
-                    classifier_prefix.extend(chunk[:remaining])
+                if name == "stderr":
+                    initial_remaining = PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES - len(classifier_initial)
+                    if initial_remaining > 0:
+                        classifier_initial.extend(chunk[:initial_remaining])
+                    if len(chunk) >= PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES:
+                        classifier_terminal[:] = chunk[-PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES:]
+                    else:
+                        overflow = max(
+                            0,
+                            len(classifier_terminal) + len(chunk) - PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES,
+                        )
+                        if overflow:
+                            del classifier_terminal[:overflow]
+                        classifier_terminal.extend(chunk)
             output[f"{name}_count"] = count
             output[f"{name}_hash"] = digest.hexdigest()
             if name == "stderr":
-                output["stderr_classifier_prefix"] = bytes(classifier_prefix)
+                output["stderr_classifier_windows"] = (classifier_initial, classifier_terminal)
         except BaseException as error:
             output[f"{name}_error"] = error
 

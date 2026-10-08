@@ -226,8 +226,18 @@ def test_process_exit_classification_has_only_fixed_categories(stderr, category)
 
 
 def test_conflicting_process_exit_signatures_are_unknown():
-    stderr = b"unexpected argument; authentication failed"
-    assert o2c._classify_process_exit_stderr(stderr) is o2c.O2cProcessExitCategory.UNKNOWN
+    assert o2c._classify_process_exit_stderr_windows(
+        b"unexpected argument", b"authentication failed",
+    ) is o2c.O2cProcessExitCategory.UNKNOWN
+
+
+def test_terminal_only_process_exit_signature_is_classified():
+    initial = b"ordinary progress output" * 80
+    terminal = b"Authentication failed: token expired"
+    assert len(initial) <= o2c.PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES
+    assert o2c._classify_process_exit_stderr_windows(initial, terminal) is (
+        o2c.O2cProcessExitCategory.AUTHENTICATION
+    )
 
 
 def test_unrecognized_process_exit_message_is_unknown():
@@ -238,13 +248,17 @@ def test_unrecognized_process_exit_message_is_unknown():
 
 def test_process_exit_stderr_classification_is_bounded_in_memory(monkeypatch):
     api = object.__new__(o2c._NativeWindowsJobObjectApi)
-    content = b"x" * o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES + b" authentication failed"
+    content = b"x" * (o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES * 3) + b" authentication failed"
     chunks = iter((content[:1000], content[1000:], b""))
     monkeypatch.setattr(api, "_read", lambda _handle: next(chunks))
     output = {}
     api._drain(2, "stderr", output)
-    assert len(output["stderr_classifier_prefix"]) == o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES
-    assert o2c._classify_process_exit_stderr(output["stderr_classifier_prefix"]) is o2c.O2cProcessExitCategory.UNKNOWN
+    initial, terminal = output["stderr_classifier_windows"]
+    assert len(initial) + len(terminal) <= o2c.MAX_PROCESS_EXIT_DIAGNOSTIC_BYTES
+    assert len(initial) == len(terminal) == o2c.PROCESS_EXIT_DIAGNOSTIC_WINDOW_BYTES
+    assert o2c._classify_process_exit_stderr_windows(initial, terminal) is (
+        o2c.O2cProcessExitCategory.AUTHENTICATION
+    )
     assert output["stderr_count"] == len(content)
     assert output["stderr_hash"] == hashlib.sha256(content).hexdigest()
 
