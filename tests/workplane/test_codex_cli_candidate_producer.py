@@ -60,6 +60,8 @@ class FakeRunner:
             self.mutate(self.workspace)
         if self.status == "launch-error":
             raise OSError("private launch detail must never enter the diagnostic")
+        if self.status == "combined-runner-failure":
+            raise o2c._O2cRunnerFailure((o2c.O2cFailureStage.CONTAINMENT, o2c.O2cFailureStage.CLEANUP))
         if self.status == "timeout":
             return outcome(root_exit_code=1, timed_out=True)
         if self.status == "nonzero":
@@ -870,10 +872,11 @@ def test_duplicate_parsed_feature_key_fails_actual_producer_preflight(tmp_path):
 
 
 class FakeJobApi:
-    def __init__(self, *, fail_assignment=False, fail_launch=False):
+    def __init__(self, *, fail_assignment=False, fail_launch=False, fail_close_job=False):
         self.events = []
         self.fail_assignment = fail_assignment
         self.fail_launch = fail_launch
+        self.fail_close_job = fail_close_job
         self.limits = None
 
     def create_suspended_process(self, *args):
@@ -907,6 +910,8 @@ class FakeJobApi:
 
     def close_job(self, job):
         self.events.append("close_job")
+        if self.fail_close_job:
+            raise OSError("private cleanup detail")
 
     def close_process(self, process):
         self.events.append("close_process")
@@ -934,6 +939,27 @@ def test_job_object_sequence_limits_and_fail_assignment_never_resumes(monkeypatc
         o2c.WindowsJobObjectRunner(launch_failed).run("codex.exe", ("exec",), "workspace", {}, b"task", 3)
     assert error.value.stage is o2c.O2cFailureStage.PROCESS_LAUNCH
     assert launch_failed.events == ["suspended"]
+    operation_and_cleanup_failed = FakeJobApi(fail_assignment=True, fail_close_job=True)
+    with pytest.raises(RuntimeError) as error:
+        o2c.WindowsJobObjectRunner(operation_and_cleanup_failed).run(
+            "codex.exe", ("exec",), "workspace", {}, b"task", 3
+        )
+    assert error.value.stages == (o2c.O2cFailureStage.CONTAINMENT, o2c.O2cFailureStage.CLEANUP)
+    assert "private cleanup detail" not in str(error.value)
+    assert "close_job" in operation_and_cleanup_failed.events
+    assert "terminate" in operation_and_cleanup_failed.events and "resume" not in operation_and_cleanup_failed.events
+
+
+def test_producer_preserves_both_fixed_runner_failure_stages(tmp_path):
+    runner = FakeRunner(status="combined-runner-failure")
+    producer, _, _ = configured(tmp_path, runner=runner)
+    result = producer.invoke(b"request")
+    assert result.status is ProducerStatus.PRODUCER_ERROR
+    assert result.candidate_proposal is None
+    assert producer.failure_diagnostic.stages == (
+        o2c.O2cFailureStage.CONTAINMENT,
+        o2c.O2cFailureStage.CLEANUP,
+    )
 
 
 def test_delayed_descendant_is_quiescent_before_workspace_observation(tmp_path, monkeypatch):

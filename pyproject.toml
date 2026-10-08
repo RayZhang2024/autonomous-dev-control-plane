@@ -13,4 +13,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-addopts = ["-p", "no:cacheprovider"]

@@ -185,8 +185,12 @@ class O2cFailureDiagnostic:
 class _O2cRunnerFailure(RuntimeError):
     """Internal runner failure tagged with a fixed stage and no dynamic details."""
 
-    def __init__(self, stage: O2cFailureStage) -> None:
-        self.stage = stage
+    def __init__(self, stages: O2cFailureStage | tuple[O2cFailureStage, ...]) -> None:
+        if type(stages) is O2cFailureStage:
+            stages = (stages,)
+        self.diagnostic = O2cFailureDiagnostic(stages)
+        self.stages = self.diagnostic.stages
+        self.stage = self.stages[0]
         super().__init__("contained task runner failed")
 
 
@@ -1080,7 +1084,8 @@ class CodexCliCandidateProducer:
                 metadata,
             )
         except _O2cRunnerFailure as error:
-            self._record_failure(error.stage)
+            for stage in error.stages:
+                self._record_failure(stage)
             return _failure(ProducerStatus.TIMEOUT if timed_out else ProducerStatus.PRODUCER_ERROR)
         except (O2cPreflightError, OSError, ValueError, TypeError, RuntimeError, subprocess.SubprocessError):
             self._record_failure(failure_stage)
@@ -1446,12 +1451,14 @@ class WindowsJobObjectRunner:
         process = None
         job = None
         cleanup_error: BaseException | None = None
+        operation_failure_stage: O2cFailureStage | None = None
         try:
             try:
                 process = self._api.create_suspended_process(
                     executable_path, arguments, workspace, child_environment, prompt_bytes
                 )
             except Exception as error:
+                operation_failure_stage = O2cFailureStage.PROCESS_LAUNCH
                 raise _O2cRunnerFailure(O2cFailureStage.PROCESS_LAUNCH) from error
             try:
                 job = self._api.create_job()
@@ -1464,12 +1471,17 @@ class WindowsJobObjectRunner:
                 )
                 _validate_execution_outcome(outcome)
             except Exception as error:
+                operation_failure_stage = O2cFailureStage.CONTAINMENT
                 raise _O2cRunnerFailure(O2cFailureStage.CONTAINMENT) from error
-            return replace(
-                outcome,
-                job_assignment_succeeded=True,
-                root_process_resumed_after_assignment=True,
-            )
+            try:
+                return replace(
+                    outcome,
+                    job_assignment_succeeded=True,
+                    root_process_resumed_after_assignment=True,
+                )
+            except Exception as error:
+                operation_failure_stage = O2cFailureStage.CONTAINMENT
+                raise _O2cRunnerFailure(O2cFailureStage.CONTAINMENT) from error
         except BaseException:
             if process is not None:
                 try:
@@ -1489,7 +1501,12 @@ class WindowsJobObjectRunner:
                 except BaseException as error:
                     cleanup_error = cleanup_error or error
             if cleanup_error is not None:
-                raise _O2cRunnerFailure(O2cFailureStage.CLEANUP) from cleanup_error
+                failure_stages = (
+                    (operation_failure_stage, O2cFailureStage.CLEANUP)
+                    if operation_failure_stage is not None
+                    else (O2cFailureStage.CLEANUP,)
+                )
+                raise _O2cRunnerFailure(failure_stages) from cleanup_error
 
 
 class _NativeWindowsJobObjectApi:

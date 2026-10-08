@@ -455,25 +455,42 @@ def _build_failure_smoke_record(
     }
 
 
+def _validate_failure_smoke_output_path(output_file: Path, repo_root: Path) -> None:
+    if not output_file.is_absolute():
+        raise ValueError("failure diagnostic output must be absolute")
+    try:
+        resolved_output = output_file.resolve()
+        resolved_repo = repo_root.resolve()
+        parent_is_directory = output_file.parent.is_dir()
+        parent_directories = (output_file.parent, *output_file.parent.parents)
+        unsafe_parent = any(o2c._is_reparse_point(directory) for directory in parent_directories)
+        output_exists = o2c._path_exists_or_link(output_file)
+        unsafe_output = output_exists and (o2c._is_reparse_point(output_file) or not output_file.is_file())
+    except (OSError, RuntimeError):
+        raise ValueError("failure diagnostic output path cannot be safely inspected") from None
+    if resolved_output.is_relative_to(resolved_repo) or not parent_is_directory or unsafe_parent or unsafe_output:
+        raise ValueError("failure diagnostic output requires an existing safe directory outside the checkout")
+
+
 def _write_failure_smoke_record(
     output_file: Path,
     repo_root: Path,
     result: object,
     producer: o2c.CodexCliCandidateProducer,
 ) -> None:
-    if not output_file.is_absolute() or output_file.resolve().is_relative_to(repo_root.resolve()):
-        raise ValueError("failure diagnostic output must be absolute and outside the source checkout")
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    _validate_failure_smoke_output_path(output_file, repo_root)
     output_file.write_text(
         json.dumps(_build_failure_smoke_record(result, producer), sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
-def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_details(tmp_path):
+def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_details(tmp_path, monkeypatch):
     repo_root = tmp_path / "source-checkout"
     repo_root.mkdir()
-    output_file = tmp_path / "external" / "diagnostics" / "failure.json"
+    output_directory = tmp_path / "external" / "diagnostics"
+    output_directory.mkdir(parents=True)
+    output_file = output_directory / "failure.json"
 
     class FailedProducer:
         task_attempt_count = 1
@@ -491,10 +508,30 @@ def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_deta
     }
     assert "stdout" not in serialized and "stderr" not in serialized
     assert "prompt" not in serialized and "credential" not in serialized
-    assert not (repo_root / output_file.name).exists()
+    assert not output_file.resolve().is_relative_to(repo_root.resolve())
 
     with pytest.raises(ValueError):
         _write_failure_smoke_record(repo_root / "failure.json", repo_root, result, FailedProducer())
+
+    missing_directory = tmp_path / "not-created" / "diagnostics"
+    with pytest.raises(ValueError):
+        _write_failure_smoke_record(missing_directory / "failure.json", repo_root, result, FailedProducer())
+    assert not missing_directory.exists()
+
+    non_directory = tmp_path / "output-is-a-file"
+    non_directory.write_text("fixture", encoding="utf-8")
+    with pytest.raises(ValueError):
+        _write_failure_smoke_record(non_directory / "failure.json", repo_root, result, FailedProducer())
+
+    unsafe_directory = tmp_path / "external" / "unsafe"
+    unsafe_directory.mkdir()
+    is_reparse_point = o2c._is_reparse_point
+    monkeypatch.setattr(
+        o2c, "_is_reparse_point",
+        lambda path: Path(path) == unsafe_directory or is_reparse_point(path),
+    )
+    with pytest.raises(ValueError):
+        _write_failure_smoke_record(unsafe_directory / "failure.json", repo_root, result, FailedProducer())
 
 
 @pytest.mark.skipif(os.environ.get("O2C_REAL_SMOKE") != "1", reason="dedicated-worker Codex smoke is explicitly opt-in")
@@ -517,10 +554,12 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
 
     request_file = Path(os.environ.get("O2C_REAL_REQUEST_FILE", ""))
     output_file = Path(os.environ.get("O2C_REAL_SMOKE_RECORD_OUTPUT", ""))
-    if not request_file.is_absolute() or not request_file.is_file() or not output_file.is_absolute():
+    if not request_file.is_absolute() or not request_file.is_file():
         pytest.fail("real smoke requires absolute request input and record output paths")
-    if output_file.resolve().is_relative_to(repo_root.resolve()):
-        pytest.fail("real-smoke record output must remain outside the source checkout")
+    try:
+        _validate_failure_smoke_output_path(output_file, repo_root)
+    except ValueError:
+        pytest.fail("real-smoke record output requires an existing safe directory outside the checkout")
     base_store = o2b_test.base_only_store()
     base_snapshot = o2b_test.project_exact_base(base_store, o2b_test.REPOSITORY, o2b_test.BASE)
     worker_home = os.environ.get("O2C_WORKER_HOME", "")
@@ -578,5 +617,9 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
         source_clean_before=source_clean_before,
         source_clean_after=source_clean_after,
     )
+    try:
+        _validate_failure_smoke_output_path(output_file, repo_root)
+    except ValueError:
+        pytest.fail("real-smoke record output is no longer an existing safe directory outside the checkout")
     output_file.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     assert output_file.is_file()
