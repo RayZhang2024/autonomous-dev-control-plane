@@ -13,7 +13,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import autodev_control.workplane.codex_cli_candidate_producer as o2c
-from autodev_control.workplane.candidate_producer import ProducerStatus
+from autodev_control.workplane.candidate_producer import (
+    CandidateProposal,
+    ProposedChangeKind,
+    ProposedFileChange,
+    ProducerStatus,
+)
 from autodev_control.workplane.fixture_candidate_materializer import (
     DeterministicFixtureCandidateMaterializer,
     FixtureBaseSnapshot,
@@ -25,6 +30,118 @@ from tests.integration import test_o2b_fixture_candidate_materialization as o2b_
 FIXED_NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
 PINNED_CODEX_01601 = Path(r"C:\O2C\bin\codex-0.160.1\bin\codex.exe")
 PINNED_CODEX_01601_SHA256 = "9e7c59c05cc1ce5677b1f94e835b2ac038ca3be14504e78d558eacdb0ea3f55d"
+_EXPECTED_REAL_SMOKE_PATH = "o2c-output.txt"
+_EXPECTED_REAL_SMOKE_CONTENT = b"o2c-real-worker-pass\n"
+_EXPECTED_REAL_SMOKE_MODE = "100644"
+_EXPECTED_REAL_SMOKE_SEED = o2c.CodexWorkspaceSeed(
+    o2b_test.BASE.value,
+    (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"fixture input", "100644"),),
+)
+_EXPECTED_REAL_SMOKE_PROPOSAL = CandidateProposal(
+    o2b_test.BASE.value,
+    (ProposedFileChange(
+        ProposedChangeKind.ADD,
+        _EXPECTED_REAL_SMOKE_PATH,
+        _EXPECTED_REAL_SMOKE_CONTENT,
+        _EXPECTED_REAL_SMOKE_MODE,
+    ),),
+)
+
+
+def _assert_expected_real_smoke_seed(seed: object) -> None:
+    if type(seed) is not o2c.CodexWorkspaceSeed or seed != _EXPECTED_REAL_SMOKE_SEED:
+        raise AssertionError("real-smoke seed differs from its fixed expected input")
+
+
+def _assert_expected_real_smoke_proposal(proposal: object) -> None:
+    if type(proposal) is not CandidateProposal or proposal != _EXPECTED_REAL_SMOKE_PROPOSAL:
+        raise AssertionError("real-smoke proposal differs from its fixed expected addition")
+
+
+def _assert_expected_real_smoke_observation(proposal: object, metadata: object) -> None:
+    _assert_expected_real_smoke_proposal(proposal)
+    if (
+        type(metadata) is not o2c.CodexRunDiagnostics
+        or metadata.workspace_file_count != len(_EXPECTED_REAL_SMOKE_SEED.files) + 1
+        or metadata.proposal_change_count != len(_EXPECTED_REAL_SMOKE_PROPOSAL.changes)
+    ):
+        raise AssertionError("real-smoke workspace observation differs from its fixed expected addition")
+
+
+def _expected_real_smoke_candidate(base_snapshot: FixtureBaseSnapshot):
+    expected_files, expected_content, expected_trees = o2b_test._expected_materialization(
+        base_snapshot, _EXPECTED_REAL_SMOKE_PROPOSAL
+    )
+    expected_blob_id = o2b_test._independent_digest(
+        o2b_test.TEST_BLOB_DOMAIN, _EXPECTED_REAL_SMOKE_CONTENT
+    )
+    if expected_files.get(_EXPECTED_REAL_SMOKE_PATH) != (_EXPECTED_REAL_SMOKE_MODE, expected_blob_id):
+        raise AssertionError("fixed smoke addition is absent from the independent O2b file model")
+    if expected_content != {expected_blob_id: _EXPECTED_REAL_SMOKE_CONTENT}:
+        raise AssertionError("independent O2b content model differs from the fixed smoke bytes")
+
+    expected_trees_by_path = tuple(
+        o2b_test.FixtureMaterializedTree(
+            directory,
+            tree_id,
+            tuple(
+                o2b_test.FixtureMaterializedTreeEntry(
+                    name, o2b_test.FixtureObjectKind(kind), mode, object_id
+                )
+                for name, kind, mode, object_id in entries
+            ),
+        )
+        for directory, (tree_id, entries) in sorted(
+            expected_trees.items(), key=lambda item: item[0].encode("utf-8")
+        )
+    )
+    expected_blobs = tuple(
+        o2b_test.FixtureMaterializedBlob(blob_id, content)
+        for blob_id, content in sorted(expected_content.items(), key=lambda item: item[0].encode("ascii"))
+    )
+    result_tree_id = expected_trees[""][0]
+    candidate_commit_id = o2b_test._independent_digest(
+        o2b_test.TEST_COMMIT_DOMAIN,
+        base_snapshot.expected_base_revision.encode("ascii"),
+        result_tree_id.encode("ascii"),
+    )
+    return o2b_test.FixtureMaterializedCandidate(
+        base_snapshot.repository_id,
+        base_snapshot.expected_base_revision,
+        candidate_commit_id,
+        result_tree_id,
+        expected_trees_by_path,
+        expected_blobs,
+    )
+
+
+def _assert_expected_real_smoke_candidate(candidate: object, base_snapshot: FixtureBaseSnapshot) -> None:
+    expected = _expected_real_smoke_candidate(base_snapshot)
+    if type(candidate) is not type(expected) or candidate != expected:
+        raise AssertionError("materialized O2b candidate differs from the fixed expected addition")
+
+
+def _expected_real_smoke_mutations(base_snapshot: FixtureBaseSnapshot):
+    if any(leaf.path == _EXPECTED_REAL_SMOKE_PATH for leaf in base_snapshot.leaves):
+        raise AssertionError("fixed smoke output path already exists in the base snapshot")
+    expected_blob_id = o2b_test._independent_digest(
+        o2b_test.TEST_BLOB_DOMAIN, _EXPECTED_REAL_SMOKE_CONTENT
+    )
+    return (
+        o2b_test.MutationFact(
+            o2b_test.CanonicalGitPath(_EXPECTED_REAL_SMOKE_PATH),
+            o2b_test.MutationKind.ADDED,
+            None,
+            o2b_test.GitSha(expected_blob_id),
+            None,
+            o2b_test.GitBlobMode(_EXPECTED_REAL_SMOKE_MODE),
+        ),
+    )
+
+
+def _assert_expected_real_smoke_mutations(mutations: object, base_snapshot: FixtureBaseSnapshot) -> None:
+    if type(mutations) is not tuple or mutations != _expected_real_smoke_mutations(base_snapshot):
+        raise AssertionError("trusted mutation inventory differs from the fixed expected addition")
 
 
 class FakePreflight:
@@ -44,7 +161,7 @@ class FakeContainedRunner:
     def run(self, executable, arguments, workspace, environment, prompt_bytes, timeout_seconds):
         self.calls += 1
         self.arguments = tuple(arguments)
-        (Path(workspace) / "o2c-output.txt").write_bytes(b"proposal from isolated fake worker")
+        (Path(workspace) / _EXPECTED_REAL_SMOKE_PATH).write_bytes(_EXPECTED_REAL_SMOKE_CONTENT)
         return o2c.ContainedExecutionOutcome(
             0, False, True, False, 0, hashlib.sha256(b"").hexdigest(),
             0, hashlib.sha256(b"").hexdigest(), 1,
@@ -83,10 +200,8 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     executable = tmp_path / "codex.exe"
     executable.write_bytes(b"fake pinned executable")
     environment = {"PATH": "system-path", "HOME": str(worker_home), "USERPROFILE": str(worker_home), "CODEX_HOME": str(codex_home)}
-    seed = o2c.CodexWorkspaceSeed(
-        o2b_test.BASE.value,
-        (o2c.CodexWorkspaceFile("o2c-input.txt", b"input", "100644"),),
-    )
+    seed = _EXPECTED_REAL_SMOKE_SEED
+    _assert_expected_real_smoke_seed(seed)
     runner = FakeContainedRunner()
     configuration = o2c.CodexCliConfiguration(
             str(executable), "codex-cli 0", hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -105,16 +220,18 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     assert produced.status is ProducerStatus.SUCCESS
     assert runner.calls == producer.task_attempt_count == 1
     proposal = produced.candidate_proposal
+    _assert_expected_real_smoke_observation(proposal, produced.untrusted_metadata)
 
     materialized = DeterministicFixtureCandidateMaterializer().materialize(proposal, base_snapshot)
     assert materialized.status is MaterializationStatus.MATERIALIZED
     assert materialized.candidate is not None
+    _assert_expected_real_smoke_candidate(materialized.candidate, base_snapshot)
     combined = o2b_test.independently_verify_and_combine(base_store, base_snapshot, proposal, materialized)
     admitted = o2b_test._trusted_admit_candidate(
         base_store, combined, materialized.candidate.candidate_commit_id, "issue69-o2c-fake-linkage"
     )
     assert admitted.candidate_commit.value == materialized.candidate.candidate_commit_id
-    assert admitted.mutation_inventory.mutations == o2b_test._independent_mutation_facts(base_snapshot, proposal)
+    _assert_expected_real_smoke_mutations(admitted.mutation_inventory.mutations, base_snapshot)
     record = _build_smoke_record(
         producer._deployment, produced.untrusted_metadata, proposal,
         materialized.candidate.candidate_commit_id, admitted.mutation_inventory.mutations,
@@ -151,6 +268,76 @@ def test_fake_o2c_proposal_links_through_o2b_independent_verifier_and_trusted_ad
     } <= external_checks
     assert record["candidate_and_admission"]["o2b_candidate_commit_id"] == materialized.candidate.candidate_commit_id
     assert "safe" not in record
+
+
+_NONEXACT_REAL_SMOKE_CHANGES = (
+    pytest.param((), id="no-op-missing-addition"),
+    pytest.param((ProposedFileChange(
+        ProposedChangeKind.ADD, "wrong-output.txt", _EXPECTED_REAL_SMOKE_CONTENT,
+        _EXPECTED_REAL_SMOKE_MODE,
+    ),), id="wrong-path"),
+    pytest.param((ProposedFileChange(
+        ProposedChangeKind.ADD, _EXPECTED_REAL_SMOKE_PATH, b"wrong content\n",
+        _EXPECTED_REAL_SMOKE_MODE,
+    ),), id="wrong-content"),
+    pytest.param((ProposedFileChange(
+        ProposedChangeKind.ADD, _EXPECTED_REAL_SMOKE_PATH, _EXPECTED_REAL_SMOKE_CONTENT,
+        "100755",
+    ),), id="wrong-mode"),
+    pytest.param((
+        _EXPECTED_REAL_SMOKE_PROPOSAL.changes[0],
+        ProposedFileChange(ProposedChangeKind.ADD, "unexpected-extra.txt", b"extra\n", "100644"),
+    ), id="extra-mutation"),
+)
+
+
+@pytest.mark.parametrize("changes", _NONEXACT_REAL_SMOKE_CHANGES)
+def test_real_smoke_expected_effect_rejects_nonexact_proposals(changes):
+    proposal = CandidateProposal(o2b_test.BASE.value, changes)
+    with pytest.raises(AssertionError, match="fixed expected addition"):
+        _assert_expected_real_smoke_proposal(proposal)
+
+
+def test_real_smoke_expected_effect_rejects_changed_seed_input():
+    changed_seed = o2c.CodexWorkspaceSeed(
+        o2b_test.BASE.value,
+        (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"changed input", "100644"),),
+    )
+    with pytest.raises(AssertionError, match="fixed expected input"):
+        _assert_expected_real_smoke_seed(changed_seed)
+
+
+@pytest.mark.parametrize("changes", _NONEXACT_REAL_SMOKE_CHANGES)
+def test_real_smoke_expected_effect_rejects_nonexact_materialized_candidates(changes):
+    base_snapshot = o2b_test.project_exact_base(
+        o2b_test.base_only_store(), o2b_test.REPOSITORY, o2b_test.BASE
+    )
+    proposal = CandidateProposal(o2b_test.BASE.value, changes)
+    materialized = DeterministicFixtureCandidateMaterializer().materialize(proposal, base_snapshot)
+    assert materialized.status is MaterializationStatus.MATERIALIZED
+    assert materialized.candidate is not None
+    with pytest.raises(AssertionError, match="fixed expected addition"):
+        _assert_expected_real_smoke_candidate(materialized.candidate, base_snapshot)
+
+
+def test_real_smoke_expected_effect_rejects_missing_and_extra_trusted_mutations():
+    base_snapshot = o2b_test.project_exact_base(
+        o2b_test.base_only_store(), o2b_test.REPOSITORY, o2b_test.BASE
+    )
+    expected = _expected_real_smoke_mutations(base_snapshot)
+    extra = o2b_test.MutationFact(
+        o2b_test.CanonicalGitPath("unexpected-extra.txt"),
+        o2b_test.MutationKind.ADDED,
+        None,
+        o2b_test.GitSha("a" * 40),
+        None,
+        o2b_test.GitBlobMode("100644"),
+    )
+
+    with pytest.raises(AssertionError, match="fixed expected addition"):
+        _assert_expected_real_smoke_mutations((), base_snapshot)
+    with pytest.raises(AssertionError, match="fixed expected addition"):
+        _assert_expected_real_smoke_mutations((*expected, extra), base_snapshot)
 
 
 @pytest.mark.parametrize("doctor_exit_code", [0, 9])
@@ -592,9 +779,11 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
         executable, version, executable_hash, worker_home, codex_home, scratch_root, 1800,
         expected_head, worker_environment_id,
     )
+    seed = _EXPECTED_REAL_SMOKE_SEED
+    _assert_expected_real_smoke_seed(seed)
     producer = o2c.CodexCliCandidateProducer(
         configuration,
-        o2c.CodexWorkspaceSeed(o2b_test.BASE.value, (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"fixture input", "100644"),)),
+        seed,
         attestation,
         parent_environment=environment,
     )
@@ -606,16 +795,16 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
         except (OSError, ValueError):
             pytest.fail("real Codex producer failed and its external stage diagnostic could not be written")
         pytest.fail("real Codex producer failed; bounded stage diagnostic was written outside the checkout")
+    _assert_expected_real_smoke_observation(result.candidate_proposal, result.untrusted_metadata)
     materialized = DeterministicFixtureCandidateMaterializer().materialize(result.candidate_proposal, base_snapshot)
     if materialized.status is not MaterializationStatus.MATERIALIZED or materialized.candidate is None:
         pytest.fail("O2b rejected the real O2c proposal")
+    _assert_expected_real_smoke_candidate(materialized.candidate, base_snapshot)
     combined = o2b_test.independently_verify_and_combine(base_store, base_snapshot, result.candidate_proposal, materialized)
     admitted = o2b_test._trusted_admit_candidate(
         base_store, combined, materialized.candidate.candidate_commit_id, "issue69-o2c-real-smoke-candidate"
     )
-    expected_inventory = o2b_test._independent_mutation_facts(base_snapshot, result.candidate_proposal)
-    if admitted.mutation_inventory.mutations != expected_inventory:
-        pytest.fail("trusted mutation inventory differs from the independent fixture verifier")
+    _assert_expected_real_smoke_mutations(admitted.mutation_inventory.mutations, base_snapshot)
     source_head_after = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
     source_clean_after = not subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
     if source_head_after != started_head:
