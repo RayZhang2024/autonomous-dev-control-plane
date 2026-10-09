@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+import re
 import subprocess
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,10 @@ PINNED_CODEX_01601_SHA256 = "9e7c59c05cc1ce5677b1f94e835b2ac038ca3be14504e78d558
 _EXPECTED_REAL_SMOKE_PATH = "o2c-output.txt"
 _EXPECTED_REAL_SMOKE_CONTENT = b"o2c-real-worker-pass\n"
 _EXPECTED_REAL_SMOKE_MODE = "100644"
+# The real worker intentionally gets a minimal one-file fixture seed. O2b
+# materializes the proposal against its richer exact-base repository fixture.
+# This is a fixture simplification, not proof that the worker seed is an exact
+# checkout of that base; exact-base linkage remains outside this smoke.
 _EXPECTED_REAL_SMOKE_SEED = o2c.CodexWorkspaceSeed(
     o2b_test.BASE.value,
     (o2c.CodexWorkspaceFile("o2c-smoke-input.txt", b"fixture input", "100644"),),
@@ -46,6 +51,17 @@ _EXPECTED_REAL_SMOKE_PROPOSAL = CandidateProposal(
         _EXPECTED_REAL_SMOKE_MODE,
     ),),
 )
+_REAL_SMOKE_MISMATCH_REASONS = frozenset({
+    "proposal_mismatch",
+    "workspace_observation_mismatch",
+    "o2b_materialization_rejected",
+    "materialized_candidate_mismatch",
+    "trusted_mutation_inventory_mismatch",
+})
+_MAX_MISMATCH_PATHS = 16
+_MAX_MISMATCH_PATH_LENGTH = 96
+_MAX_MISMATCH_RECORD_BYTES = 8192
+_MISMATCH_GIT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 def _assert_expected_real_smoke_seed(seed: object) -> None:
@@ -681,6 +697,219 @@ def _write_failure_smoke_record(
     )
 
 
+def _safe_mismatch_path(path: object) -> str:
+    if type(path) is not str or not path or len(path) > _MAX_MISMATCH_PATH_LENGTH:
+        return "<redacted-path>"
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or ":" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+    ):
+        return "<redacted-path>"
+    parts = path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return "<redacted-path>"
+    return path
+
+
+def _safe_mismatch_identity(value: object, *, max_length: int = 256) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > max_length
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return "<redacted-identity>"
+    return value
+
+
+def _safe_mismatch_git_id(value: object) -> str:
+    return value if type(value) is str and _MISMATCH_GIT_ID.fullmatch(value) is not None else "<invalid-git-id>"
+
+
+def _mismatch_observed_effect(proposal: object, metadata: object) -> dict[str, object]:
+    if type(proposal) is CandidateProposal:
+        change_count: int | None = len(proposal.changes)
+        paths = [_safe_mismatch_path(change.path) for change in proposal.changes[:_MAX_MISMATCH_PATHS]]
+        omitted_path_count = max(0, change_count - len(paths))
+    else:
+        change_count = None
+        paths = []
+        omitted_path_count = 0
+    reported_value = getattr(metadata, "proposal_change_count", None)
+    reported_count = reported_value if type(reported_value) is int and reported_value >= 0 else None
+    workspace_value = getattr(metadata, "workspace_file_count", None)
+    workspace_file_count = workspace_value if type(workspace_value) is int and workspace_value >= 0 else None
+    return {
+        "proposal_change_count": change_count,
+        "reported_proposal_change_count": reported_count,
+        "proposal_changed_paths": paths,
+        "omitted_path_count": omitted_path_count,
+        "workspace_file_count": workspace_file_count,
+    }
+
+
+def _build_real_smoke_mismatch_record(
+    mismatch_reason: str,
+    attestation: o2c.CodexWorkerDeploymentAttestation,
+    proposal: object,
+    metadata: object,
+    *,
+    expected_source_head: str,
+    source_head_before: str,
+    source_head_after: str,
+    source_clean_before: bool,
+    source_clean_after: bool,
+    task_attempt_count: int,
+) -> dict[str, object]:
+    reason = mismatch_reason if mismatch_reason in _REAL_SMOKE_MISMATCH_REASONS else "unknown_mismatch"
+    return {
+        "format_version": "o2c-smoke-mismatch/1",
+        "producer_status": "SUCCESS",
+        "task_attempt_count": task_attempt_count,
+        "mismatch_reason": reason,
+        "source_identity": {
+            "expected_pr_head_sha": _safe_mismatch_git_id(expected_source_head),
+            "source_head_before": _safe_mismatch_git_id(source_head_before),
+            "source_head_after": _safe_mismatch_git_id(source_head_after),
+            "source_clean_before": source_clean_before,
+            "source_clean_after": source_clean_after,
+        },
+        "attestation_identity": {
+            "attestation_id": _safe_mismatch_git_id(attestation.attestation_id),
+            "source_head_sha": _safe_mismatch_git_id(attestation.source_head_sha),
+            "worker_environment_id": _safe_mismatch_identity(attestation.worker_environment_id),
+            "codex_executable_version": _safe_mismatch_identity(attestation.codex_executable_version),
+            "codex_executable_sha256": _safe_mismatch_git_id(attestation.codex_executable_sha256),
+        },
+        "observed_effect": _mismatch_observed_effect(proposal, metadata),
+    }
+
+
+def _write_real_smoke_mismatch_record(
+    output_file: Path,
+    repo_root: Path,
+    mismatch_reason: str,
+    attestation: o2c.CodexWorkerDeploymentAttestation,
+    proposal: object,
+    metadata: object,
+    *,
+    expected_source_head: str,
+    source_head_before: str,
+    source_head_after: str,
+    source_clean_before: bool,
+    source_clean_after: bool,
+    task_attempt_count: int,
+) -> None:
+    _validate_failure_smoke_output_path(output_file, repo_root)
+    record = _build_real_smoke_mismatch_record(
+        mismatch_reason,
+        attestation,
+        proposal,
+        metadata,
+        expected_source_head=expected_source_head,
+        source_head_before=source_head_before,
+        source_head_after=source_head_after,
+        source_clean_before=source_clean_before,
+        source_clean_after=source_clean_after,
+        task_attempt_count=task_attempt_count,
+    )
+    serialized = (json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(serialized) > _MAX_MISMATCH_RECORD_BYTES:
+        raise ValueError("bounded mismatch record exceeded its fixed size limit")
+    output_file.write_bytes(serialized)
+
+
+def _current_source_identity(repo_root: Path) -> tuple[str, bool]:
+    head = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=repo_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    clean = not subprocess.run(
+        ("git", "status", "--porcelain"), cwd=repo_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return head, clean
+
+
+def _expected_real_smoke_observation_mismatch(proposal: object, metadata: object) -> str | None:
+    if type(proposal) is not CandidateProposal or proposal != _EXPECTED_REAL_SMOKE_PROPOSAL:
+        return "proposal_mismatch"
+    if (
+        type(metadata) is not o2c.CodexRunDiagnostics
+        or metadata.workspace_file_count != len(_EXPECTED_REAL_SMOKE_SEED.files) + 1
+        or metadata.proposal_change_count != len(_EXPECTED_REAL_SMOKE_PROPOSAL.changes)
+    ):
+        return "workspace_observation_mismatch"
+    return None
+
+
+def _fail_real_smoke_mismatch(
+    output_file: Path,
+    repo_root: Path,
+    mismatch_reason: str,
+    attestation: o2c.CodexWorkerDeploymentAttestation,
+    result: o2c.CandidateProducerResult,
+    *,
+    expected_source_head: str,
+    source_head_before: str,
+    source_head_after: str,
+    source_clean_before: bool,
+    source_clean_after: bool,
+    task_attempt_count: int,
+) -> None:
+    try:
+        _write_real_smoke_mismatch_record(
+            output_file,
+            repo_root,
+            mismatch_reason,
+            attestation,
+            result.candidate_proposal,
+            result.untrusted_metadata,
+            expected_source_head=expected_source_head,
+            source_head_before=source_head_before,
+            source_head_after=source_head_after,
+            source_clean_before=source_clean_before,
+            source_clean_after=source_clean_after,
+            task_attempt_count=task_attempt_count,
+        )
+    except (OSError, ValueError):
+        pytest.fail("real Codex outcome mismatched the fixed expectation and its bounded external record could not be written", pytrace=False)
+    pytest.fail(
+        f"real Codex producer returned SUCCESS but failed the fixed expected outcome ({mismatch_reason}); bounded mismatch evidence was written",
+        pytrace=False,
+    )
+
+
+def _write_mismatch_and_fail(
+    output_file: Path,
+    repo_root: Path,
+    mismatch_reason: str,
+    attestation: o2c.CodexWorkerDeploymentAttestation,
+    result: o2c.CandidateProducerResult,
+    *,
+    expected_source_head: str,
+    source_head_before: str,
+    source_clean_before: bool,
+    task_attempt_count: int,
+) -> None:
+    source_head_after, source_clean_after = _current_source_identity(repo_root)
+    _fail_real_smoke_mismatch(
+        output_file,
+        repo_root,
+        mismatch_reason,
+        attestation,
+        result,
+        expected_source_head=expected_source_head,
+        source_head_before=source_head_before,
+        source_head_after=source_head_after,
+        source_clean_before=source_clean_before,
+        source_clean_after=source_clean_after,
+        task_attempt_count=task_attempt_count,
+    )
+
+
 def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_details(tmp_path, monkeypatch):
     repo_root = tmp_path / "source-checkout"
     repo_root.mkdir()
@@ -734,6 +963,231 @@ def test_failure_smoke_record_is_written_outside_checkout_without_sensitive_deta
     )
     with pytest.raises(ValueError):
         _write_failure_smoke_record(unsafe_directory / "failure.json", repo_root, result, FailedProducer())
+
+
+def _fixture_smoke_diagnostics(*, workspace_file_count: int = 2, proposal_change_count: int = 1):
+    return o2c.CodexRunDiagnostics(
+        runner_version="fixture-runner",
+        worker_identity_measured="fixture-worker",
+        codex_version="codex-cli fixture",
+        codex_version_measured_before_task=True,
+        codex_executable_sha256_before="a" * 64,
+        codex_executable_sha256_after="a" * 64,
+        worker_home_path="C:\\fixture\\worker",
+        userprofile_path="C:\\fixture\\worker",
+        worker_agents_clean=True,
+        codex_home_path="C:\\fixture\\codex-home",
+        codex_home_clean=True,
+        root_exit_code=0,
+        elapsed_milliseconds=12,
+        workspace_file_count=workspace_file_count,
+        proposal_change_count=proposal_change_count,
+        stdout_byte_count=0,
+        stdout_sha256=hashlib.sha256(b"").hexdigest(),
+        stderr_byte_count=0,
+        stderr_sha256=hashlib.sha256(b"").hexdigest(),
+        process_tree_quiescent=True,
+        resource_limit_violation=False,
+        measured_features=tuple((name, False) for name in o2c.CAPABILITY_DENY_SET),
+        measured_mcp_server_count=0,
+        sandbox_implementation="mxc",
+        doctor_exit_code=0,
+        codex_cli_version_raw="codex-cli fixture",
+        codex_package_version="fixture",
+        candidate_workspace_git_present=False,
+        job_assignment_succeeded=True,
+        root_process_resumed_after_assignment=True,
+        active_process_count_before_scan=0,
+        resource_violation_types=(),
+    )
+
+
+def _mismatch_fixture_attestation() -> o2c.CodexWorkerDeploymentAttestation:
+    configuration = o2c.CodexCliConfiguration(
+        "C:\\fixture\\codex.exe", "codex-cli fixture", "a" * 64,
+        "C:\\fixture\\worker", "C:\\fixture\\codex-home", "C:\\fixture\\scratch",
+        30, o2b_test.BASE.value, "fixture-environment-id",
+    )
+    return _fixture_attestation(configuration)
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    (
+        CandidateProposal(o2b_test.BASE.value, ()),
+        CandidateProposal(o2b_test.BASE.value, (
+            ProposedFileChange(ProposedChangeKind.ADD, "wrong-output.txt", b"fixture", "100644"),
+        )),
+        CandidateProposal(o2b_test.BASE.value, (
+            ProposedFileChange(ProposedChangeKind.ADD, _EXPECTED_REAL_SMOKE_PATH, b"credential-marker", "100644"),
+        )),
+        CandidateProposal(o2b_test.BASE.value, (
+            ProposedFileChange(ProposedChangeKind.ADD, _EXPECTED_REAL_SMOKE_PATH, _EXPECTED_REAL_SMOKE_CONTENT, "100755"),
+        )),
+        CandidateProposal(o2b_test.BASE.value, (
+            *_EXPECTED_REAL_SMOKE_PROPOSAL.changes,
+            ProposedFileChange(ProposedChangeKind.ADD, "unexpected-extra.txt", b"private-response-marker", "100644"),
+        )),
+    ),
+    ids=("no-op", "wrong-path", "wrong-content", "wrong-mode", "unexpected-extra"),
+)
+def test_real_smoke_success_mismatch_writes_bounded_external_record_and_fails(tmp_path, proposal):
+    repo_root = tmp_path / "source-checkout"
+    repo_root.mkdir()
+    output_directory = tmp_path / "external" / "diagnostics"
+    output_directory.mkdir(parents=True)
+    output_file = output_directory / "mismatch.json"
+    metadata = _fixture_smoke_diagnostics(workspace_file_count=1 if not proposal.changes else 3)
+    result = o2c.CandidateProducerResult(ProducerStatus.SUCCESS, proposal, metadata)
+    reason = _expected_real_smoke_observation_mismatch(proposal, metadata)
+    assert reason == "proposal_mismatch"
+
+    with pytest.raises(pytest.fail.Exception, match="returned SUCCESS but failed the fixed expected outcome"):
+        _fail_real_smoke_mismatch(
+            output_file,
+            repo_root,
+            reason,
+            _mismatch_fixture_attestation(),
+            result,
+            expected_source_head=o2b_test.BASE.value,
+            source_head_before=o2b_test.BASE.value,
+            source_head_after=o2b_test.BASE.value,
+            source_clean_before=True,
+            source_clean_after=True,
+            task_attempt_count=1,
+        )
+
+    serialized = output_file.read_text(encoding="utf-8")
+    record = json.loads(serialized)
+    assert record["format_version"] == "o2c-smoke-mismatch/1"
+    assert record["producer_status"] == "SUCCESS"
+    assert record["task_attempt_count"] == 1
+    assert record["mismatch_reason"] == "proposal_mismatch"
+    assert record["source_identity"] == {
+        "expected_pr_head_sha": o2b_test.BASE.value,
+        "source_head_before": o2b_test.BASE.value,
+        "source_head_after": o2b_test.BASE.value,
+        "source_clean_before": True,
+        "source_clean_after": True,
+    }
+    assert record["attestation_identity"] == {
+        "attestation_id": "b" * 64,
+        "source_head_sha": o2b_test.BASE.value,
+        "worker_environment_id": "fixture-environment-id",
+        "codex_executable_version": "codex-cli fixture",
+        "codex_executable_sha256": "a" * 64,
+    }
+    assert record["observed_effect"]["proposal_change_count"] == len(proposal.changes)
+    assert record["observed_effect"]["reported_proposal_change_count"] == 1
+    assert record["observed_effect"]["workspace_file_count"] == metadata.workspace_file_count
+    assert record["observed_effect"]["proposal_changed_paths"] == [change.path for change in proposal.changes]
+    assert "credential-marker" not in serialized and "private-response-marker" not in serialized
+    assert "stdout" not in serialized and "stderr" not in serialized and "prompt" not in serialized
+    assert len(serialized.encode("utf-8")) <= _MAX_MISMATCH_RECORD_BYTES
+    assert not output_file.resolve().is_relative_to(repo_root.resolve())
+
+
+def test_real_smoke_workspace_observation_mismatch_writes_record_and_fails(tmp_path):
+    repo_root = tmp_path / "source-checkout"
+    repo_root.mkdir()
+    output_directory = tmp_path / "external"
+    output_directory.mkdir()
+    output_file = output_directory / "mismatch.json"
+    metadata = _fixture_smoke_diagnostics(workspace_file_count=1)
+    proposal = _EXPECTED_REAL_SMOKE_PROPOSAL
+    result = o2c.CandidateProducerResult(ProducerStatus.SUCCESS, proposal, metadata)
+    reason = _expected_real_smoke_observation_mismatch(proposal, metadata)
+    assert reason == "workspace_observation_mismatch"
+    with pytest.raises(pytest.fail.Exception):
+        _fail_real_smoke_mismatch(
+            output_file, repo_root, reason, _mismatch_fixture_attestation(), result,
+            expected_source_head=o2b_test.BASE.value,
+            source_head_before=o2b_test.BASE.value,
+            source_head_after=o2b_test.BASE.value,
+            source_clean_before=True,
+            source_clean_after=True,
+            task_attempt_count=1,
+        )
+    record = json.loads(output_file.read_text(encoding="utf-8"))
+    assert record["mismatch_reason"] == "workspace_observation_mismatch"
+    assert record["observed_effect"]["workspace_file_count"] == 1
+    assert record["observed_effect"]["proposal_changed_paths"] == [_EXPECTED_REAL_SMOKE_PATH]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "o2b_materialization_rejected",
+        "materialized_candidate_mismatch",
+        "trusted_mutation_inventory_mismatch",
+    ),
+)
+def test_real_smoke_downstream_mismatch_record_remains_a_failure(tmp_path, reason):
+    repo_root = tmp_path / "source-checkout"
+    repo_root.mkdir()
+    output_directory = tmp_path / "external"
+    output_directory.mkdir()
+    output_file = output_directory / "mismatch.json"
+    result = o2c.CandidateProducerResult(
+        ProducerStatus.SUCCESS, _EXPECTED_REAL_SMOKE_PROPOSAL, _fixture_smoke_diagnostics()
+    )
+    with pytest.raises(pytest.fail.Exception):
+        _fail_real_smoke_mismatch(
+            output_file, repo_root, reason, _mismatch_fixture_attestation(), result,
+            expected_source_head=o2b_test.BASE.value,
+            source_head_before=o2b_test.BASE.value,
+            source_head_after=o2b_test.BASE.value,
+            source_clean_before=True,
+            source_clean_after=True,
+            task_attempt_count=1,
+        )
+    record = json.loads(output_file.read_text(encoding="utf-8"))
+    assert record["mismatch_reason"] == reason
+    assert record["format_version"] == "o2c-smoke-mismatch/1"
+    assert "admission" not in record and "completion" not in record
+
+
+def test_real_smoke_mismatch_record_caps_paths_and_redacts_unsafe_path_text(tmp_path):
+    repo_root = tmp_path / "source-checkout"
+    repo_root.mkdir()
+    output_directory = tmp_path / "external"
+    output_directory.mkdir()
+    output_file = output_directory / "mismatch.json"
+    changes = tuple(
+        ProposedFileChange(ProposedChangeKind.ADD, f"C:\\private\\{index}.txt", b"private-content", "100644")
+        for index in range(_MAX_MISMATCH_PATHS + 5)
+    )
+    proposal = CandidateProposal(o2b_test.BASE.value, changes)
+    metadata = _fixture_smoke_diagnostics(
+        workspace_file_count=len(_EXPECTED_REAL_SMOKE_SEED.files) + len(changes),
+        proposal_change_count=len(changes),
+    )
+    record = _build_real_smoke_mismatch_record(
+        "proposal_mismatch", _mismatch_fixture_attestation(), proposal, metadata,
+        expected_source_head=o2b_test.BASE.value,
+        source_head_before=o2b_test.BASE.value,
+        source_head_after=o2b_test.BASE.value,
+        source_clean_before=True,
+        source_clean_after=True,
+        task_attempt_count=1,
+    )
+    _write_real_smoke_mismatch_record(
+        output_file, repo_root, "proposal_mismatch", _mismatch_fixture_attestation(), proposal, metadata,
+        expected_source_head=o2b_test.BASE.value,
+        source_head_before=o2b_test.BASE.value,
+        source_head_after=o2b_test.BASE.value,
+        source_clean_before=True,
+        source_clean_after=True,
+        task_attempt_count=1,
+    )
+    serialized = output_file.read_text(encoding="utf-8")
+    loaded = json.loads(serialized)
+    assert record == loaded
+    assert loaded["observed_effect"]["proposal_change_count"] == _MAX_MISMATCH_PATHS + 5
+    assert loaded["observed_effect"]["omitted_path_count"] == 5
+    assert loaded["observed_effect"]["proposal_changed_paths"] == ["<redacted-path>"] * _MAX_MISMATCH_PATHS
+    assert "private-content" not in serialized and "C:\\private" not in serialized
+    assert len(serialized.encode("utf-8")) <= _MAX_MISMATCH_RECORD_BYTES
 
 
 @pytest.mark.skipif(os.environ.get("O2C_REAL_SMOKE") != "1", reason="dedicated-worker Codex smoke is explicitly opt-in")
@@ -795,16 +1249,66 @@ def test_opt_in_real_codex_smoke_records_exact_head_o2b_and_trusted_admission(tm
         except (OSError, ValueError):
             pytest.fail("real Codex producer failed and its external stage diagnostic could not be written")
         pytest.fail("real Codex producer failed; bounded stage diagnostic was written outside the checkout")
-    _assert_expected_real_smoke_observation(result.candidate_proposal, result.untrusted_metadata)
+    mismatch_reason = _expected_real_smoke_observation_mismatch(
+        result.candidate_proposal, result.untrusted_metadata
+    )
+    if mismatch_reason is not None:
+        _write_mismatch_and_fail(
+            output_file,
+            repo_root,
+            mismatch_reason,
+            attestation,
+            result,
+            expected_source_head=expected_head,
+            source_head_before=started_head,
+            source_clean_before=source_clean_before,
+            task_attempt_count=producer.task_attempt_count,
+        )
     materialized = DeterministicFixtureCandidateMaterializer().materialize(result.candidate_proposal, base_snapshot)
     if materialized.status is not MaterializationStatus.MATERIALIZED or materialized.candidate is None:
-        pytest.fail("O2b rejected the real O2c proposal")
-    _assert_expected_real_smoke_candidate(materialized.candidate, base_snapshot)
+        _write_mismatch_and_fail(
+            output_file,
+            repo_root,
+            "o2b_materialization_rejected",
+            attestation,
+            result,
+            expected_source_head=expected_head,
+            source_head_before=started_head,
+            source_clean_before=source_clean_before,
+            task_attempt_count=producer.task_attempt_count,
+        )
+    try:
+        _assert_expected_real_smoke_candidate(materialized.candidate, base_snapshot)
+    except AssertionError:
+        _write_mismatch_and_fail(
+            output_file,
+            repo_root,
+            "materialized_candidate_mismatch",
+            attestation,
+            result,
+            expected_source_head=expected_head,
+            source_head_before=started_head,
+            source_clean_before=source_clean_before,
+            task_attempt_count=producer.task_attempt_count,
+        )
     combined = o2b_test.independently_verify_and_combine(base_store, base_snapshot, result.candidate_proposal, materialized)
     admitted = o2b_test._trusted_admit_candidate(
         base_store, combined, materialized.candidate.candidate_commit_id, "issue69-o2c-real-smoke-candidate"
     )
-    _assert_expected_real_smoke_mutations(admitted.mutation_inventory.mutations, base_snapshot)
+    try:
+        _assert_expected_real_smoke_mutations(admitted.mutation_inventory.mutations, base_snapshot)
+    except AssertionError:
+        _write_mismatch_and_fail(
+            output_file,
+            repo_root,
+            "trusted_mutation_inventory_mismatch",
+            attestation,
+            result,
+            expected_source_head=expected_head,
+            source_head_before=started_head,
+            source_clean_before=source_clean_before,
+            task_attempt_count=producer.task_attempt_count,
+        )
     source_head_after = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
     source_clean_after = not subprocess.run(("git", "status", "--porcelain"), cwd=repo_root, check=True, capture_output=True, text=True).stdout.strip()
     if source_head_after != started_head:
